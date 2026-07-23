@@ -5,15 +5,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-23
+
 ### Added
+
+- Support for loading configuration settings from `.env` file automatically on startup.
+- `.env` and `.env.example` configuration file templates for project settings.
 
 ### Changed
 
-- README: clarify that agy is Google's Antigravity CLI (official successor to Gemini CLI); reword the no-video limitation to reflect agy's native lack of video understanding rather than server hardware.
+- Increased default `AGY_TIMEOUT` from 180 seconds (3 minutes) to 900 seconds (15 minutes) for long-running AI tasks.
 
-### Fixed
-
-## [1.0.1] - 2026-07-23
 
 ### Changed
 

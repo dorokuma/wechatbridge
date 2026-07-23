@@ -60,7 +60,7 @@ cp deploy/wechatbridge.env.example .env
 |---|---|---|
 | `AGY_BIN_PATH` | `agy` | agy 可执行文件路径 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用桥的微信 ID，逗号分隔（空 = 全开） |
-| `AGY_TIMEOUT` | `180` | agy 执行超时，秒 |
+| `AGY_TIMEOUT` | `900` | agy 执行超时秒数（默认 15 分钟） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信的文件大小上限（100 MB） |
 
 完整列表见 [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example)。

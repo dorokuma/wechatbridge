@@ -10,6 +10,28 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
 
 
+def _load_env_file():
+    """Automatically load .env file if present."""
+    env_path = os.getenv("WECHATBRIDGE_ENV_FILE", os.path.join(os.path.dirname(_BASE_DIR), ".env"))
+    if not os.path.exists(env_path):
+        env_path = os.path.join(_BASE_DIR, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception as e:
+            logger.warning("Failed to load .env file %s: %s", env_path, e)
+
+
+_load_env_file()
+
+
 def _env_int(name: str, default: int) -> int:
     val = os.getenv(name)
     if val is None:
@@ -59,8 +81,9 @@ class AppConfig:
         "WECHATBRIDGE_QRCODE_URL_FILE", os.path.join(_BASE_DIR, ".current_qrcode_url.txt")
     )
 
-    # Timeout for agy execution (seconds)
-    agy_timeout: int = _env_int("AGY_TIMEOUT", 180)
+    # Timeout for agy execution (seconds) — default 900s (15 minutes)
+    agy_timeout: int = _env_int("AGY_TIMEOUT", 900)
+
 
     # QR code polling timeout (seconds)
     qrcode_poll_timeout: int = _env_int("QRCODE_POLL_TIMEOUT", 180)

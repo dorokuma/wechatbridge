@@ -46,15 +46,8 @@ env/
 qrcode*.png
 .current_qrcode_url.txt
 *.pyc
-
-# Databases (ctxmode index, never commit)
 *.db
-*.db-shm
-*.db-wal
-*.db-journal
+*.db-*
+.prelog_backup/
+qrcode_ascii.txt
 
-# Runtime per-user prefs
-*prefs.json
-
-# Local dev sessions
-sessions/
