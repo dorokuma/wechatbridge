@@ -344,7 +344,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                 await process.wait()
             except Exception as e:
                 logger.warning("子进程清理失败: %s", e)
-        return "⏰ **处理超时** ⏰\n\n这条指令处理超时了，请稍后再试，或尝试简化指令。", []
+        return "⏰ **处理超时** ⏰", []
 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
@@ -398,13 +398,13 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
                 process.returncode,
             )
             return clean_output(stderr_text) if stderr_text else (
-                f"❌ **agy 指令失败** ❌\n\n`agy {' '.join(subcmd_args)}` 执行失败。"
+                f"❌ **终端指令执行失败** ❌"
             )
 
         return clean_output(stdout_text) or "(empty response)"
 
     except asyncio.TimeoutError:
-        return "❌ **指令超时** ❌\n\n请稍后再试。"
+        return "❌ **指令超时** ❌"
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
         return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```"
@@ -467,34 +467,34 @@ def handle_persona(args: str, user_id: str) -> str:
         try:
             with open(gemini_path, "w", encoding="utf-8") as f:
                 f.write(rest)
-            return "✅ **人格文档已更新** ✅\n\n下次对话生效。"
+            return "✅ **人格文档已更新** ✅"
         except OSError as e:
             logger.error("Failed to write persona for %s: %s", user_id, e)
-            return "❌ **写入人格文档失败** ❌\n\n请稍后再试。"
+            return "❌ **写入人格文档失败** ❌"
     elif subcmd and subcmd not in ("show", "clear", "reset", "set"):
         # No subcommand → treat whole args as content
         os.makedirs(gemini_dir, exist_ok=True)
         try:
             with open(gemini_path, "w", encoding="utf-8") as f:
                 f.write(args.strip())
-            return "✅ **人格文档已更新** ✅\n\n下次对话生效。"
+            return "✅ **人格文档已更新** ✅"
         except OSError as e:
             logger.error("Failed to write persona for %s: %s", user_id, e)
-            return "❌ **写入人格文档失败** ❌\n\n请稍后再试。"
+            return "❌ **写入人格文档失败** ❌"
 
     # show
     if subcmd == "show":
         if not os.path.exists(gemini_path):
-            return "（未设置人格文档，使用 agy 默认。）"
+            return "（未设置人格文档）"
         try:
             with open(gemini_path, "r", encoding="utf-8") as f:
                 val = f.read()
             if len(val) > 1500:
-                val = val[:1500] + "\n\n（内容较长，已截断至前1500字符）"
+                val = val[:1500] + "\n\n（已截断至前1500字符）"
             return val or "（空文档）"
         except OSError as e:
             logger.error("Failed to read persona for %s: %s", user_id, e)
-            return "❌ **读取人格文档失败** ❌\n\n请稍后再试。"
+            return "❌ **读取人格文档失败** ❌"
 
     # clear
     if subcmd == "clear":
@@ -504,8 +504,8 @@ def handle_persona(args: str, user_id: str) -> str:
                 return "✅ **人格文档已清除** ✅"
             except OSError as e:
                 logger.error("Failed to clear persona for %s: %s", user_id, e)
-                return "❌ **清除人格文档失败** ❌\n\n请稍后再试。"
-        return "ℹ️ **本就无人格文档** ℹ️，无需清除。"
+                return "❌ **清除人格文档失败** ❌"
+        return "ℹ️ **本就无人格文档** ℹ️"
 
     # reset
     if subcmd == "reset":
@@ -519,10 +519,10 @@ def handle_persona(args: str, user_id: str) -> str:
             return "✅ **人格已重置为全局默认** ✅"
         except OSError as e:
             logger.error("Failed to reset persona for %s: %s", user_id, e)
-            return "❌ **重置人格文档失败** ❌\n\n请稍后再试。"
+            return "❌ **重置人格文档失败** ❌"
 
     # empty args
-    return "📋 **用法** 📋\n\n- `/persona <内容>` 或 `/persona set <内容>` — 设置人格\n- `/persona show` — 查看当前人格\n- `/persona clear` — 清除人格\n- `/persona reset` — 重置为默认"
+    return "📋 **/persona 用法** 📋\n\n- `/persona <内容>` 设置\n- `/persona show` 查看\n- `/persona clear` 清除\n- `/persona reset` 重置默认"
 
 
 def _cmd_clear(user_id: str) -> str:
@@ -532,10 +532,10 @@ def _cmd_clear(user_id: str) -> str:
     try:
         if os.path.exists(flag_path):
             os.remove(flag_path)
-        return "✅ **对话已重置** ✅\n\n下次发消息开始新会话。"
+        return "✅ **对话已重置** ✅"
     except OSError as e:
         logger.error("Failed to clear session for %s: %s", user_id, e)
-        return "❌ **重置失败** ❌\n\n请稍后再试。"
+        return "❌ **重置失败** ❌"
 
 
 def _cmd_fast(user_id: str) -> str:
@@ -543,7 +543,7 @@ def _cmd_fast(user_id: str) -> str:
     prefs = load_prefs(user_id)
     prefs["effort"] = "low"
     save_prefs(user_id, prefs)
-    return "✅ **已开启 fast 模式** ✅（低推理开销）"
+    return "✅ **已开启 fast 模式** ✅"
 
 
 def _cmd_planning(user_id: str) -> str:
@@ -558,7 +558,7 @@ def _cmd_add_dir(args: str, user_id: str) -> str:
     """Handle /add-dir <path>: add path to add_dirs list (dedup)."""
     path = args.strip()
     if not path:
-        return "❌ **用法** ❌\n\n`/add-dir <路径>`"
+        return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
     prefs = load_prefs(user_id)
     dirs = prefs.get("add_dirs", [])
     if path not in dirs:
@@ -577,11 +577,11 @@ async def _cmd_model(args: str, user_id: str) -> str:
     """
     name = args.strip()
     if not name:
-        return "❌ **用法** ❌\n\n`/model <模型名称>`\n\n用 `/models` 查看可用模型。"
+        return "❌ **缺少参数** ❌\n\n`/model <名称>`"
 
     output = await _run_agy_subcommand(["models"], user_id)
     if output.startswith("[error]") or output.startswith("❌"):
-        return "❌ **无法获取模型列表** ❌\n\n请稍后再试。"
+        return "❌ **无法获取模型列表** ❌"
 
     models = [line.strip() for line in output.split("\n") if line.strip()]
 
@@ -608,9 +608,9 @@ async def _cmd_model(args: str, user_id: str) -> str:
         if embedded:
             prefs.pop("effort", None)
         save_prefs(user_id, prefs)
-        return f"✅ **模型已切换** ✅\n\n`{matched}`（前缀匹配 `{name}`）"
+        return f"✅ **模型已切换** ✅\n\n`{matched}`"
 
-    return f"❌ **模型不存在** ❌\n\n`{name}` 不存在，请用 `/models` 查看可用模型。"
+    return f"❌ **模型不存在** ❌\n\n`{name}`"
 
 
 async def handle_slash_command(text: str, user_id: str) -> str | None:
@@ -638,7 +638,7 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
     B_CMDS = frozenset({"/exit", "/quit", "/logout"})
     if cmd in B_CMDS:
         return (
-            "⛔ **该指令在微信端禁用** ⛔\n\n在微信端使用此指令会断开 bot 或清除 agy 登录，请在终端操作。"
+            "⛔ **该指令在微信端禁用** ⛔"
         )
 
     # --- C class: TUI panels (not supported on WeChat) ---
@@ -651,7 +651,7 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
     })
     if cmd in C_CMDS:
         return (
-            f"⚠️ **微信端不支持** ⚠️\n\n`{cmd}` 是 agy TUI 面板操作，微信端不支持，请在终端 agy 里使用。"
+            f"⚠️ **微信端不支持** ⚠️\n\n`{cmd}`"
         )
 
     # --- A class: implemented commands ---
@@ -702,7 +702,7 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
         if not config.enable_subagent:
             return "ℹ️ **该功能已禁用** ℹ️"
         if not args:
-            return "❌ **用法** ❌\n\n`/agent <名称> <任务>`"
+            return "❌ **缺少参数** ❌\n\n`/agent <名称> <任务>`"
         # Construct prompt and run through agy
         agent_parts = args.split(maxsplit=1)
         agent_name = agent_parts[0]

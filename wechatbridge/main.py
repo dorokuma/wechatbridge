@@ -129,7 +129,7 @@ async def gate_and_run(client, from_user, context_token, prompt) -> tuple[str, l
         }
         await client.send_message(
             to_user_id=from_user,
-            text=f"⚠️ **危险操作确认** ⚠️\n\n操作内容：\n```\n{prompt}\n```\n\n- 回复 **y** → 执行\n- 回复其他内容 → 取消",
+            text=f"⚠️ **危险操作确认** ⚠️\n\n```\n{prompt}\n```\n\n- 回复 **y** → 执行\n- 回复其他 → 取消",
             context_token=context_token,
             baseurl=client.state.baseurl,
             bot_token=client.state.bot_token,
@@ -156,7 +156,7 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                 size_mb = file_size / (1024 * 1024)
                 await client.send_message(
                     to_user_id=from_user,
-                    text=f"⚠️ **文件过大** ⚠️\n\n文件 `{art_name}` 大小 {size_mb:.1f} MB，超过发送上限。\n已保存至服务器路径：\n```\n{art_path}\n```",
+                    text=f"⚠️ **文件过大** ⚠️\n\n`{art_name}` {size_mb:.1f} MB\n已存：`{art_path}`",
                     context_token=context_token,
                     baseurl=client.state.baseurl,
                     bot_token=client.state.bot_token,
@@ -239,7 +239,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     if config.allowed_senders and from_user not in config.allowed_senders:
         await client.send_message(
             to_user_id=from_user,
-            text="⛔ **未授权用户** ⛔\n\n你的账号无权使用此机器人，请联系管理员添加白名单。",
+            text="⛔ **未授权用户** ⛔\n联系管理员添加白名单。",
             context_token=context_token,
             baseurl=client.state.baseurl,
             bot_token=client.state.bot_token,
@@ -280,7 +280,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             logger.info("[AUDIT] user=%s cancelled dangerous prompt", from_user)
             await client.send_message(
                 to_user_id=from_user,
-                text="🚫 **已取消** 🚫\n\n- 危险操作未执行",
+                text="🚫 **已取消** 🚫",
                 context_token=context_token,
                 baseurl=client.state.baseurl,
                 bot_token=client.state.bot_token,
@@ -320,7 +320,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
         except Exception as e:
             logger.exception("图片下载/解密失败: %s", e)
-            reply = f"❌ **图片下载或解密失败** ❌\n\n原因：\n```\n{e}\n```"
+            reply = f"❌ **图片下载或解密失败** ❌\n\n```\n{e}\n```"
 
     # ---- Case 1.5: Message contains a file (non-image) ----
     elif file_media and file_media.get("aes_key"):
@@ -350,7 +350,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
         except Exception as e:
             logger.exception("文件下载/解密失败: %s", e)
-            reply = f"❌ **文件下载或解密失败** ❌\n\n原因：\n```\n{e}\n```"
+            reply = f"❌ **文件下载或解密失败** ❌\n\n```\n{e}\n```"
 
     # ---- Case 1.6: Voice message (text transcription passthrough) ----
     elif has_voice:
@@ -362,7 +362,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             reply, artifacts = result
         else:
             # WeChat failed to transcribe the voice → ask user to type.
-            reply = "🤔 **听不清，请打字** 🤔\n\n语音未能识别为文字，请直接输入文字消息。"
+            reply = "🤔 **听不清，请打字** 🤔"
             logger.info("语音未识别出文字 from=%s", from_user)
 
     # ---- Case 2: Text-only message (original logic) ----
