@@ -13,6 +13,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Fixed
 
+## [1.0.1] - 2026-07-23
+
+### Changed
+
+- Simplified user-facing prompt messages: removed verbose explanatory suffixes, changed "用法" to "缺少参数" where appropriate, removed parenthetical notes and redundant explanations.
+
 ## [1.0.0] - 2026-07-23
 
 First public release.
