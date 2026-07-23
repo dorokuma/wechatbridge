@@ -272,7 +272,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     try:
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("TOKEN","KEY","SECRET","PASSWORD","AWS","GITHUB","GITLAB","CREDENTIAL"))}
         env["HOME"] = session_dir
+        env["PAGER"] = "cat"
+        env["CI"] = "true"
+        env["NONINTERACTIVE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
         process = await asyncio.create_subprocess_exec(
+
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -359,12 +364,25 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         if process and process.pid:
             try:
                 pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGKILL)
-                logger.info("Killed process group %s", pgid)
+                # First send SIGTERM for graceful shutdown to let agy release SQLite WAL & Cascade locks
+                os.killpg(pgid, signal.SIGTERM)
+                logger.info("Sent SIGTERM to process group %s for graceful lock release", pgid)
+                # Grace period: wait up to 2 seconds for process to exit
+                for _ in range(20):
+                    if process.returncode is not None:
+                        break
+                    await asyncio.sleep(0.1)
+                if process.returncode is None:
+                    # Force kill with SIGKILL if still running after grace period
+                    os.killpg(pgid, signal.SIGKILL)
+                    logger.info("Sent SIGKILL to process group %s after grace period", pgid)
             except (ProcessLookupError, PermissionError, OSError) as e:
-                logger.warning("Failed to kill process group: %s", e)
+                logger.warning("Failed to terminate process group: %s", e)
             try:
                 await process.wait()
+            except Exception:
+                pass
+
             except Exception as e:
                 logger.warning("子进程清理失败: %s", e)
         return "⏰ **处理超时** ⏰", []

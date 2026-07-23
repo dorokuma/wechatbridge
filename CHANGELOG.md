@@ -5,7 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-## [1.0.5] - 2026-07-23
+## [1.0.6] - 2026-07-23
+
+### Changed
+
+- Replaced forced `SIGKILL` process termination with a graceful `SIGTERM` 2-second grace period to allow `agy` CLI to gracefully unlock SQLite WAL database files and close Cascade session handles, preventing Cascade lock deadlocks on subsequent `-c` invocations.
+- Added `PAGER=cat`, `CI=true`, `NONINTERACTIVE=1`, and `PYTHONUNBUFFERED=1` environment flags to prevent subshell commands from hanging on headless standard input reads.
+
 
 ### Changed
 
