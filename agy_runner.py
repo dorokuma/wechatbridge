@@ -12,7 +12,7 @@ import shutil
 import signal
 import time
 
-from .config import config
+from config import config
 
 logger = logging.getLogger("agy_runner")
 
@@ -133,7 +133,6 @@ def ensure_user_gemini(user_id: str) -> str:
     os.makedirs(antigravity_dir, exist_ok=True)
 
     # Copy global auth token if not yet present
-    # agy standard auth token path, managed by agy CLI
     token_src = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
     token_dst = os.path.join(antigravity_dir, "antigravity-oauth-token")
     if not os.path.exists(token_dst) and os.path.exists(token_src):
@@ -144,7 +143,6 @@ def ensure_user_gemini(user_id: str) -> str:
             logger.warning("Failed to copy auth token for %s: %s", user_id, e)
 
     # Copy global GEMINI.md persona as default if not yet present
-    # agy standard persona file path, managed by agy CLI
     agents_src = os.path.expanduser("~/.gemini/GEMINI.md")
     agents_dst = os.path.join(gemini_dir, "GEMINI.md")
     if not os.path.exists(agents_dst) and os.path.exists(agents_src):
@@ -421,7 +419,7 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
                 process.returncode,
             )
             return clean_output(stderr_text) if stderr_text else (
-                f"❌ **终端指令执行失败** ❌"
+                "❌ **终端指令执行失败** ❌"
             )
 
         return clean_output(stdout_text) or "(empty response)"
@@ -532,7 +530,6 @@ def handle_persona(args: str, user_id: str) -> str:
 
     # reset
     if subcmd == "reset":
-        # agy standard persona file path, managed by agy CLI
         agents_src = os.path.expanduser("~/.gemini/GEMINI.md")
         if not os.path.exists(agents_src):
             return "❌ **全局默认人格文档不存在** ❌"

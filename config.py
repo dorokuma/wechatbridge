@@ -9,12 +9,9 @@ import logging
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
 
-
+# Automatically load .env file if present
 def _load_env_file():
-    """Automatically load .env file if present."""
-    env_path = os.getenv("WECHATBRIDGE_ENV_FILE", os.path.join(os.path.dirname(_BASE_DIR), ".env"))
-    if not os.path.exists(env_path):
-        env_path = os.path.join(_BASE_DIR, ".env")
+    env_path = os.getenv("WECHATBRIDGE_ENV_FILE", os.path.join(_BASE_DIR, ".env"))
     if os.path.exists(env_path):
         try:
             with open(env_path, "r", encoding="utf-8") as f:
@@ -28,8 +25,8 @@ def _load_env_file():
         except Exception as e:
             logger.warning("Failed to load .env file %s: %s", env_path, e)
 
-
 _load_env_file()
+
 
 
 def _env_int(name: str, default: int) -> int:
@@ -59,7 +56,7 @@ class AppConfig:
     ilink_base_url: str = os.getenv("ILINK_BASE_URL", "https://ilinkai.weixin.qq.com")
 
     # agy binary path
-    agy_binary_path: str = os.getenv("AGY_BIN_PATH", "agy")  # default assumes in PATH
+    agy_binary_path: str = os.getenv("AGY_BIN_PATH", "/root/.local/bin/agy")
 
     # Base directory for per-user session workspaces
     session_base_dir: str = os.getenv(
@@ -84,7 +81,6 @@ class AppConfig:
     # Timeout for agy execution (seconds) — default 3600s (60 minutes / 1 hour)
     agy_timeout: int = _env_int("AGY_TIMEOUT", 3600)
 
-
     # QR code polling timeout (seconds)
     qrcode_poll_timeout: int = _env_int("QRCODE_POLL_TIMEOUT", 180)
 
@@ -98,7 +94,7 @@ class AppConfig:
     cdn_base_url: str = os.getenv("WECHATBRIDGE_CDN_BASE", "https://novac2c.cdn.weixin.qq.com/c2c")
 
     # agy scratch directory (where agy writes generated files)
-    agy_scratch_dir: str = os.getenv("AGY_SCRATCH_DIR", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))  # agy generated artifacts scratch dir
+    agy_scratch_dir: str = os.getenv("AGY_SCRATCH_DIR", "/root/.gemini/antigravity-cli/scratch")
 
     # Scratch file retention days (TTL cleanup)
     scratch_retention_days: int = _env_int("AGY_SCRATCH_RETENTION_DAYS", 7)

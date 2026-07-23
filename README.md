@@ -60,7 +60,7 @@ Key variables (all have defaults):
 |---|---|---|
 | `AGY_BIN_PATH` | `agy` | path to the agy binary |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs allowed to use the bridge (empty = allow all) |
-| `AGY_TIMEOUT` | `900` | agy execution timeout in seconds (default 15 minutes) |
+| `AGY_TIMEOUT` | `3600` | agy execution timeout in seconds (default 60 minutes / 1 hour) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 
 See [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example) for the full list.

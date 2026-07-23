@@ -5,7 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-## [1.0.4] - 2026-07-23
+## [1.0.5] - 2026-07-23
+
+### Changed
+
+- Increased default `AGY_TIMEOUT` from 900s to 3600s (60 minutes / 1 hour) to fully support long-horizon complex programming tasks without early process termination.
+- Added automatic single-attempt retry and friendly fallback formatting when encountering `timeout waiting for cascade/response` API errors from the AI engine.
+
 
 ### Changed
 
