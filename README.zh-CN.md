@@ -5,30 +5,30 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge 把微信机器人接到 [agy](#前置条件)——谷歌的 Antigravity CLI——让你在微信对话里就能读文件、跑命令、抓网页，并把生成的文件收回来。
+WeChatBridge 把微信机器人接到 agy（谷歌的 Antigravity CLI）。你在微信对话里就能读文件、跑命令、抓网页，agy 生成的文件也会发回微信。
 
 ```
 微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy CLI
                                  (本项目)           (跑工具)
 ```
 
-桥长轮询 iLink 机器人 API 收微信消息，为每个用户起一个 `agy` 子进程处理，再把回复发回微信。agy 生成的文件经 CDN 回传。
+程序轮询 iLink 收微信消息，每个用户开一个 agy 进程处理，回复发回微信。agy 生成的文件经 CDN 发回。
 
 ## 功能
 
-- **文本、图片、文件、语音**消息从微信转发给 agy
-- **产物回传** — agy 生成的文档、图片、代码发回微信
-- **按用户隔离会话** — 每个微信用户有独立的 agy 工作区
-- **slash 指令**运行时控制（`/model`、`/clear`、`/fast`、`/persona` 等）
-- **危险操作确认闸** — 删除 / 格式化 / `rm -rf` 等指令执行前要确认
-- **白名单** — 限定指定微信 ID 才能用
-- **MCP 与子代理引导**（`/mcp`、`/agent`）
-- **AES-128-ECB 加密**媒体经微信 CDN 传输
-- 附带 **systemd 服务文件**，自动重启
+- 文本、图片、文件、语音消息都能从微信发给 agy
+- agy 生成的文档、图片、代码会发回微信
+- 每个微信用户有独立的 agy 工作区
+- slash 指令运行时控制：`/model`、`/clear`、`/fast`、`/persona` 等
+- 危险指令（删除、格式化、`rm -rf`）执行前要确认
+- 白名单限定指定微信 ID 才能用
+- `/mcp`、`/agent` 引导 agy 的 MCP 工具和子代理
+- 媒体经微信 CDN 用 AES-128-ECB 加密传输
+- 附带 systemd 服务文件，自动重启
 
 ## 前置条件
 
-- **agy**（谷歌 Antigravity CLI）已安装并登录（`agy` 在 `PATH`，或设 `AGY_BIN_PATH`）。Antigravity CLI 是谷歌的终端 agentic 编程工具——能理解代码库、经授权编辑文件、在终端跑命令，是 Gemini CLI 的官方继任者。
+- **agy**（谷歌 Antigravity CLI），已安装并登录。`agy` 在 `PATH` 里，或者设 `AGY_BIN_PATH`。Antigravity CLI 是谷歌的终端 agentic 编程工具：能理解代码库、经授权编辑文件、在终端跑命令，是 Gemini CLI 的官方继任者。
 - 一个微信账号，配合 [ClawBot / iLink](https://ilinkai.weixin.qq.com) 机器人，扫码绑定。
 - Python 3.10+。
 
@@ -101,11 +101,11 @@ sudo systemctl enable --now wechatbridge
 
 ## 已知限制
 
-- 依赖 agy —— 不是独立 agent。
+- 依赖 agy，不是独立 agent。
 - 语音准确率封顶在微信语音转文字能力，没有本地 ASR。
 - 不收发视频。agy 原生不支持理解视频内容，需要第三方工具，超出本项目范围。
 - 不输出原生语音气泡（没做 silk 编码）。
-- 一个进程一个机器人 —— 两个微信号就跑两个实例。
+- 一个进程一个机器人，两个微信号就跑两个实例。
 - agy 以 `--dangerously-skip-permissions` 运行（自动批准所有工具调用）。请用白名单限制访问，只部署给可信用户。
 
 ## 贡献
@@ -114,4 +114,4 @@ sudo systemctl enable --now wechatbridge
 
 ## 许可证
 
-MIT —— 见 [`LICENSE`](LICENSE)。
+MIT，见 [`LICENSE`](LICENSE)。

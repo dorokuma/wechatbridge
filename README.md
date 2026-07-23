@@ -5,30 +5,30 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to [agy](#prerequisites) — Google's Antigravity CLI — so you can read files, run commands, fetch the web, and receive generated files back, all from a WeChat conversation.
+WeChatBridge connects a WeChat bot to agy (Google's Antigravity CLI). You can read files, run commands, fetch web pages, and get generated files back, all from a WeChat chat.
 
 ```
 WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy CLI
                                      (this project)    (runs tools)
 ```
 
-The bridge long-polls the iLink bot API for incoming messages, spawns an `agy` subprocess per user, and returns the reply. Files agy generates are uploaded back to WeChat over the CDN.
+The bridge long-polls iLink for incoming messages, runs an `agy` subprocess per user, and sends the reply back. Files agy creates go back to WeChat through the CDN.
 
 ## Features
 
-- **Text, image, file, and voice** messages from WeChat forwarded to agy
-- **Generated files returned** — documents, images, and code agy produces are sent back to WeChat
-- **Per-user sessions** — each WeChat user gets an isolated agy workspace
-- **Slash commands** for runtime control (`/model`, `/clear`, `/fast`, `/persona`, ...)
-- **Dangerous prompt gate** — delete / format / `rm -rf` prompts ask for confirmation before running
-- **Sender whitelist** — restrict access to specific WeChat IDs
-- **MCP and subagent guidance** via `/mcp` and `/agent`
-- **AES-128-ECB encrypted media** transfer over the WeChat CDN
-- **systemd unit** with auto-restart included
+- Text, image, file, and voice messages from WeChat all go to agy
+- Files agy generates (documents, images, code) get sent back to WeChat
+- Each WeChat user gets an isolated agy workspace
+- Slash commands for runtime control: `/model`, `/clear`, `/fast`, `/persona`, and more
+- Dangerous prompts (delete, format, `rm -rf`) ask for confirmation before running
+- Sender whitelist to restrict access to specific WeChat IDs
+- `/mcp` and `/agent` guide agy's MCP tools and subagents
+- Media is encrypted with AES-128-ECB over the WeChat CDN
+- systemd unit with auto-restart included
 
 ## Prerequisites
 
-- **agy** (Google's Antigravity CLI) installed and authenticated (`agy` in `PATH`, or set `AGY_BIN_PATH`). Antigravity CLI is Google's terminal-first agentic coding tool — it understands your codebase, makes edits with your permission, and runs commands from the terminal. It is the official successor to Gemini CLI.
+- **agy** (Google's Antigravity CLI), installed and authenticated. Either have `agy` in `PATH` or set `AGY_BIN_PATH`. Antigravity CLI is Google's terminal-first agentic coding tool: it understands your codebase, edits files with your permission, and runs commands from the terminal. It's the official successor to Gemini CLI.
 - A WeChat account with a [ClawBot / iLink](https://ilinkai.weixin.qq.com) bot to bind via QR code.
 - Python 3.10+.
 
@@ -97,15 +97,15 @@ sudo systemctl enable --now wechatbridge
 | `/mcp` | MCP tool usage guidance |
 | `/agent <name> <task>` | invoke a subagent for a task |
 
-Other `/` commands are passed through to agy unchanged.
+Other `/` commands pass through to agy unchanged.
 
 ## Limitations
 
-- Requires agy — this is not a standalone agent.
-- Voice accuracy is capped at WeChat's speech-to-text; there is no on-device ASR.
-- No video send or receive. agy has no native video understanding — parsing video content needs third-party tooling, which is out of scope.
-- No native voice bubble output (silk encoding is not implemented).
-- One bot per process — run two instances for two WeChat accounts.
+- Requires agy. This is not a standalone agent.
+- Voice accuracy is capped at WeChat's speech-to-text. There's no on-device ASR.
+- No video send or receive. agy has no native video understanding, and parsing video content needs third-party tooling that's out of scope.
+- No native voice bubble output (silk encoding isn't implemented).
+- One bot per process. Run two instances for two WeChat accounts.
 - agy runs with `--dangerously-skip-permissions` (auto-approves every tool call). Restrict access with the sender whitelist and only deploy for trusted users.
 
 ## Contributing
@@ -114,4 +114,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). The project follows Semantic Versionin
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
