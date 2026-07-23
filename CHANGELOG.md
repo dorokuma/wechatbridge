@@ -5,7 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-## [1.0.2] - 2026-07-23
+## [1.0.3] - 2026-07-23
+
+### Added
+
+- Robust exponential backoff with random jitter retry strategy for `send_message` and `send_media_message` (up to 5 attempts covering 30-60s network recovery window).
+- Failure classification: retries transient network errors & 5xx server errors, fails fast on 401/403 auth errors and 4xx client errors.
+
 
 ### Added
 

@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .config import config
+from config import config
 
 logger = logging.getLogger("ilink")
 
