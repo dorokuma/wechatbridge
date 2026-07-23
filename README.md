@@ -5,7 +5,7 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to [agy](#prerequisites), an agentic CLI, so you can read files, run commands, fetch the web, and receive generated files back — all from a WeChat conversation.
+WeChatBridge connects a WeChat bot to [agy](#prerequisites) — Google's Antigravity CLI — so you can read files, run commands, fetch the web, and receive generated files back, all from a WeChat conversation.
 
 ```
 WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy CLI
@@ -28,7 +28,7 @@ The bridge long-polls the iLink bot API for incoming messages, spawns an `agy` s
 
 ## Prerequisites
 
-- **agy CLI** installed and authenticated (`agy` in `PATH`, or set `AGY_BIN_PATH`). agy is an agentic CLI (Antigravity / Gemini CLI) that runs tools locally.
+- **agy** (Google's Antigravity CLI) installed and authenticated (`agy` in `PATH`, or set `AGY_BIN_PATH`). Antigravity CLI is Google's terminal-first agentic coding tool — it understands your codebase, makes edits with your permission, and runs commands from the terminal. It is the official successor to Gemini CLI.
 - A WeChat account with a [ClawBot / iLink](https://ilinkai.weixin.qq.com) bot to bind via QR code.
 - Python 3.10+.
 
@@ -103,7 +103,7 @@ Other `/` commands are passed through to agy unchanged.
 
 - Requires agy — this is not a standalone agent.
 - Voice accuracy is capped at WeChat's speech-to-text; there is no on-device ASR.
-- No video send or receive (agy cannot view video; the server is too small for ASR).
+- No video send or receive. agy has no native video understanding — parsing video content needs third-party tooling, which is out of scope.
 - No native voice bubble output (silk encoding is not implemented).
 - One bot per process — run two instances for two WeChat accounts.
 - agy runs with `--dangerously-skip-permissions` (auto-approves every tool call). Restrict access with the sender whitelist and only deploy for trusted users.

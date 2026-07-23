@@ -9,6 +9,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Changed
 
+- README: clarify that agy is Google's Antigravity CLI (official successor to Gemini CLI); reword the no-video limitation to reflect agy's native lack of video understanding rather than server hardware.
+
 ### Fixed
 
 ## [1.0.0] - 2026-07-23
