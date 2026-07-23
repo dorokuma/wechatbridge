@@ -13,9 +13,9 @@ import time
 import uuid
 from io import StringIO
 
-from .config import config
-from .ilink import ILinkClient
-from .agy import run_agy, handle_slash_command, get_session_dir, is_dangerous
+from config import config
+from ilink import ILinkClient
+from agy_runner import run_agy, handle_slash_command, get_session_dir, is_dangerous
 
 # ---------------------------------------------------------------------------
 # Logging

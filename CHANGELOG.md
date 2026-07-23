@@ -5,7 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-## [1.0.3] - 2026-07-23
+## [1.0.4] - 2026-07-23
+
+### Changed
+
+- Refactored message polling loop to spawn non-blocking background async tasks per message (`asyncio.create_task`), ensuring the `get_updates` heartbeat channel remains 100% active 24x7 without disconnecting during long AI task executions.
+- Added per-user async locks (`user_locks`) to maintain message sequence ordering per user while enabling full inter-user concurrency.
+
 
 ### Added
 
