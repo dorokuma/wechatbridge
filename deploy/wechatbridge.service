@@ -1,0 +1,16 @@
+[Unit]
+Description=WeChat Bridge Service
+After=network.target
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory to your installation path
+WorkingDirectory=/opt/wechatbridge
+ExecStart=/usr/bin/python3 -m wechatbridge
+Restart=always
+RestartSec=5s
+# Create a dedicated system user if running under a non-root account
+User=wechatbridge
+
+[Install]
+WantedBy=multi-user.target
