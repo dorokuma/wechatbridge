@@ -168,9 +168,10 @@ class AppConfig:
     # dsh execution timeout (seconds)
     dsh_timeout: int = _env_int("DSH_TIMEOUT", 600)
 
-    # Explicit DSH_HOME passed to the dsh child process. Empty = machine-wide
-    # default (~/.dsh): profiles and credentials are shared host-wide (same
-    # model as the grok backend's machine-wide login).
+    # Explicit DSH_HOME passed to the dsh child process. Empty resolves via
+    # precedence: WECHATBRIDGE_DSH_HOME > WECHATBRIDGE_HOST_HOME/.dsh > ~/.dsh.
+    # Profiles and credentials are shared host-wide (same model as the grok
+    # backend's machine-wide login).
     dsh_home: str = os.getenv("WECHATBRIDGE_DSH_HOME", "")
 
     # Bridge-managed long-term memory for the dsh backend. The headless
@@ -196,6 +197,12 @@ class AppConfig:
     session_base_dir: str = os.getenv(
         "WECHATBRIDGE_SESSION_DIR",
         os.path.join(_instance_data_dir, "sessions"),
+    )
+
+    # Bridge-private dsh state directory (kept outside session_base_dir for isolation)
+    dsh_state_dir: str = os.getenv(
+        "WECHATBRIDGE_DSH_STATE_DIR",
+        os.path.join(_instance_data_dir, "dsh_state"),
     )
 
     state_file_path: str = os.getenv(
@@ -365,7 +372,7 @@ def _normalized_dsh_home() -> tuple[bool, str]:
 def host_dsh_home() -> str:
     """Machine-wide DeepSeek Harness home used by dsh child process and session cleanup.
 
-    Precedence: ``WECHATBRIDGE_DSH_HOME`` (config.dsh_home) > ``WECHATBRIDGE_HOST_HOME``/``~``.
+    Precedence: ``WECHATBRIDGE_DSH_HOME`` (config.dsh_home) > ``WECHATBRIDGE_HOST_HOME/.dsh`` > ``~/.dsh``.
     """
     return _normalized_dsh_home()[1]
 

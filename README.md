@@ -47,11 +47,16 @@ Per-user switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend
 
 ### dsh backend notes
 
-- **Single-turn session + bridge-managed memory:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so the bridge itself keeps the user's recent turns (default last 10) in a per-user `dsh_memory.jsonl` and injects them into every prompt — conversation continuity and long-term memory are preserved across messages without restart. `/clear` / `/new` wipe that memory to start fresh. `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
-- Runs `dsh --profile headless -- <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
-- Image and file attachments are merged into the prompt text as `@/absolute/path` mentions. Verified in dsh v0.1.1-rc.2: `headless` passes the prompt text directly to the model without pre-reading or inlining mentions; the model receives system guidance on @-paths and may invoke file tools (e.g. `read`) if needed. The bridge only filters out-of-bounds mentions starting with absolute paths, `~`, or `file://` (`@/abs`, `@~/x`, `@file://`, replaced with `[blocked-path]`), which is best-effort prompt text filtering rather than a sandbox boundary.
-- Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` to configure a dedicated service home with automatic session retention cleanup; when unset, it reuses the host `~/.dsh` without automatic session cleanup (managed by the operator). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
-- Status: implemented from the published `dsh` CLI contract (headless bundle source) plus a fake CLI in the test suite; final acceptance depends on a real `dsh login` + headless run.
+- **What is dsh:** DeepSeek Harness CLI (`dsh`), running one-shot tasks via the `headless` profile.
+- **Enable / Switch:** Set `WECHATBRIDGE_BACKEND=dsh` globally in `.env`, or switch per-user in WeChat via `/backend dsh`.
+- **Dependency (PyYAML):** The dsh backend requires `PyYAML` to parse profile plugin configurations. If missing, `/backend dsh` returns a user-visible notice and preserves existing backend preferences. Install with `pip install PyYAML` or `pipx inject wechatbridge-cli PyYAML`.
+- **Window memory (default):** The `headless` profile creates a fresh session per invocation (`session-<uuid>`), so the bridge manages long-term conversation memory: recent turns (default 10 pairs, up to `WECHATBRIDGE_DSH_MEMORY_CHARS` chars) are saved to `dsh_memory.jsonl` and injected into every prompt. `/clear` or `/new` wipes this memory to start fresh.
+- **Persistent resume mode:** Set `WECHATBRIDGE_DSH_RESUME=true` for true persistent sessions (codex-style resume). Requires the headless profile bundle to mount the `dsh-bridge-runner` plugin (`dsh_bridge_runner.py`, which reads `DSH_BRIDGE_SESSION_ID` and `DSH_BRIDGE_TASK` from env). Context accumulates natively across turns without windowing. `/clear` or `/new` deletes the stored session ID to start a fresh session. Window memory injection is skipped in resume mode.
+- **Workspace & State Isolation:** Runs `dsh --profile headless -- <prompt>` with `cwd` = per-user session directory (`WECHATBRIDGE_SESSION_DIR/<user_id>`). Bridge-private state files (`dsh_memory.jsonl` and persistent session ID) are stored under `WECHATBRIDGE_DSH_STATE_DIR` (`~/.local/share/wechatbridge/<instance>/dsh_state/`), outside the child's `session_dir` tree to eliminate direct 1-level parent/sibling relative traversal (`../`).
+- **Threat Model:** Child processes run under the same host UID without container sandbox isolation. While 1-level relative traversal (`../`) cannot reach private state, 2-level traversal (`../../dsh_state/<user_id>`) remains reachable on the filesystem and is accepted. Treat as trusted-user tooling.
+- Image and file attachments are merged into the prompt text as `@/absolute/path` mentions. Verified against dsh v0.1.1-rc.2 source: `headless` profile does not pre-read or inline @mention files at the CLI/runtime level, but passes prompt text directly to the model; the model receives system guidance on @-paths and invokes file tools (`read`) as needed. The bridge filters out-of-bounds mentions (`@/abs`, `@~/x`, `@file://`, replaced with `[blocked-path]`), which is a prompt text layer best-effort filter, not a sandbox boundary.
+- Auth / profiles are **machine-wide** (resolved via precedence `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`, same host-fallback model as grok/codex): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` to configure a dedicated service home with automatic session retention cleanup; when unset, it falls back to `$WECHATBRIDGE_HOST_HOME/.dsh` (if set) or `~/.dsh` without automatic session cleanup (managed by the operator). If the bridge runs as a dedicated system user (e.g. `wechatbridge`), set `WECHATBRIDGE_HOST_HOME` to point to the operator's home directory so CLI credentials and profiles are discovered. `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
+- **Status:** Implemented against the published dsh CLI contract and covered by the test suite (fake CLI). The persistent resume mode requires users to configure and mount the `dsh-bridge-runner` plugin in their dsh profile bundle; plugin files are not bundled with this repository.
 
 ### Grok backend notes
 
@@ -149,7 +154,9 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh backend: recent user+assistant turns injected as context |
 | `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh backend: max chars of injected memory context |
 | `WECHATBRIDGE_DSH_RESUME` | `false` | dsh backend: true persistent-session mode — one dsh session per user resumed on every message (codex-style); requires the dsh-bridge-runner plugin in the headless profile; skips windowed memory when enabled |
-| `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = reuse host `~/.dsh` without auto cleanup |
+| `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = fallback to `WECHATBRIDGE_HOST_HOME/.dsh` or `~/.dsh` without auto cleanup (precedence: `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`) |
+| `WECHATBRIDGE_HOST_HOME` | _empty_ | host home directory override for service user deployments; used as fallback base for grok (`~/.grok`), codex (`~/.codex`), and dsh (`~/.dsh`) |
+| `WECHATBRIDGE_DSH_STATE_DIR` | _derived_ | bridge-private dsh state directory (memory JSONL and persistent session IDs; defaults to `~/.local/share/wechatbridge/<instance>/dsh_state`) |
 | `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs (empty = allow all) |
@@ -239,8 +246,8 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | Command | Action |
 |---|---|
 | `/help` | list supported commands for the active backend |
-| `/backend <agy\|grok\|codex\|dsh>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag and codex `thread_id`/resume — so the next turn starts a fresh session; history files may remain until retention cleanup) |
-| `/clear` or `/new` | drop continue flag so the next CLI turn is a new conversation (does not instantly delete history files) |
+| `/backend <agy\|grok\|codex\|dsh>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag, codex `thread_id`/resume, or dsh memory/session ID — so the next turn starts a fresh session; history files may remain until retention cleanup) |
+| `/clear` or `/new` | start a new conversation (agy/grok: drops continue flag; codex: clears thread ID; dsh: clears window memory or persistent session ID) |
 | `/model <name>` | set model (all backends validate against a live list: agy/grok via CLI `models`; codex via `codex debug models` [then `--bundled`]; unknown name or list-fetch failure refuse and do not write prefs; see `/models`) |
 | `/models` | list models — agy/grok/codex all query the live CLI (codex: `debug models`; falls back to a built-in reference note only if the live list cannot be fetched) |
 | `/fast` | set low reasoning effort (**on only** — not a toggle; no “off” command) |
@@ -262,7 +269,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 - **Auto-approve CLIs.** agy runs with `--dangerously-skip-permissions`; grok with `--always-approve` (unless planning mode); dsh tools run without host path restrictions. Treat this as trusted-user tooling, not a multi-tenant sandbox.
 - **Danger gate is keyword-based**, not full intent understanding. Defaults target concrete patterns (`rm -rf /`, pipe-to-shell, `mkfs`, `format c:`, a few heavy Chinese phrases, …). Everyday wording like bare “delete” is **not** gated. Override list via `WECHATBRIDGE_CONFIRM_KEYWORDS`; approve with `WECHATBRIDGE_CONFIRM_TOKEN` (default `y`), TTL `WECHATBRIDGE_PENDING_TTL`.
 - **Inbound media** is size-capped (default 20 MB), streamed, and CDN hosts are allowlisted. Missing `aes_key` returns a clear error.
-- **Outbound artifacts** only leave the allowed per-user tree (agy: session scratch; grok: under session dir), after `realpath` checks, and only if under `WECHATBRIDGE_MAX_OUTBOUND_BYTES`.
+- **Outbound artifacts** only leave the allowed per-user tree (agy: session scratch; grok: under session dir; dsh: under session dir), after `realpath` checks, and only if under `WECHATBRIDGE_MAX_OUTBOUND_BYTES`.
 - **Concurrency:** global process-slot cap (`WECHATBRIDGE_MAX_CONCURRENT`, default 4). Same user is serialized and does **not** hold a global slot while waiting on their previous message; different users can run in parallel up to the cap.
 - **Long replies** are split into chunks (`WECHATBRIDGE_MESSAGE_CHUNK`, default 2000 characters).
 - **Data layout:** instance data under `~/.local/share/wechatbridge/<instance>/` (override with env). Runtime dirs prefer `0700`; token/QR files prefer `0600` (Unix; Windows relies on NTFS ACLs).
@@ -273,7 +280,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 
 - Not a standalone agent — requires agy and/or grok and/or codex and/or dsh.
 - The **codex** backend is not yet verified against a real Codex subscription/CLI; it is validated by source research, a JSONL fixture, and a fake CLI in tests. Treat it as community-tested until a real user confirms.
-- The **dsh** backend runs a fresh `headless` session per message; continuity is provided by bridge-injected memory (last `WECHATBRIDGE_DSH_MEMORY_TURNS` turns, bounded by `WECHATBRIDGE_DSH_MEMORY_CHARS`) — so it is not a persistent agent process with tool-state continuity. Verified against a real `dsh login` + headless run and the test suite.
+- The **dsh** backend supports both windowed memory (default, last `WECHATBRIDGE_DSH_MEMORY_TURNS` turns) and true persistent sessions (`WECHATBRIDGE_DSH_RESUME=true`). Covered by the test suite; persistent resume mode requires users to configure and mount their own `dsh-bridge-runner` plugin (this repository does not bundle plugin files).
 - dsh model/effort/mode/persona slash commands are not wired yet; `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` return a "not supported" notice on the dsh backend.
 - Voice is WeChat speech-to-text only; no local ASR; empty transcript → “type instead”.
 - No video send/receive; no native WeChat voice-bubble replies (no silk encode).

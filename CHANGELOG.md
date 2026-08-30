@@ -5,10 +5,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-30
+
 ### Added
 
-- **dsh 后端常驻会话模式**：新增 `WECHATBRIDGE_DSH_RESUME`（默认关）。启用后 headless profile 挂载 `dsh-bridge-runner` 插件，每条消息按 `DSH_BRIDGE_SESSION_ID` **恢复**（`agents.resume`）同一 dsh 会话——上下文无限累积、类似 codex 的 `resume <thread_id>`；`/clear` 删除会话 id 开启全新会话。启用时窗口记忆注入自动跳过。
-- **dsh 后端长时记忆**：headless 每次新建会话，故由桥为每用户保存最近对话（默认最近 10 轮，存于每用户 `dsh_memory.jsonl`）并注入每次提问，跨消息保持连续对话与长期记忆；`/clear`、`/new` 清空该记忆重新开始。新增 `WECHATBRIDGE_DSH_MEMORY_TURNS`（默认 10）与 `WECHATBRIDGE_DSH_MEMORY_CHARS`（默认 6000）配置。危险指令闸门仍只看原始提问，不看不注入的记忆。
+- **dsh 后端常驻会话模式**：新增 `WECHATBRIDGE_DSH_RESUME`（默认关）。启用后 headless profile 挂载 `dsh-bridge-runner` 插件（`dsh_bridge_runner.py`），每条消息按 `DSH_BRIDGE_SESSION_ID` **恢复**（`agents.resume`）同一 dsh 会话——上下文无限累积、类似 codex 的 `resume <thread_id>`；`/clear` 或 `/new` 删除会话 ID 开启全新会话。启用时窗口记忆注入自动跳过。
+- **dsh 后端长时记忆**：headless 默认单轮每次新建会话，由桥为每用户维护长期对话记忆（默认最近 10 轮，存于每用户 `dsh_memory.jsonl`）并自动注入每次提问；`/clear`、`/new` 清空该记忆重新开始。新增 `WECHATBRIDGE_DSH_MEMORY_TURNS`（默认 10）与 `WECHATBRIDGE_DSH_MEMORY_CHARS`（默认 6000）配置。记忆条目会经 is_dangerous 与策略过滤，用户原文本身已危险时不丢上下文（刚过确认门），组装后才变危险才丢记忆回退裸 prompt；gate_and_run 确认门只看用户原文，run_dsh 对含记忆的 safe_prompt 只打 [AUDIT] 日志、不拦截。
+- **dsh 私有状态目录隔离**：新增 `WECHATBRIDGE_DSH_STATE_DIR`（默认 `~/.local/share/wechatbridge/<实例名>/dsh_state`），将 dsh 窗口记忆文件（`dsh_memory.jsonl`）与持久会话 ID 独立存放于会话工作区外，消除子进程 cwd 一级相对路径穿越（`../`）。威胁模型：同 UID 无沙箱环境下，二级相对穿越（`../../dsh_state/<user_id>`）可达且已接受。
+- **依赖新增与前置探测**：新增 `PyYAML` 依赖（用于解析 dsh profile 插件挂载状态）。在 `/backend dsh` 切换指令执行前增加依赖前置探测，缺失 PyYAML 时友好提示安装（`pip install PyYAML` 或 `pipx inject wechatbridge-cli PyYAML`）并保持原引擎偏好不变。
 
 ## [1.5.0] - 2026-08-29
 

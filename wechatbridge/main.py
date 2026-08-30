@@ -134,18 +134,21 @@ def _get_backend(user_id: str) -> str:
 async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
     """Dispatch prompt to the active backend's run function."""
     backend = _get_backend(user_id)
-    if backend == "grok":
-        from .grok import run_grok
-        return await run_grok(prompt, user_id)
-    elif backend == "codex":
-        from .codex import run_codex
-        return await run_codex(prompt, user_id)
-    elif backend == "dsh":
-        from .dsh import run_dsh
-        return await run_dsh(prompt, user_id)
-    else:
-        from .agy import run_agy
-        return await run_agy(prompt, user_id)
+    try:
+        if backend == "grok":
+            from .grok import run_grok
+            return await run_grok(prompt, user_id)
+        elif backend == "codex":
+            from .codex import run_codex
+            return await run_codex(prompt, user_id)
+        elif backend == "dsh":
+            from .dsh import run_dsh
+            return await run_dsh(prompt, user_id)
+        else:
+            from .agy import run_agy
+            return await run_agy(prompt, user_id)
+    except (ImportError, ModuleNotFoundError) as e:
+        return format_error("缺少依赖", str(e)), []
 
 
 # ---------------------------------------------------------------------------
@@ -431,18 +434,21 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
         ) + format_update_hint()
 
     backend = _get_backend(user_id)
-    if backend == "grok":
-        from .grok import handle_grok_slash_command
-        return await handle_grok_slash_command(text, user_id)
-    elif backend == "codex":
-        from .codex import handle_codex_slash_command
-        return await handle_codex_slash_command(text, user_id)
-    elif backend == "dsh":
-        from .dsh import handle_dsh_slash_command
-        return await handle_dsh_slash_command(text, user_id)
-    else:
-        from .agy import handle_slash_command
-        return await handle_slash_command(text, user_id)
+    try:
+        if backend == "grok":
+            from .grok import handle_grok_slash_command
+            return await handle_grok_slash_command(text, user_id)
+        elif backend == "codex":
+            from .codex import handle_codex_slash_command
+            return await handle_codex_slash_command(text, user_id)
+        elif backend == "dsh":
+            from .dsh import handle_dsh_slash_command
+            return await handle_dsh_slash_command(text, user_id)
+        else:
+            from .agy import handle_slash_command
+            return await handle_slash_command(text, user_id)
+    except (ImportError, ModuleNotFoundError) as e:
+        return format_error("缺少依赖", str(e))
 
 
 def _cmd_backend(args: str, user_id: str) -> str:
@@ -469,6 +475,18 @@ def _cmd_backend(args: str, user_id: str) -> str:
             f"❌ **未知引擎** ❌\n\n支持: {backend_list}\n\n"
             f"`/backend {'` 或 `/backend '.join(KNOWN_BACKENDS)}`"
         )
+    # 切换前先探测依赖（如 dsh 依赖 PyYAML），依赖缺失时保持原 prefs
+    if name == "dsh":
+        try:
+            from .dsh import clear_memory, clear_session_id
+        except (ImportError, ModuleNotFoundError) as e:
+            return format_error("缺少依赖", str(e))
+    elif name == "codex":
+        try:
+            from .codex import _delete_codex_thread_id
+        except (ImportError, ModuleNotFoundError) as e:
+            return format_error("缺少依赖", str(e))
+
     prefs = load_prefs(user_id)
     old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
@@ -479,8 +497,10 @@ def _cmd_backend(args: str, user_id: str) -> str:
         clear_initialized(session_dir, backend=new)
         # codex 的续聊依赖 .codex_thread_id，切换时一并清掉避免指向旧会话
         if new == "codex":
-            from .codex import _delete_codex_thread_id
             _delete_codex_thread_id(session_dir)
+        elif new == "dsh":
+            clear_memory(user_id)
+            clear_session_id(user_id)
         return (
             f"✅ **助手引擎已切换** ✅\n\n"
             f"`{old}` → `{new}`\n"

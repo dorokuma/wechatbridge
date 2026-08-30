@@ -61,6 +61,15 @@ def get_session_dir(user_id: str) -> str:
     return os.path.join(config.session_base_dir, sanitize_user_id(user_id))
 
 
+def get_dsh_state_dir() -> str:
+    """Return the root directory for bridge-private dsh state (outside session_base_dir)."""
+    if hasattr(config, "dsh_state_dir") and config.dsh_state_dir:
+        return config.dsh_state_dir
+    sess_base = config.session_base_dir
+    parent = os.path.dirname(os.path.abspath(sess_base))
+    return os.path.join(parent, "dsh_state")
+
+
 def ensure_session_dir(user_id: str) -> str:
     """Create per-user session dir with mode 0700 and return its path."""
     path = get_session_dir(user_id)
@@ -1395,6 +1404,16 @@ def _clean_user_history(user_dir: str, cutoff: float) -> int:
     removed += _clean_codex_sessions(
         os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL), cutoff
     )
+    # Legacy dsh files directly under user_dir (migrated/obsolete)
+    for fn in ("dsh_session_id", "dsh_memory.jsonl"):
+        fp = os.path.join(user_dir, fn)
+        try:
+            if os.path.isfile(fp) and os.lstat(fp).st_mtime < cutoff:
+                os.remove(fp)
+                removed += 1
+                logger.info("Session cleanup: removed legacy dsh file %s", fp)
+        except OSError as e:
+            logger.warning("Session cleanup failed for %s: %s", fp, e)
     return removed
 
 
@@ -1472,22 +1491,30 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
             except OSError as e:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
-    # dsh: no per-user session history (transcripts live in host DSH_HOME/sessions);
-    # clear .initialized.dsh flag when cleaning session
-    flag = os.path.join(user_dir, ".initialized.dsh")
-    if os.path.exists(flag):
-        try:
-            os.remove(flag)
-            cleared["dsh"] = True
-            logger.info(
-                "Session cleanup: cleared .initialized.dsh for %s",
-                user_dir,
-            )
-        except OSError as e:
-            logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
+    # dsh: transcripts live in host DSH_HOME/sessions or bridge-private state dir;
+    # clear .initialized.dsh flag only when no active memory/session remains
+    user_name = os.path.basename(user_dir)
+    dsh_priv = os.path.join(get_dsh_state_dir(), user_name)
+    dsh_has = (
+        _dir_has_any_file(dsh_priv)
+        or os.path.exists(os.path.join(user_dir, "dsh_memory.jsonl"))
+        or os.path.exists(os.path.join(user_dir, "dsh_session_id"))
+    )
+    if not dsh_has:
+        flag = os.path.join(user_dir, ".initialized.dsh")
+        if os.path.exists(flag):
+            try:
+                os.remove(flag)
+                cleared["dsh"] = True
+                logger.info(
+                    "Session cleanup: cleared .initialized.dsh for %s (no dsh history left)",
+                    user_dir,
+                )
+            except OSError as e:
+                logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
     # Legacy: clean shared .initialized if no history at all
-    if not grok_has and not agy_has and not codex_has:
+    if not grok_has and not agy_has and not codex_has and not dsh_has:
         flag = os.path.join(user_dir, ".initialized")
         if os.path.exists(flag):
             try:
@@ -1539,6 +1566,8 @@ def clean_session_data(
     if os.path.isdir(base):
         try:
             for name in os.listdir(base):
+                if name.startswith("."):
+                    continue
                 user_dir = os.path.join(base, name)
                 if not os.path.isdir(user_dir):
                     continue
@@ -1550,6 +1579,34 @@ def clean_session_data(
                 _clear_initialized_if_no_history(user_dir)
         except OSError as e:
             logger.error("Session data cleanup error: %s", e)
+
+    # Clean private dsh bridge state data (dsh_state/<user_id>/...)
+    dsh_state_base = get_dsh_state_dir()
+    if os.path.isdir(dsh_state_base):
+        try:
+            for uname in os.listdir(dsh_state_base):
+                if uname.startswith("."):
+                    continue
+                upath = os.path.join(dsh_state_base, uname)
+                if os.path.isdir(upath):
+                    removed += _remove_old_files_under(upath, hist_cutoff)
+                    _try_rmdir_empty(upath)
+            _try_rmdir_empty(dsh_state_base)
+        except OSError as e:
+            logger.error("DSH bridge state data cleanup error: %s", e)
+
+    # Clean legacy private dsh bridge data if present under session_base_dir (.dsh_bridge/<user_id>/...)
+    legacy_dsh_bridge = os.path.join(base, ".dsh_bridge")
+    if os.path.isdir(legacy_dsh_bridge):
+        try:
+            for uname in os.listdir(legacy_dsh_bridge):
+                upath = os.path.join(legacy_dsh_bridge, uname)
+                if os.path.isdir(upath):
+                    removed += _remove_old_files_under(upath, hist_cutoff)
+                    _try_rmdir_empty(upath)
+            _try_rmdir_empty(legacy_dsh_bridge)
+        except OSError as e:
+            logger.error("Legacy DSH bridge data cleanup error: %s", e)
 
     # Machine-wide dsh session history cleanup (DSH_HOME/sessions/<cwd-key>/<id>/)
     # Only runs when WECHATBRIDGE_DSH_HOME was explicitly configured to prevent

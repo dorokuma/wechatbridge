@@ -47,11 +47,16 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 ### dsh 后端说明
 
-- **单轮会话 + 桥接记忆：** `headless` profile 每次调用都新建会话（`session-<uuid>`），所以由桥本身为每用户保存最近对话（默认最近 10 轮，存于每用户 `dsh_memory.jsonl`）并注入每次提问——跨消息保持连续对话与长期记忆。`/clear` / `/new` 会清空该记忆重新开始；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 暂未接通（会返回"暂不支持"提示）。
-- 以 `dsh --profile headless -- <提示>` 运行，`cwd` = 每用户会话目录（每用户工作区；模型生成的文件落在那里，可经 CDN 回传）。
+- **dsh 是什么：** DeepSeek Harness CLI（`dsh`），通过 `headless` profile 单轮执行任务。
+- **启用与切换：** 可在 `.env` 中设置全局 `WECHATBRIDGE_BACKEND=dsh`，或在微信中通过 `/backend dsh` 按用户切换。
+- **依赖说明（PyYAML）：** dsh 后端需要 `PyYAML` 解析 profile 插件配置。若缺少依赖，`/backend dsh` 会返回明确报错且保持原引擎偏好不变。安装方式：`pip install PyYAML` 或 `pipx inject wechatbridge-cli PyYAML`。
+- **窗口记忆（默认模式）：** `headless` profile 每次调用均新建会话（`session-<uuid>`），由桥维护长期对话记忆：最近对话轮数（默认 10 轮对，最多 `WECHATBRIDGE_DSH_MEMORY_CHARS` 字符）存于 `dsh_memory.jsonl` 并自动注入每次提问。`/clear` 或 `/new` 清空该记忆以重新开始。
+- **常驻会话模式（resume）：** 设置 `WECHATBRIDGE_DSH_RESUME=true` 开启真正的常驻会话模式（类似 codex resume）。要求 headless profile 挂载 `dsh-bridge-runner` 插件（`dsh_bridge_runner.py`，从环境变量读取 `DSH_BRIDGE_SESSION_ID` 与 `DSH_BRIDGE_TASK`）。上下文在同一会话内原生累积，无窗口截断。`/clear` 或 `/new` 会删除存储的会话 ID 并开启新会话。开启常驻模式时，自动跳过窗口记忆注入。
+- **工作区与状态隔离：** 以 `dsh --profile headless -- <提示>` 运行，`cwd` = 每用户会话目录（`WECHATBRIDGE_SESSION_DIR/<user_id>`）。桥私有状态文件（`dsh_memory.jsonl` 与持久会话 ID）保存在 `WECHATBRIDGE_DSH_STATE_DIR`（`~/.local/share/wechatbridge/<实例名>/dsh_state/`），独立于子进程会话目录树，杜绝一级相对路径穿越（`../`）。
+- **威胁模型：** 子进程以相同宿主 UID 运行，无容器沙箱隔离。虽然一级相对穿越（`../`）无法访问私有状态，但同 UID 下二级相对穿越（`../../dsh_state/<user_id>`）在文件系统层面可达且已接受。请作为可信用户工具部署。
 - 图片/文件附件对 dsh 以 @绝对路径 文本并入 prompt。经 dsh v0.1.1-rc.2 源码验证：`headless` profile 不会在 CLI/运行时层面预读取或内联 @mention 文件，而是将 prompt 作为纯文本直接提交给模型，模型依赖系统提示感知 @ 路径并在需要时自行调用 `read` 等工具；桥仅拦截绝对路径与 ~ 开头的越界 mention（`@/abs`、`@~/x`、`@file://`，替换为 `[blocked-path]`），是 prompt 文本层的 best-effort 过滤，不是沙箱边界。
-- 认证 / profile 为**机器级共享**（`~/.dsh`，与 grok 机器级登录同模型）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。显式设置 `WECHATBRIDGE_DSH_HOME` 时使用专用主目录并开启自动会话保留清理；未设置时复用宿主 `~/.dsh`，不执行自动会话清理，由操作员自行管理。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
-- **状态：** 基于已发布的 dsh CLI 契约（headless bundle 源码）与测试用 fake CLI 实现；最终需由真实用户在 `dsh login` + headless 实跑后验收。
+- 认证 / profile 为**机器级共享**（回退优先级：`WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`，与 grok/codex 宿主回退模型一致）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。显式设置 `WECHATBRIDGE_DSH_HOME` 时使用专用主目录并开启自动会话保留清理；未设置时回退至 `$WECHATBRIDGE_HOST_HOME/.dsh`（若设置）或 `~/.dsh`，不执行自动会话清理，由操作员自行管理。若桥以专用系统用户（如 `wechatbridge`）运行，可设置 `WECHATBRIDGE_HOST_HOME` 指向操作员主目录以复用 CLI凭证与 profile。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
+- **状态：** 基于已发布的 dsh CLI 契约与测试套件（fake CLI）覆盖实现。常驻 resume 模式需用户在 dsh profile 中自行挂载 `dsh-bridge-runner` 插件，本仓库不附带插件文件。
 
 ### grok 后端说明
 
@@ -149,7 +154,9 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh 后端：注入上下文的最近对话轮数（user+assistant 对） |
 | `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh 后端：注入记忆上下文的字符上限 |
 | `WECHATBRIDGE_DSH_RESUME` | `false` | dsh 后端：常驻会话模式——每用户一个 dsh 会话，每条消息恢复同一会话（codex 式）；需在 headless profile 挂载 dsh-bridge-runner 插件；启用时跳过窗口记忆 |
-| `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 复用宿主 `~/.dsh` 且不自动清理 |
+| `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 回退至 `WECHATBRIDGE_HOST_HOME/.dsh` 或 `~/.dsh` 且不自动清理（优先级：`WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`） |
+| `WECHATBRIDGE_HOST_HOME` | _空_ | 宿主用户主目录覆盖（服务用户部署时使用；用作 grok `~/.grok`、codex `~/.codex`、dsh `~/.dsh` 的回退基准路径） |
+| `WECHATBRIDGE_DSH_STATE_DIR` | _派生_ | 桥私有 dsh 状态目录（记忆 JSONL 与持久会话 ID；默认 `~/.local/share/wechatbridge/<实例名>/dsh_state`） |
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔（空 = 全开） |
@@ -239,8 +246,8 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | 指令 | 作用 |
 |---|---|
 | `/help` | 按当前后端列出支持指令 |
-| `/backend <agy\|grok\|codex\|dsh>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态——agy/grok 标记与 codex `thread_id`/resume——下次起新会话；历史文件可能仍在，靠保留策略清理） |
-| `/clear` 或 `/new` | 丢掉续聊标记，下次 CLI 起新对话（不会立刻删除历史文件） |
+| `/backend <agy\|grok\|codex\|dsh>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态——agy/grok 标记、codex `thread_id`/resume，或 dsh 记忆/会话 ID——下次起新会话；历史文件可能仍在，靠保留策略清理） |
+| `/clear` 或 `/new` | 开启新对话（agy/grok：丢弃续聊标记；codex：清空 thread_id；dsh：清空窗口记忆或常驻会话 ID） |
 | `/model <名称>` | 设模型（各后端均对照实时列表校验：agy/grok 走 CLI `models`；codex 走 `codex debug models`，失败或空再试 `--bundled`；未知名或列表拉取失败则拒绝且不写 prefs；见 `/models`） |
 | `/models` | 列出可用模型——agy/grok/codex 均向 CLI 实时查询（codex：`debug models`；仅在实时列表拉不到时才回退内置参考说明） |
 | `/fast` | 设为低推理开销（**只开不关**，不是来回切换） |
@@ -262,7 +269,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 - **CLI 自动批准。** agy 带 `--dangerously-skip-permissions`；grok 带 `--always-approve`（planning 模式除外）；dsh 的模型工具无宿主路径约束。只适合可信用户，不是多租户沙箱。
 - **危险闸门是关键词匹配**，不是完整意图识别。默认针对具体模式（如 `rm -rf /`、管道进 shell、`mkfs`、`format c:`、少量重型中文句式等）。日常里单独一个「删除」**不会**拦。可用 `WECHATBRIDGE_CONFIRM_KEYWORDS` 自定义；确认口令 `WECHATBRIDGE_CONFIRM_TOKEN`（默认 `y`），等待 `WECHATBRIDGE_PENDING_TTL`。
 - **入站媒体**有大小上限（默认 20 MB）、流式下载、CDN 域名白名单；缺 `aes_key` 会明确报错。
-- **出站产物**只从用户允许目录发出（agy：会话 scratch；grok：会话目录下），经 `realpath` 检查，且不超过 `WECHATBRIDGE_MAX_OUTBOUND_BYTES`。
+- **出站产物**只从用户允许目录发出（agy：会话 scratch；grok：会话目录下；dsh：会话目录下），经 `realpath` 检查，且不超过 `WECHATBRIDGE_MAX_OUTBOUND_BYTES`。
 - **并发：** 全局同时处理上限默认 4。同一用户串行，排队等自己上一条时**不占**全局槽；不同用户可并行，受全局上限约束。
 - **长回复**按字数切块（`WECHATBRIDGE_MESSAGE_CHUNK`，默认 2000）。
 - **数据目录：** 默认 `~/.local/share/wechatbridge/<instance>/`（可 env 覆盖）。运行目录倾向 `0700`，token/二维码倾向 `0600`（Unix；Windows 依赖 NTFS ACL）。
@@ -273,7 +280,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 
 - 依赖 agy 和/或 grok 和/或 codex 和/或 dsh，本身不是独立 agent。
 - **codex** 后端尚未在真实 Codex 订阅/CLI 上实测，仅经源码研究、JSONL fixture 与 fake CLI 测试验证，暂视为社区测试，待真实用户确认。
-- **dsh** 后端每条消息都跑全新的 `headless` 会话；连续性由桥注入的记忆提供（最近 `WECHATBRIDGE_DSH_MEMORY_TURNS` 轮、受 `WECHATBRIDGE_DSH_MEMORY_CHARS` 限制）——因此不是带工具状态连续性的常驻 agent 进程。已通过真实 `dsh login` + headless 实测与测试套件验证。
+- **dsh** 后端支持窗口记忆模式（默认，最近 `WECHATBRIDGE_DSH_MEMORY_TURNS` 轮）与常驻会话模式（`WECHATBRIDGE_DSH_RESUME=true`）。逻辑已由测试套件完整覆盖；常驻 resume 模式需用户自行挂载 `dsh-bridge-runner` 插件（本仓库不附带插件文件）。
 - dsh 的模型 / 强度 / 模式 / 人格 slash 指令尚未接通；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 在 dsh 后端会返回"暂不支持"提示。
 - 语音只靠微信转写；无本地 ASR；转写为空会提示改打字。
 - 不收发视频；不回原生语音气泡（未做 silk 编码）。

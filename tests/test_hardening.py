@@ -2602,5 +2602,200 @@ class TestClearInitializedPreservesHistory(unittest.TestCase):
             self.assertTrue(os.path.exists(prefs_file))
 
 
+_UPDATE_SH = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy", "update.sh"))
+
+
+class TestUpdateScriptPackageMatch(unittest.TestCase):
+    """Test update.sh logic for exact package name matching directly from deploy/update.sh."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script_path = _UPDATE_SH
+        with open(cls.script_path, "r", encoding="utf-8") as f:
+            cls.script_content = f.read()
+
+    def _extract_match_pipelines(self) -> tuple[str, str]:
+        """Extract the exact short-list and full-list matching pipelines from deploy/update.sh."""
+        import re
+        m = re.search(
+            r"if\s+run_pipx\s+list\s+--short\s+2>/dev/null\s*\|\s*(.+?)\s*\|\|\s*run_pipx\s+list\s+2>/dev/null\s*\|\s*(.+?);\s*then",
+            self.script_content,
+        )
+        self.assertIsNotNone(m, f"Could not find run_pipx list condition in {self.script_path}")
+        short_pipe = m.group(1).strip()
+        full_pipe = m.group(2).strip()
+        return short_pipe, full_pipe
+
+    def _test_short_match(self, input_text: str) -> bool:
+        import subprocess
+        short_pipe, _ = self._extract_match_pipelines()
+        p = subprocess.run(["bash", "-c", short_pipe], input=input_text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return p.returncode == 0
+
+    def _test_full_match(self, input_text: str) -> bool:
+        import subprocess
+        _, full_pipe = self._extract_match_pipelines()
+        p = subprocess.run(["bash", "-c", full_pipe], input=input_text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return p.returncode == 0
+
+    def test_script_syntax_valid(self):
+        """deploy/update.sh itself must pass bash syntax check."""
+        import subprocess
+        p = subprocess.run(["bash", "-n", self.script_path], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, f"bash -n failed on update.sh: {p.stderr}")
+
+    def test_short_exact_match(self):
+        self.assertTrue(self._test_short_match("wechatbridge-cli 1.6.0\nother-pkg 0.1\n"))
+
+    def test_short_prefix_no_match(self):
+        self.assertFalse(self._test_short_match("wechatbridge-foo 1.0.0\nwechatbridge 1.0.0\n"))
+
+    def test_full_exact_match(self):
+        self.assertTrue(self._test_full_match("   package wechatbridge-cli 1.6.0, installed using Python 3.13.5\n"))
+
+    def test_full_prefix_no_match(self):
+        self.assertFalse(self._test_full_match("   package wechatbridge-foo 1.6.0, installed using Python 3.13.5\n"))
+        self.assertFalse(self._test_full_match("   package wechatbridge 1.6.0, installed using Python 3.13.5\n"))
+
+    def test_update_script_execution_branches(self):
+        """Execute deploy/update.sh in isolated mock environment to verify upgrade vs install decision."""
+        import subprocess, tempfile, shutil
+        td = tempfile.mkdtemp()
+        try:
+            log_file = os.path.join(td, "pipx.log")
+            mock_pipx = os.path.join(td, "pipx")
+            with open(mock_pipx, "w", encoding="utf-8") as f:
+                f.write(
+                    f"#!/usr/bin/env bash\n"
+                    f"if [ \"$1\" = \"list\" ] && [ \"${{2:-}}\" = \"--short\" ]; then\n"
+                    f"  echo \"${{MOCK_PIPX_SHORT:-}}\"\n"
+                    f"elif [ \"$1\" = \"list\" ]; then\n"
+                    f"  echo \"${{MOCK_PIPX_FULL:-}}\"\n"
+                    f"elif [ \"$1\" = \"upgrade\" ] || [ \"$1\" = \"install\" ]; then\n"
+                    f"  echo \"$*\" >> {log_file!r}\n"
+                    f"fi\n"
+                    f"exit 0\n"
+                )
+            os.chmod(mock_pipx, 0o755)
+
+            mock_wechatbridge = os.path.join(td, "wechatbridge")
+            with open(mock_wechatbridge, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\necho 'wechatbridge 1.6.0'\nexit 0\n")
+            os.chmod(mock_wechatbridge, 0o755)
+
+            systemctl_log = os.path.join(td, "systemctl.log")
+            mock_systemctl = os.path.join(td, "systemctl")
+            with open(mock_systemctl, "w", encoding="utf-8") as f:
+                f.write(
+                    f"#!/usr/bin/env bash\n"
+                    f"echo \"$*\" >> {systemctl_log!r}\n"
+                    f"if [ \"$1\" = \"list-units\" ]; then\n"
+                    f"  echo \"wechatbridge.service loaded active running\"\n"
+                    f"fi\n"
+                    f"exit 0\n"
+                )
+            os.chmod(mock_systemctl, 0o755)
+
+            mock_sudo = os.path.join(td, "sudo")
+            with open(mock_sudo, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/usr/bin/env bash\n"
+                    "while [ $# -gt 0 ]; do\n"
+                    "  case \"$1\" in\n"
+                    "    -u)\n"
+                    "      shift 2\n"
+                    "      ;;\n"
+                    "    -H)\n"
+                    "      shift 1\n"
+                    "      ;;\n"
+                    "    --)\n"
+                    "      shift\n"
+                    "      break\n"
+                    "      ;;\n"
+                    "    *)\n"
+                    "      break\n"
+                    "      ;;\n"
+                    "  esac\n"
+                    "done\n"
+                    "exec \"$@\"\n"
+                )
+            os.chmod(mock_sudo, 0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{td}:{env.get('PATH', '')}"
+            # Test with WECHATBRIDGE_USER differing from whoami to verify sudo option consumption
+            env["WECHATBRIDGE_USER"] = "different_user_for_test"
+
+            # 1. Exact match in short output -> triggers upgrade
+            if os.path.exists(log_file):
+                os.remove(log_file)
+            if os.path.exists(systemctl_log):
+                os.remove(systemctl_log)
+            env["MOCK_PIPX_SHORT"] = "wechatbridge-cli 1.6.0\nfoo 1.0"
+            env["MOCK_PIPX_FULL"] = ""
+            p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(log_file, "r", encoding="utf-8") as f:
+                self.assertIn("upgrade wechatbridge-cli", f.read())
+            self.assertTrue(os.path.exists(systemctl_log))
+            with open(systemctl_log, "r", encoding="utf-8") as f:
+                slog = f.read()
+                self.assertIn("list-units", slog)
+                self.assertIn("restart", slog)
+
+            # 2. Prefix mismatch in short output -> triggers install
+            if os.path.exists(log_file):
+                os.remove(log_file)
+            if os.path.exists(systemctl_log):
+                os.remove(systemctl_log)
+            env["MOCK_PIPX_SHORT"] = "wechatbridge-foo 1.6.0\nwechatbridge 1.6.0"
+            env["MOCK_PIPX_FULL"] = ""
+            p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(log_file, "r", encoding="utf-8") as f:
+                self.assertIn("install wechatbridge-cli", f.read())
+            self.assertTrue(os.path.exists(systemctl_log))
+            with open(systemctl_log, "r", encoding="utf-8") as f:
+                slog = f.read()
+                self.assertIn("list-units", slog)
+                self.assertIn("restart", slog)
+
+            # 3. Exact match in full output -> triggers upgrade
+            if os.path.exists(log_file):
+                os.remove(log_file)
+            if os.path.exists(systemctl_log):
+                os.remove(systemctl_log)
+            env["MOCK_PIPX_SHORT"] = ""
+            env["MOCK_PIPX_FULL"] = "  package wechatbridge-cli 1.6.0, installed using Python 3.13.5\n"
+            p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(log_file, "r", encoding="utf-8") as f:
+                self.assertIn("upgrade wechatbridge-cli", f.read())
+            self.assertTrue(os.path.exists(systemctl_log))
+            with open(systemctl_log, "r", encoding="utf-8") as f:
+                slog = f.read()
+                self.assertIn("list-units", slog)
+                self.assertIn("restart", slog)
+
+            # 4. Prefix mismatch in full output -> triggers install
+            if os.path.exists(log_file):
+                os.remove(log_file)
+            if os.path.exists(systemctl_log):
+                os.remove(systemctl_log)
+            env["MOCK_PIPX_SHORT"] = ""
+            env["MOCK_PIPX_FULL"] = "  package wechatbridge-foo 1.6.0, installed using Python 3.13.5\n"
+            p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(log_file, "r", encoding="utf-8") as f:
+                self.assertIn("install wechatbridge-cli", f.read())
+            self.assertTrue(os.path.exists(systemctl_log))
+            with open(systemctl_log, "r", encoding="utf-8") as f:
+                slog = f.read()
+                self.assertIn("list-units", slog)
+                self.assertIn("restart", slog)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

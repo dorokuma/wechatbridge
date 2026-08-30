@@ -4,7 +4,7 @@
 <dict>
     <key>Label</key>
     <string>com.wechatbridge</string>
-    <!-- pipx installs the entry point under ~/.local/bin — run `pipx install wechatbridge` first.
+    <!-- pipx installs the entry point under ~/.local/bin — run `pipx install wechatbridge-cli` first.
          Config is read from ~/.config/wechatbridge/<instance>.env (see deploy/wechatbridge.env.example). -->
     <key>ProgramArguments</key>
     <array>

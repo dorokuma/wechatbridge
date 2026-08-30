@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 # ExecStart uses %h which resolves to the home directory of the User specified below.
-# Make sure the service user has run: pipx install wechatbridge
+# Make sure the service user has run: pipx install wechatbridge-cli
 ExecStart=%h/.local/bin/wechatbridge
 # Instance-specific config: ~/.config/wechatbridge/%i.env
 # Falls back to ~/.config/wechatbridge/.env

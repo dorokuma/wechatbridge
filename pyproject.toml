@@ -28,6 +28,7 @@ dependencies = [
     "qrcode",
     "Pillow",
     "cryptography",
+    "PyYAML",
 ]
 
 [project.scripts]
