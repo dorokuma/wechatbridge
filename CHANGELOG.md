@@ -5,6 +5,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Documentation
+
+- **README（英文/中文）**：新增 systemd 部署内存限制（`MemoryHigh`/`MemoryMax`）说明与按实例 drop-in 覆盖指引。
+
 ## [1.6.1] - 2026-09-05
 
 ### Fixed

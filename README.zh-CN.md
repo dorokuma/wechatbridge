@@ -163,7 +163,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（agy / grok / codex 后端） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信文件大小上限（100 MB） |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | 入站图片/文件下载后上限（20 MB） |
-| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局同时处理上限；同用户串行且排队不占全局槽；满了回「忙」 |
+| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局同时处理上限；同用户串行且排队不占全局槽；满了回「忙」（小内存主机可调小此项以避免并发 CLI 内存峰值；见[内存限制](#内存限制)） |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | 危险闸门确认口令 |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | 是否启用 `/mcp` 说明指令 |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | 是否启用 `/agent` 提示改写指令 |
@@ -229,6 +229,39 @@ sudo systemctl enable --now wechatbridge@bot3
 
 每个实例读取自己的配置文件（`~/.config/wechatbridge/bot2.env`），数据存放在各自的数据目录（`~/.local/share/wechatbridge/bot2/`）。
 
+#### 内存限制
+
+多实例模板（`deploy/wechatbridge@.service`）内置了 cgroup 内存防护配置：
+
+```ini
+MemoryAccounting=yes
+MemoryHigh=450M
+MemoryMax=512M
+```
+
+- **为什么选这些默认值？** 后端 CLI 子进程（如 `agy`）在单轮处理时 RSS 可达约 276 MB 以上，遇到识图或长会话时峰值更高。在 ~1 GB 内存的主机上，过于严格的硬限制（例如 300 MB）会引发剧烈的换页抖动、高昂的 swap 延迟以及流式传输中断（`subscriber fell behind updates`）。`450M` 软限制（`MemoryHigh`）会触发温和的内存回收，而 `512M`（`MemoryMax`）提供了硬顶 ceiling，防止整机 OOM。
+- **通过 drop-in 按实例覆盖：** 无需修改基础 unit 模板即可单独调整内存限：
+  ```bash
+  sudo mkdir -p /etc/systemd/system/wechatbridge@bot2.service.d/
+  cat << 'EOF' | sudo tee /etc/systemd/system/wechatbridge@bot2.service.d/memory.conf
+  [Service]
+  # 适用于 >= 2 GB 内存的主机
+  MemoryHigh=600M
+  MemoryMax=768M
+  EOF
+  sudo systemctl daemon-reload
+  sudo systemctl restart wechatbridge@bot2
+  ```
+  查看生效中的限制：
+  ```bash
+  systemctl show wechatbridge@bot2 -p MemoryHigh,MemoryMax
+  ```
+- **容量规划指引：** 默认值针对小内存主机（~1 GB RAM）调优。在余量充裕的较大主机上可适当放宽。部署多实例时注意：每个实例运行在独立的 service cgroup 中 — 需按全部运行实例最坏情况下的总上限（`N × MemoryMax`）规划内存预算。
+- **与并发的交互：** 重型任务并发（例如多位用户同时发送图片）会成倍增加后端 CLI 的内存开销。在内存受限的主机上，优先降低 `WECHATBRIDGE_MAX_CONCURRENT`（如调至 `2` 或 `1`），再考虑调大内存上限。
+- **Swap 配置：** 避免收紧 `MemorySwapMax` — swap 余量是重要的安全缓冲，能在承压时降速运行而非直接触发 cgroup OOM kill。
+- **单实例部署：** 单实例模板 `deploy/wechatbridge.service` 未内置内存限。小内存主机走单实例路径时，应自行使用 drop-in 加限（上述命令中的路径替换为 `/etc/systemd/system/wechatbridge.service.d/` 即可逐字复用）。
+- **平台适用性：** 这些 cgroup 内存限制仅适用于 Linux systemd 部署；macOS（launchd）与 Windows（任务计划程序）路径没有等价的按实例上限限制。
+
 ### macOS（launchd）
 
 ```bash
@@ -270,7 +303,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 - **危险闸门是关键词匹配**，不是完整意图识别。默认针对具体模式（如 `rm -rf /`、管道进 shell、`mkfs`、`format c:`、少量重型中文句式等）。日常里单独一个「删除」**不会**拦。可用 `WECHATBRIDGE_CONFIRM_KEYWORDS` 自定义；确认口令 `WECHATBRIDGE_CONFIRM_TOKEN`（默认 `y`），等待 `WECHATBRIDGE_PENDING_TTL`。
 - **入站媒体**有大小上限（默认 20 MB）、流式下载、CDN 域名白名单；缺 `aes_key` 会明确报错。
 - **出站产物**只从用户允许目录发出（agy：会话 scratch；grok：会话目录下；dsh：会话目录下），经 `realpath` 检查，且不超过 `WECHATBRIDGE_MAX_OUTBOUND_BYTES`。
-- **并发：** 全局同时处理上限默认 4。同一用户串行，排队等自己上一条时**不占**全局槽；不同用户可并行，受全局上限约束。
+- **并发：** 全局同时处理上限默认 4。同一用户串行，排队等自己上一条时**不占**全局槽；不同用户可并行，受全局上限约束（重型并发任务会成倍增加子进程内存开销；见[内存限制](#内存限制)）。
 - **长回复**按字数切块（`WECHATBRIDGE_MESSAGE_CHUNK`，默认 2000）。
 - **数据目录：** 默认 `~/.local/share/wechatbridge/<instance>/`（可 env 覆盖）。运行目录倾向 `0700`，token/二维码倾向 `0600`（Unix；Windows 依赖 NTFS ACL）。
 - **清理：** 会话临时文件与对话历史用不同 TTL（`WECHATBRIDGE_SESSION_RETENTION_DAYS`、`WECHATBRIDGE_HISTORY_RETENTION_DAYS`）。偏好/登录信息不按此删。

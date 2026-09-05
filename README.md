@@ -163,7 +163,7 @@ Key variables (all have defaults):
 | `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (agy / grok / codex backends) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
-| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply |
+| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply (on small RAM hosts, lower this to avoid concurrent CLI memory spikes; see [Memory limits](#memory-limits)) |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | reply this token to approve a gated dangerous prompt |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | enable the `/mcp` help text command |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | enable the `/agent` prompt-rewrite command |
@@ -229,6 +229,39 @@ sudo systemctl enable --now wechatbridge@bot3
 
 Each instance reads its own config file (`~/.config/wechatbridge/bot2.env`) and keeps state under its own data directory (`~/.local/share/wechatbridge/bot2/`).
 
+#### Memory limits
+
+The multi-instance template (`deploy/wechatbridge@.service`) configures cgroup memory protection:
+
+```ini
+MemoryAccounting=yes
+MemoryHigh=450M
+MemoryMax=512M
+```
+
+- **Why these defaults?** Backend CLI child processes (such as `agy`) can reach ~276 MB+ RSS during a single turn, and spike even higher during image recognition or long conversational sessions. A tight hard cap (e.g. 300 MB) on ~1 GB RAM hosts triggers aggressive page thrashing, deep swap latency, and stream interruptions (`subscriber fell behind updates`). The `450M` soft limit (`MemoryHigh`) triggers gentle reclaim, while `512M` (`MemoryMax`) provides a hard ceiling preventing full-host OOM.
+- **Overriding per-instance via drop-in:** Override memory limits without modifying the base unit template:
+  ```bash
+  sudo mkdir -p /etc/systemd/system/wechatbridge@bot2.service.d/
+  cat << 'EOF' | sudo tee /etc/systemd/system/wechatbridge@bot2.service.d/memory.conf
+  [Service]
+  # for hosts with >= 2 GB RAM
+  MemoryHigh=600M
+  MemoryMax=768M
+  EOF
+  sudo systemctl daemon-reload
+  sudo systemctl restart wechatbridge@bot2
+  ```
+  Verify active limits:
+  ```bash
+  systemctl show wechatbridge@bot2 -p MemoryHigh,MemoryMax
+  ```
+- **Sizing guidance:** The defaults are tuned for small hosts (~1 GB RAM). On larger hosts with ample headroom, limits can be relaxed. When deploying multiple instances, note that each instance runs in its own service cgroup — budget for the worst-case combined ceiling of N × MemoryMax across running instances.
+- **Interaction with concurrency:** Concurrent heavy turns (e.g. multiple users sending images at once) multiply backend CLI memory consumption. On memory-constrained hosts, prioritize lowering `WECHATBRIDGE_MAX_CONCURRENT` (e.g. to `2` or `1`) before increasing memory caps.
+- **Swap configuration:** Avoid tightening `MemorySwapMax` — swap margin serves as a vital safety buffer that slows execution under pressure instead of triggering an immediate cgroup OOM kill.
+- **Single-instance deployments:** The single-instance unit `deploy/wechatbridge.service` does not include built-in memory caps. On small RAM hosts using the single-instance path, apply limits via drop-in (the snippet above works verbatim for `/etc/systemd/system/wechatbridge.service.d/`).
+- **Platform scope:** These cgroup memory limits apply only to Linux systemd deployments; the macOS (launchd) and Windows (Task Scheduler) paths have no equivalent per-instance cap.
+
 ### macOS (launchd)
 
 ```bash
@@ -270,7 +303,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 - **Danger gate is keyword-based**, not full intent understanding. Defaults target concrete patterns (`rm -rf /`, pipe-to-shell, `mkfs`, `format c:`, a few heavy Chinese phrases, …). Everyday wording like bare “delete” is **not** gated. Override list via `WECHATBRIDGE_CONFIRM_KEYWORDS`; approve with `WECHATBRIDGE_CONFIRM_TOKEN` (default `y`), TTL `WECHATBRIDGE_PENDING_TTL`.
 - **Inbound media** is size-capped (default 20 MB), streamed, and CDN hosts are allowlisted. Missing `aes_key` returns a clear error.
 - **Outbound artifacts** only leave the allowed per-user tree (agy: session scratch; grok: under session dir; dsh: under session dir), after `realpath` checks, and only if under `WECHATBRIDGE_MAX_OUTBOUND_BYTES`.
-- **Concurrency:** global process-slot cap (`WECHATBRIDGE_MAX_CONCURRENT`, default 4). Same user is serialized and does **not** hold a global slot while waiting on their previous message; different users can run in parallel up to the cap.
+- **Concurrency:** global process-slot cap (`WECHATBRIDGE_MAX_CONCURRENT`, default 4). Same user is serialized and does **not** hold a global slot while waiting on their previous message; different users can run in parallel up to the cap (heavy concurrent tasks multiply subprocess memory; see [Memory limits](#memory-limits)).
 - **Long replies** are split into chunks (`WECHATBRIDGE_MESSAGE_CHUNK`, default 2000 characters).
 - **Data layout:** instance data under `~/.local/share/wechatbridge/<instance>/` (override with env). Runtime dirs prefer `0700`; token/QR files prefer `0600` (Unix; Windows relies on NTFS ACLs).
 - **Retention:** session temps vs dialogue history use separate TTLs (`WECHATBRIDGE_SESSION_RETENTION_DAYS`, `WECHATBRIDGE_HISTORY_RETENTION_DAYS`). Prefs/auth are kept.
