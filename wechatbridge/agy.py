@@ -18,7 +18,7 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
-    format_error, format_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
+    format_error, format_cli_error, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir,
 )
 
@@ -53,6 +53,22 @@ def extract_artifacts(text: str) -> list[tuple[str, str]]:
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
     return result
+
+
+def _is_transient_stream_error(stderr_text: str) -> str | None:
+    """Check if stderr indicates a transient stream error eligible for retry.
+
+    Returns "cascade" for cascade/response timeouts, "stream" for agent stream
+    interruption, or None if not retriable.
+    """
+    if not stderr_text:
+        return None
+    cat = _classify_cli_error(stderr_text, backend="agy")
+    if cat == "cascade_timeout":
+        return "cascade"
+    if cat == "agent_stream_interrupted":
+        return "stream"
+    return None
 
 
 def ensure_user_gemini(user_id: str) -> str:
@@ -235,8 +251,15 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                 stderr_text,
             )
             if not stdout_text and stderr_text:
-                if "timeout waiting for cascade" in stderr_text.lower() or "timeout waiting for response" in stderr_text.lower():
-                    logger.warning("Cascade/API timeout detected for user %s, retrying once automatically", user_id)
+                err_kind = _is_transient_stream_error(stderr_text)
+                if err_kind:
+                    logger.warning(
+                        "Transient stream error (%s) detected for user %s, retrying once automatically",
+                        err_kind,
+                        user_id,
+                    )
+                    if err_kind == "stream":
+                        await asyncio.sleep(3)
                     retry_process = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
@@ -257,10 +280,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                             timeout, user_id,
                         )
                         await terminate_process(retry_process, graceful=True)
-                        return format_error(
-                            "模型响应超时",
-                            "模型响应超时，自动重试仍超时。请稍后重试或简化指令。",
-                        ), []
+                        if err_kind == "cascade":
+                            return format_error(
+                                "模型响应超时",
+                                "模型响应超时，自动重试仍超时。请稍后重试或简化指令。",
+                            ), []
+                        return format_cli_error(stderr_text, backend="agy"), []
                     except (asyncio.CancelledError, Exception):
                         await terminate_process(retry_process, graceful=False)
                         raise
@@ -278,10 +303,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         ):
                             mark_initialized(session_dir, backend="agy")
                         return r_display, r_artifacts
-                    return format_error(
-                        "模型响应超时",
-                        "模型响应超时，自动重试仍失败。请稍后重试或简化指令。",
-                    ), []
+                    if err_kind == "cascade":
+                        return format_error(
+                            "模型响应超时",
+                            "模型响应超时，自动重试仍失败。请稍后重试或简化指令。",
+                        ), []
+                    return format_cli_error(r_stderr_text or stderr_text, backend="agy"), []
                 return format_cli_error(stderr_text, backend="agy"), []
             # Non-zero exit: never treat raw stdout as a normal success reply
             raw = stderr_text or stdout_text or display or "process exited abnormally"

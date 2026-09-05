@@ -5,6 +5,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-05
+
+### Fixed
+
+- **agy 流中断分类与提示**：agy CLI 出现 `subscriber fell behind updates`、`connection to the agent was interrupted`、`conversation update stream failed` 等流中断时，新增 `agent_stream_interrupted` 分类与「助手连接中断」中文提示（原落入 unknown 兜底「执行失败」），引导用户发 `/new` 开始新会话或稍后再试。
+
+### Changed
+
+- **agy 流中断自动重试**：检测到流中断错误时自动重试一次（退避 3s 避开瞬时连接抖动），重试有输出即视为恢复；`cascade` 响应超时保持原重试行为（不退避）。
+- **deploy 模板内存限调整**：`deploy/wechatbridge@.service` 内存限制由 `MemoryMax=300M` 调整为 `MemoryHigh=450M` + `MemoryMax=512M`，避免 agy 子进程识图/长会话瞬时 RSS（~276M）触顶导致深度换页卡顿与流中断。
+
 ## [1.6.0] - 2026-08-30
 
 ### Added

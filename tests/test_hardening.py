@@ -2302,6 +2302,28 @@ class TestClassifyCliError(unittest.TestCase):
     def test_network_unreachable(self):
         self.assertEqual(self._cat("network is unreachable"), "network")
 
+    # --- agent_stream_interrupted -------------------------------------------------
+
+    def test_agent_stream_interrupted_real_error(self):
+        err = "Error: the connection to the agent was interrupted before the response finished: subscriber fell behind updates, stalled for 8s"
+        self.assertEqual(self._cat(err), "agent_stream_interrupted")
+
+    def test_agent_stream_interrupted_stalled_variants(self):
+        self.assertEqual(self._cat("subscriber fell behind updates, stalled for 5s"), "agent_stream_interrupted")
+        self.assertEqual(self._cat("subscriber fell behind updates, stalled for 13s"), "agent_stream_interrupted")
+        self.assertEqual(self._cat("subscriber fell behind updates, stalled for 13 s"), "agent_stream_interrupted")
+        self.assertEqual(self._cat("stalled for 8s"), "agent_stream_interrupted")
+
+    def test_agent_stream_interrupted_conversation_stream_failed(self):
+        self.assertEqual(self._cat("conversation update stream failed"), "agent_stream_interrupted")
+
+    def test_agent_stream_interrupted_connection_interrupted(self):
+        self.assertEqual(self._cat("connection to the agent was interrupted"), "agent_stream_interrupted")
+
+    def test_agent_stream_interrupted_negative_installed(self):
+        err = "package wechatbridge-cli 1.6.0, installed using Python 3.13.5"
+        self.assertNotEqual(self._cat(err), "agent_stream_interrupted")
+
     # --- cascade_timeout ----------------------------------------------------------
 
     def test_cascade_timeout(self):
@@ -2404,6 +2426,12 @@ class TestFormatCliErrorCategories(unittest.TestCase):
         out = self._fmt("connection refused")
         self.assertIn("网络错误", out)
 
+    def test_agent_stream_interrupted_copy(self):
+        out = self._fmt("Error: the connection to the agent was interrupted before the response finished: subscriber fell behind updates, stalled for 8s")
+        self.assertIn("助手连接中断", out)
+        self.assertIn("❌", out)
+        self.assertIn("/new", out)
+
     def test_timeout_still_error(self):
         out = self._fmt("timeout")
         self.assertIn("超时", out)
@@ -2438,6 +2466,12 @@ class TestFormatCliErrorNoRawInReply(unittest.TestCase):
         out = self._fmt("rate limit exceeded")
         self.assertNotIn("rate", out.lower())
         self.assertNotIn("limit", out.lower())
+
+    def test_no_raw_agent_stream_interrupted(self):
+        out = self._fmt("Error: the connection to the agent was interrupted before the response finished: subscriber fell behind updates, stalled for 8s")
+        self.assertNotIn("subscriber", out.lower())
+        self.assertNotIn("interrupted", out.lower())
+        self.assertNotIn("stalled", out.lower())
 
 
 class TestFormatCliErrorLogging(unittest.TestCase):
@@ -2795,6 +2829,158 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
                 self.assertIn("restart", slog)
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+
+class _FakeAgyProc:
+    def __init__(self, stdout: str, stderr: str, rc: int = 0, pid: int = 4242):
+        self._stdout = stdout.encode("utf-8")
+        self._stderr = stderr.encode("utf-8")
+        self.returncode = rc
+        self.pid = pid
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+    def kill(self):
+        pass
+
+
+class TestAgyStreamRetry(unittest.IsolatedAsyncioTestCase):
+    """Test agy runner retry behavior for stream interruption and cascade timeouts."""
+
+    def setUp(self):
+        from wechatbridge.config import config
+
+        self.td = tempfile.mkdtemp(prefix="wb-agy-retry-")
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_is_transient_stream_error_helper(self):
+        from wechatbridge.agy import _is_transient_stream_error
+
+        self.assertIsNone(_is_transient_stream_error(""))
+        self.assertEqual(_is_transient_stream_error("timeout waiting for cascade"), "cascade")
+        self.assertEqual(_is_transient_stream_error("timeout waiting for response"), "cascade")
+        self.assertEqual(
+            _is_transient_stream_error("subscriber fell behind updates, stalled for 8s"),
+            "stream",
+        )
+        self.assertEqual(_is_transient_stream_error("conversation update stream failed"), "stream")
+        self.assertEqual(_is_transient_stream_error("connection to the agent was interrupted"), "stream")
+        self.assertIsNone(_is_transient_stream_error("package wechatbridge-cli 1.6.0, installed using Python 3.13.5"))
+        self.assertIsNone(_is_transient_stream_error("some random error"))
+
+    async def test_stream_interrupted_retries_and_recovers(self):
+        from wechatbridge import agy as agy_mod
+
+        calls = 0
+        stream_err = (
+            "Error: the connection to the agent was interrupted before the response finished: "
+            "subscriber fell behind updates, stalled for 8s"
+        )
+
+        async def spawn(*_a, **_k):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _FakeAgyProc("", stream_err, rc=1)
+            return _FakeAgyProc("hello from retry", "", rc=0)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=AsyncMock()), \
+             mock.patch.object(agy_mod.asyncio, "sleep", new=AsyncMock()) as mock_sleep:
+            display, arts = await agy_mod.run_agy("hi", "u-stream-ok")
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(display, "hello from retry")
+        self.assertEqual(arts, [])
+        mock_sleep.assert_awaited_once_with(3)
+
+    async def test_stream_interrupted_retry_fails_returns_stream_interrupted_copy(self):
+        from wechatbridge import agy as agy_mod
+
+        calls = 0
+        stream_err = (
+            "Error: the connection to the agent was interrupted before the response finished: "
+            "subscriber fell behind updates, stalled for 8s"
+        )
+
+        async def spawn(*_a, **_k):
+            nonlocal calls
+            calls += 1
+            return _FakeAgyProc("", stream_err, rc=1)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=AsyncMock()), \
+             mock.patch.object(agy_mod.asyncio, "sleep", new=AsyncMock()) as mock_sleep:
+            display, arts = await agy_mod.run_agy("hi", "u-stream-fail")
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(arts, [])
+        self.assertIn("助手连接中断", display)
+        self.assertIn("❌", display)
+        self.assertIn("/new", display)
+        mock_sleep.assert_awaited_once_with(3)
+
+    async def test_stream_interrupted_retry_timeout_returns_stream_interrupted_copy(self):
+        from wechatbridge import agy as agy_mod
+
+        calls = 0
+        stream_err = (
+            "Error: the connection to the agent was interrupted before the response finished: "
+            "subscriber fell behind updates, stalled for 8s"
+        )
+
+        class _TimeoutProc(_FakeAgyProc):
+            async def communicate(self):
+                raise asyncio.TimeoutError()
+
+        async def spawn(*_a, **_k):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _FakeAgyProc("", stream_err, rc=1)
+            return _TimeoutProc("", "", rc=0)
+
+        mock_term = AsyncMock()
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=mock_term), \
+             mock.patch.object(agy_mod.asyncio, "sleep", new=AsyncMock()):
+            display, arts = await agy_mod.run_agy("hi", "u-stream-timeout")
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(arts, [])
+        self.assertIn("助手连接中断", display)
+        mock_term.assert_awaited_once()
+
+    async def test_cascade_timeout_retries_and_fails_with_cascade_copy(self):
+        from wechatbridge import agy as agy_mod
+
+        calls = 0
+        cascade_err = "Timeout waiting for cascade response"
+
+        async def spawn(*_a, **_k):
+            nonlocal calls
+            calls += 1
+            return _FakeAgyProc("", cascade_err, rc=1)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=AsyncMock()), \
+             mock.patch.object(agy_mod.asyncio, "sleep", new=AsyncMock()) as mock_sleep:
+            display, arts = await agy_mod.run_agy("hi", "u-cascade-fail")
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(arts, [])
+        self.assertIn("模型响应超时", display)
+        mock_sleep.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -298,9 +298,9 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
     Returns one of:
       payload_too_large, context_too_large, invalid_argument,
       auth, resource_exhausted, rate_limit, bare_429, quota,
-      network, timeout, cascade_timeout, permission,
-      session_not_found, model_invalid, command_not_found, not_found,
-      unknown
+      agent_stream_interrupted, network, timeout, cascade_timeout,
+      permission, session_not_found, model_invalid, command_not_found,
+      not_found, unknown
 
     This is a pure function (no I/O, no logging).  ``format_cli_error``
     drives user-facing copy from the category; callers that need the
@@ -434,7 +434,16 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
     ):
         return "bare_429"
 
-    # --- 6. Network ---------------------------------------------------------------
+    # --- 6. Agent stream interrupted ----------------------------------------------
+    if (
+        "subscriber fell behind updates" in lower
+        or "connection to the agent was interrupted" in lower
+        or "conversation update stream failed" in lower
+        or bool(re.search(r"\bstalled for \d+\s*s", lower))
+    ):
+        return "agent_stream_interrupted"
+
+    # --- 7. Network ---------------------------------------------------------------
     if (
         "connection refused" in lower
         or "connection reset" in lower
@@ -449,14 +458,14 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
     ):
         return "network"
 
-    # --- 7. Timeout / cascade -----------------------------------------------------
+    # --- 8. Timeout / cascade -----------------------------------------------------
     if "timeout waiting for cascade" in lower or "timeout waiting for response" in lower:
         return "cascade_timeout"
 
     if "timeout" in lower or "timed out" in lower or "deadline exceeded" in lower:
         return "timeout"
 
-    # --- 8. Permission / misc specific --------------------------------------------
+    # --- 9. Permission / misc specific --------------------------------------------
     if "permission" in lower and ("denied" in lower or "refuse" in lower or "rejected" in lower):
         return "permission"
 
@@ -556,6 +565,15 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
 
     if category == "network":
         return format_error("网络错误", "连不上服务，请检查网络后重试。")
+
+    if category == "agent_stream_interrupted":
+        return format_error(
+            "助手连接中断",
+            (
+                "助手响应流意外中断。\n"
+                "请发 /new 开始新会话或稍后再试。"
+            ),
+        )
 
     if category == "cascade_timeout":
         return format_error(
