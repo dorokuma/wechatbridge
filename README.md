@@ -259,7 +259,7 @@ MemoryMax=512M
 - **Sizing guidance:** The defaults are tuned for small hosts (~1 GB RAM). On larger hosts with ample headroom, limits can be relaxed. When deploying multiple instances, note that each instance runs in its own service cgroup — budget for the worst-case combined ceiling of N × MemoryMax across running instances.
 - **Interaction with concurrency:** Concurrent heavy turns (e.g. multiple users sending images at once) multiply backend CLI memory consumption. On memory-constrained hosts, prioritize lowering `WECHATBRIDGE_MAX_CONCURRENT` (e.g. to `2` or `1`) before increasing memory caps.
 - **Swap configuration:** Avoid tightening `MemorySwapMax` — swap margin serves as a vital safety buffer that slows execution under pressure instead of triggering an immediate cgroup OOM kill.
-- **Single-instance deployments:** The single-instance unit `deploy/wechatbridge.service` does not include built-in memory caps. On small RAM hosts using the single-instance path, apply limits via drop-in (the snippet above works verbatim for `/etc/systemd/system/wechatbridge.service.d/`).
+- **Single-instance deployments:** The single-instance unit `deploy/wechatbridge.service` includes the same built-in memory limits (`MemoryHigh=450M` and `MemoryMax=512M`). To adjust them, override via a drop-in under `/etc/systemd/system/wechatbridge.service.d/` and replace the unit name in the `systemctl` commands above with `wechatbridge`. Takes effect when the unit file is installed or re-installed; `update.sh` upgrades do not touch unit files.
 - **Platform scope:** These cgroup memory limits apply only to Linux systemd deployments; the macOS (launchd) and Windows (Task Scheduler) paths have no equivalent per-instance cap.
 
 ### macOS (launchd)

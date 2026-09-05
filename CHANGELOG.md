@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-09-05
+
+### Changed
+
+- **deploy 模板内存限补全**：单实例 unit `deploy/wechatbridge.service` 内置与多实例模板一致的内存限（`MemoryHigh=450M` + `MemoryMax=512M`）；限值仅在部署或重铺 unit 文件时生效，`update.sh` 升级不改动 unit 文件。
+
 ### Documentation
 
 - **README（英文/中文）**：新增 systemd 部署内存限制（`MemoryHigh`/`MemoryMax`）说明与按实例 drop-in 覆盖指引。

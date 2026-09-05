@@ -12,6 +12,12 @@ EnvironmentFile=-%h/.config/wechatbridge/.env
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5s
+# Cap per-instance RSS so a single busy bot cannot OOM a small host.
+# agy 子进程单轮瞬时 RSS 可达 ~276M（965MiB 小内存主机实测数据），300M 硬限会被识图/长会话顶死导致深度换页与流中断；
+# 450M 软限提前温和回收，512M 硬限兜底防 OOM。
+MemoryAccounting=yes
+MemoryHigh=450M
+MemoryMax=512M
 # Create a dedicated system user if running under a non-root account
 User=wechatbridge
 

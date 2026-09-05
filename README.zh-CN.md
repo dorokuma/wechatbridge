@@ -259,7 +259,7 @@ MemoryMax=512M
 - **容量规划指引：** 默认值针对小内存主机（~1 GB RAM）调优。在余量充裕的较大主机上可适当放宽。部署多实例时注意：每个实例运行在独立的 service cgroup 中 — 需按全部运行实例最坏情况下的总上限（`N × MemoryMax`）规划内存预算。
 - **与并发的交互：** 重型任务并发（例如多位用户同时发送图片）会成倍增加后端 CLI 的内存开销。在内存受限的主机上，优先降低 `WECHATBRIDGE_MAX_CONCURRENT`（如调至 `2` 或 `1`），再考虑调大内存上限。
 - **Swap 配置：** 避免收紧 `MemorySwapMax` — swap 余量是重要的安全缓冲，能在承压时降速运行而非直接触发 cgroup OOM kill。
-- **单实例部署：** 单实例模板 `deploy/wechatbridge.service` 未内置内存限。小内存主机走单实例路径时，应自行使用 drop-in 加限（上述命令中的路径替换为 `/etc/systemd/system/wechatbridge.service.d/` 即可逐字复用）。
+- **单实例部署：** 单实例模板 `deploy/wechatbridge.service` 现已内置与多实例模板相同的内存限（`MemoryHigh=450M` 与 `MemoryMax=512M`）。如需调整，可通过 `/etc/systemd/system/wechatbridge.service.d/` 下的 drop-in 进行覆盖，并注意将上述 `systemctl` 命令中的单元名相应替换为 `wechatbridge`。限值仅在部署或重铺 unit 文件时生效，`update.sh` 升级不改动 unit 文件。
 - **平台适用性：** 这些 cgroup 内存限制仅适用于 Linux systemd 部署；macOS（launchd）与 Windows（任务计划程序）路径没有等价的按实例上限限制。
 
 ### macOS（launchd）
