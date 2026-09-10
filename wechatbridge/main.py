@@ -404,6 +404,73 @@ async def _run_llm_with_guard(
         return _BUSY_USER_TEXT, []
 
 
+async def _maybe_handle_price(
+    client: ILinkClient, from_user: str, context_token: str, text: str
+) -> bool:
+    """Auto-trigger the price lookup for share tokens (jd short links,
+    taokouling, tb short links). Returns True when the message was fully
+    handled (price card already sent); False to continue the normal flow.
+
+    Plain product URLs deliberately pass through to the CLI — the user may
+    want the assistant to work on the page; /price covers those explicitly.
+    """
+    try:
+        from .price import detect_price_trigger, handle_price_query, price_feature_ready
+    except ImportError:
+        return False
+
+    if not price_feature_ready():
+        return False  # 未配置 key: 拦截层不激活,一切照旧
+
+    trigger = detect_price_trigger(text)
+    if not trigger or trigger["kind"] not in ("jd_short", "tkl", "tb_short"):
+        return False
+
+    logger.info("比价触发 from=%s: kind=%s", from_user, trigger["kind"])
+    reply = await handle_price_query(trigger)
+    success = await client.send_message(
+        to_user_id=from_user,
+        text=reply,
+        context_token=context_token,
+        baseurl=client.state.baseurl,
+        bot_token=client.state.bot_token,
+    )
+    if success:
+        logger.info("比价回复已发送到 %s", from_user)
+    else:
+        logger.warning("比价回复发送失败到 %s", from_user)
+    return True
+
+
+async def _cmd_price(args: str) -> str:
+    """Handle /price <链接|分享码|淘口令> — force a price lookup.
+
+    Bridge-native: no CLI subprocess, no global slot usage. This is the
+    explicit trigger for plain product URLs that otherwise pass through.
+    """
+    from .price import detect_price_trigger, handle_price_query, price_feature_ready
+
+    target = args.strip()
+    if not target:
+        return (
+            "💰 **比价** 💰\n\n"
+            "用法: `/price <商品链接|分享码|淘口令>`\n\n"
+            "京东短链/淘口令直接发消息即可自动比价；"
+            "普通商品页链接需要用 /price 触发。"
+        )
+    if not price_feature_ready():
+        return (
+            "ℹ️ **比价功能未启用** ℹ️\n\n"
+            "在桥的 .env 里配置以下任一项后重启：\n"
+            "`JDUNION_APP_KEY` / `JDUNION_APP_SECRET`（京东联盟）\n"
+            "`DATAOKE_APP_KEY`（淘宝/天猫，大淘客代理）"
+        )
+    trigger = detect_price_trigger(target)
+    if not trigger:
+        return "❓ 没认出这是商品链接或分享码。支持：京东短链、淘口令、淘宝分享、京东/淘宝商品页链接。"
+    return await handle_price_query(trigger)
+
+
 async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_token: str):
     """Dispatch slash command to the active backend's handler.
 
@@ -426,6 +493,10 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
     # /agent 也在这里处理：统一走 gate_and_run 确认门，不能绕开 is_dangerous
     if cmd == "/agent":
         return await _cmd_agent(client, args, user_id, context_token)
+
+    # /price — bridge-native price lookup (京东联盟 / 大淘客)
+    if cmd == "/price":
+        return await _cmd_price(args)
 
     if cmd == "/version":
         return (
@@ -1023,6 +1094,13 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             return
 
         logger.info("收到消息 from=%s: %.100s", from_user, text)
+
+        # Price-comparison interception: share tokens (JD short links, taokouling)
+        # auto-trigger; plain product URLs pass through to the CLI. Runs after the
+        # dangerous-prompt confirmation block so confirm flows are not disturbed,
+        # and before slash handling so `/price` resolves here.
+        if await _maybe_handle_price(client, from_user, context_token, text):
+            return
 
         # Slash command interception
         if text.startswith("/"):

@@ -192,8 +192,12 @@ def clean_output(text: str) -> str:
 # WeChat error reply format (fixed header + body)
 # ---------------------------------------------------------------------------
 
-# Shown when backend returns successfully but with no display text
-EMPTY_REPLY = "（这次没有文字回复）"
+# Shown when backend returns successfully but with no display text.
+# Empty output after a successful run is, in practice, an exhausted-quota
+# signal (agy/grok/codex CLI stay exit-0 and just print nothing) — say so
+# explicitly instead of the confusing "no text reply" phrasing.
+EMPTY_REPLY = "🔔 对话额度已用尽\n\n后端没有返回任何内容，通常是本账号的对话额度/用量已耗尽。请稍后再试或联系管理员确认额度。"
+
 
 # Titles used for upstream throttle / quota user replies (🔔 notice style).
 # Keep in sync with format_cli_error branches and is_upstream_throttle_reply.

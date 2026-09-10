@@ -514,7 +514,7 @@ class TestRunDshIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBas
 
     async def test_empty_reply(self):
         display, artifacts = await self._run("hi", mode="empty")
-        self.assertEqual(display, "（这次没有文字回复）")
+        self.assertEqual(display, "🔔 对话额度已用尽\n\n后端没有返回任何内容，通常是本账号的对话额度/用量已耗尽。请稍后再试或联系管理员确认额度。")
         self.assertEqual(artifacts, [])
 
     async def test_nonzero_exit_maps_to_error_bubble(self):
@@ -1210,7 +1210,7 @@ class TestRunDshMemoryIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrat
         display, artifacts = await self._run("继续", user_id=user_id, mode="empty")
         self.assertIn("上下文安全提示", display)
         self.assertIn("历史对话记录触发安全策略", display)
-        self.assertIn("（这次没有文字回复）", display)
+        self.assertIn("对话额度已用尽", display)
 
     async def test_run_dsh_shows_notice_on_error_reply_when_context_dropped(self):
         """When context was dropped and command exits nonzero / fails, safety notice is preserved separately from error bubble."""
