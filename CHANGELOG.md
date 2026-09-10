@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-10
+
+### Added
+
+- **微信内原生比价查询**：新增 `wechatbridge/price.py`，支持京东联盟（京东短链/商品页）与大淘客（淘宝/天猫/淘口令）两个数据源。微信里直接甩京东短链、淘口令等分享码自动触发比价，回「现价/历史最低/优惠券/到手价」卡片；普通商品页 URL 透传给 CLI，可用 `/price <链接|分享码>` 强制比价。未配置 `JDUNION_APP_KEY/SECRET` 或 `DATAOKE_APP_KEY` 时优雅降级（拦截层不激活）。
+
+### Changed
+
+- **空回复文案明确化**：后端成功返回但无文字时，回复由「（这次没有文字回复）」改为「🔔 对话额度已用尽」+ 说明，明确提示是账号额度/用量耗尽，便于用户理解（对应 `EMPTY_REPLY` 常量）。
+
 ## [1.6.2] - 2026-09-05
 
 ### Changed
