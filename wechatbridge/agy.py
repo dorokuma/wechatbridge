@@ -10,13 +10,16 @@ import re
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from urllib.parse import unquote
 
 from .config import config
 from .runner_common import (
+    MAX_ADD_DIRS,
+    _sanitize_prompt_at_paths,
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
-    clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
+    clean_output, load_prefs, save_prefs, is_dangerous, is_sensitive_artifact_path, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir,
@@ -27,22 +30,26 @@ logger = logging.getLogger("agy_runner")
 # execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
 _MAX_ARG_BYTES = 120 * 1024
 
+# Matches markdown [name](file:///path) while supporting one level of balanced
+# brackets in display name and one level of balanced parentheses in path (e.g.
+# "report (1).pdf"), without greedily spanning across multiple links on a line.
+_FILE_LINK_RE = re.compile(
+    r"\[((?:[^\[\]]+|\[[^\[\]]*\])+)\]\(file:///((?:[^()\s]+|\([^()\s]*\))+)\)"
+)
+
 
 def extract_artifacts(text: str) -> list[tuple[str, str]]:
     """Extract (name, absolute_path) tuples from markdown file:/// links.
 
-    Uses regex ``\\[([^\\]]+)\\](file:///([^)]+))`` to find agy-generated
-    artifact references in stdout. Returns deduplicated, order-preserved list.
-
-    Paths and display names are URL-decoded (``urllib.parse.unquote``) so
-    percent-encoded spaces / CJK (e.g. ``my%20report.pdf``, ``%E6%8A%A5%E5%91%8A.pdf``)
-    resolve to real filesystem paths.
+    Supports balanced parentheses in filenames (e.g. ``report (1).pdf``) and
+    URL-decodes (``urllib.parse.unquote``) percent-encoded spaces / CJK.
+    Returns a deduplicated, order-preserved list.
     """
     if not text:
         return []
     seen = set()
     result = []
-    for match in re.finditer(r"\[([^\]]+)\]\(file:///([^)]+)\)", text):
+    for match in _FILE_LINK_RE.finditer(text):
         name = unquote(match.group(1).split("#")[0])
         path_part = unquote(match.group(2).split("#")[0])
         abs_path = path_part if path_part.startswith("/") else "/" + path_part
@@ -88,14 +95,38 @@ def ensure_user_gemini(user_id: str) -> str:
     except OSError:
         pass
 
-    # Copy global auth token if not yet present
+    # Copy or refresh global auth token when missing or older than host token
     # agy standard auth token path, managed by agy CLI
     token_src = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
     token_dst = os.path.join(antigravity_dir, "antigravity-oauth-token")
-    if not os.path.exists(token_dst) and os.path.exists(token_src):
+    if os.path.exists(token_src):
         try:
-            shutil.copy(token_src, token_dst)
-            os.chmod(token_dst, 0o600)
+            src_stat = os.stat(token_src)
+            need_copy = not os.path.exists(token_dst)
+            if not need_copy and src_stat.st_size > 0:
+                try:
+                    dst_stat = os.stat(token_dst)
+                    if src_stat.st_mtime > dst_stat.st_mtime or dst_stat.st_size == 0:
+                        need_copy = True
+                except OSError:
+                    need_copy = True
+            if need_copy and src_stat.st_size > 0:
+                fd, tmp_token = tempfile.mkstemp(
+                    dir=antigravity_dir, prefix=".oauth-token.", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "wb") as fout:
+                        with open(token_src, "rb") as fin:
+                            shutil.copyfileobj(fin, fout)
+                    os.chmod(tmp_token, 0o600)
+                    os.replace(tmp_token, token_dst)
+                except OSError:
+                    if os.path.exists(tmp_token):
+                        try:
+                            os.unlink(tmp_token)
+                        except OSError:
+                            pass
+                    raise
         except OSError as e:
             logger.warning("Failed to copy auth token for %s: %s", user_id, e)
 
@@ -178,14 +209,20 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         cmd += ["--effort", effort]
     if prefs.get("mode"):
         cmd += ["--mode", prefs["mode"]]
-    for d in prefs.get("add_dirs", []):
+    valid_add_dirs = []
+    for d in (prefs.get("add_dirs", []) or [])[:MAX_ADD_DIRS]:
         if not d:
             continue
         ok, resolved = validate_add_dir(d, user_id)
         if ok:
+            valid_add_dirs.append(resolved)
             cmd += ["--add-dir", resolved]
         else:
             logger.warning("Skipping disallowed add_dir for %s: %s (%s)", user_id, d, resolved)
+
+    safe_prompt = _sanitize_prompt_at_paths(
+        prompt, session_dir, extra_roots=valid_add_dirs
+    )
 
     if first:
         logger.info(
@@ -198,7 +235,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             user_id,
         )
 
-    cmd += ["-p", prompt]
+    cmd += ["-p", safe_prompt]
 
     process = None
     try:
@@ -226,7 +263,11 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
         # A: Extract artifacts from raw stdout (before clean_output!)
-        artifacts = extract_artifacts(stdout_text)
+        artifacts = [
+            (n, p)
+            for n, p in extract_artifacts(stdout_text)
+            if not is_sensitive_artifact_path(p, session_dir)
+        ]
 
         # B: (disabled) Scratch diff via before/after snapshots is removed because
         #   multi-user shared scratch causes cross-user artifact leakage.
@@ -237,6 +278,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         display = clean_output(stdout_text) or EMPTY_REPLY
 
         # Strip file:/// links from display to avoid leaking server paths
+        display = _FILE_LINK_RE.sub(r"[\1]", display)
         display = re.sub(
             r"\[([^\]]+)\]\(file:///[^)]+\)",
             r"[\1]",
@@ -293,8 +335,13 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                     r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
                     # Any useful stdout after retry counts as recovered (agy may exit non-zero)
                     if r_stdout_text:
-                        r_artifacts = extract_artifacts(r_stdout_text)
+                        r_artifacts = [
+                            (n, p)
+                            for n, p in extract_artifacts(r_stdout_text)
+                            if not is_sensitive_artifact_path(p, session_dir)
+                        ]
                         r_display = clean_output(r_stdout_text) or EMPTY_REPLY
+                        r_display = _FILE_LINK_RE.sub(r"[\1]", r_display)
                         r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
                         if (
                             first
@@ -310,9 +357,10 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         ), []
                     return format_cli_error(r_stderr_text or stderr_text, backend="agy"), []
                 return format_cli_error(stderr_text, backend="agy"), []
-            # Non-zero exit: never treat raw stdout as a normal success reply
+            # Non-zero exit: never treat raw stdout as a normal success reply,
+            # but preserve any valid non-sensitive artifacts already emitted.
             raw = stderr_text or stdout_text or display or "process exited abnormally"
-            return format_cli_error(raw, backend="agy"), []
+            return format_cli_error(raw, backend="agy"), artifacts
 
         # Success path only — never mark on ❌/🔔 error/throttle bubbles
         if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
@@ -524,26 +572,44 @@ def handle_persona(args: str, user_id: str) -> str:
 
 
 def _cmd_clear(user_id: str) -> str:
-    """Handle /clear or /new: delete .initialized flag to start fresh."""
+    """Handle /clear or /new: delete .initialized flag to start fresh and reset sticky plan mode."""
     session_dir = get_session_dir(user_id)
     clear_initialized(session_dir, backend="agy")
+    prefs_path = os.path.join(session_dir, "prefs.json")
+    if os.path.exists(prefs_path):
+        prefs = load_prefs(user_id)
+        if prefs.get("mode"):
+            update_active_prefs(user_id, mode="")
     return "✅ **对话已重置** ✅"
 
 
-def _cmd_fast(user_id: str) -> str:
-    """Handle /fast: set effort=low (scoped to current backend)."""
+_OFF_ARGS = frozenset({"off", "0", "false", "no", "normal", "default", "reset", "clear", "agent"})
+
+
+def _cmd_fast(user_id: str, args: str = "") -> str:
+    """Handle /fast [on|off]: set effort=low or toggle off (scoped to current backend)."""
+    sub = (args or "").strip().lower()
+    prefs = load_prefs(user_id)
+    if sub in _OFF_ARGS or (not sub and prefs.get("effort") == "low"):
+        update_active_prefs(user_id, effort="")
+        return "✅ **已关闭快速模式** ✅"
     update_active_prefs(user_id, effort="low")
     return "✅ **已开启快速模式** ✅"
 
 
-def _cmd_planning(user_id: str) -> str:
-    """Handle /planning: set mode=plan (scoped to current backend)."""
+def _cmd_planning(user_id: str, args: str = "") -> str:
+    """Handle /planning [on|off]: set mode=plan or toggle off (scoped to current backend)."""
+    sub = (args or "").strip().lower()
+    prefs = load_prefs(user_id)
+    if sub in _OFF_ARGS or (not sub and prefs.get("mode") == "plan"):
+        update_active_prefs(user_id, mode="")
+        return "✅ **已关闭规划模式** ✅"
     update_active_prefs(user_id, mode="plan")
     return "✅ **已开启规划模式** ✅"
 
 
 def _cmd_add_dir(args: str, user_id: str) -> str:
-    """Handle /add-dir <path>: add path to add_dirs list (dedup, validated)."""
+    """Handle /add-dir <path>: add path to add_dirs list (dedup, validated, capped)."""
     path = args.strip()
     if not path:
         return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
@@ -554,10 +620,32 @@ def _cmd_add_dir(args: str, user_id: str) -> str:
     prefs = load_prefs(user_id)
     dirs = prefs.get("add_dirs", [])
     if resolved not in dirs:
+        if len(dirs) >= MAX_ADD_DIRS:
+            return f"❌ **工作目录数量已达上限 ({MAX_ADD_DIRS})** ❌"
         dirs.append(resolved)
         prefs["add_dirs"] = dirs
         save_prefs(user_id, prefs)
     return f"✅ **已添加工作目录** ✅\n\n```\n{resolved}\n```"
+
+
+def _parse_agy_model_ids(output: str) -> list[str]:
+    """Extract canonical model IDs from ``agy models`` output.
+
+    ``agy models`` outputs ``<model_id>\\t<Display Name>`` per line (e.g.
+    ``gemini-4-argon-high\\tGemini 4 Argon (High)``). Strip the display column
+    and any status/banner lines so only valid model slugs are returned.
+    """
+    models: list[str] = []
+    for raw_line in (output or "").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith(("fetching available models", "available models", "error:")):
+            continue
+        model_id = line.split("\t", 1)[0].strip()
+        if model_id and " " not in model_id:
+            models.append(model_id)
+    return models
 
 
 async def _cmd_model(args: str, user_id: str) -> str:
@@ -576,7 +664,7 @@ async def _cmd_model(args: str, user_id: str) -> str:
     if output.startswith("[error]") or is_bridge_formatted_reply(output):
         return "❌ **无法获取模型列表** ❌"
 
-    models = [line.strip() for line in output.split("\n") if line.strip()]
+    models = _parse_agy_model_ids(output)
 
     # Exact match
     if name in models:
@@ -652,10 +740,10 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
         return _cmd_clear(user_id)
 
     if cmd == "/fast":
-        return _cmd_fast(user_id)
+        return _cmd_fast(user_id, args)
 
     if cmd == "/planning":
-        return _cmd_planning(user_id)
+        return _cmd_planning(user_id, args)
 
     if cmd == "/model":
         return await _cmd_model(args, user_id)

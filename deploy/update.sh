@@ -42,7 +42,7 @@ fi
 
 # --- Upgrade (or install if not present) ---
 echo "Upgrading WeChatBridge..."
-if run_pipx list --short 2>/dev/null | awk '{print $1}' | grep -qx "wechatbridge-cli" || run_pipx list 2>/dev/null | grep -q -E "(^|[[:space:]])package[[:space:]]+wechatbridge-cli([[:space:]]|,|$)|(^|[[:space:]])wechatbridge-cli([[:space:]]|$)"; then
+if run_pipx list --short 2>/dev/null | awk '{print $1}' | grep -x "wechatbridge-cli" >/dev/null || run_pipx list 2>/dev/null | grep -E "(^|[[:space:]])package[[:space:]]+wechatbridge-cli([[:space:]]|,|$)|(^|[[:space:]])wechatbridge-cli([[:space:]]|$)" >/dev/null; then
     run_pipx upgrade wechatbridge-cli
 else
     echo "WeChatBridge not yet installed under '$TARGET_USER'. Installing..."

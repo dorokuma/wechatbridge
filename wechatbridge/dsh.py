@@ -52,11 +52,13 @@ from .runner_common import (
     is_bridge_formatted_reply,
     is_dangerous,
     is_first_message,
+    is_sensitive_artifact_path,
     mark_initialized,
     path_is_under,
     sanitize_env,
     sanitize_user_id,
     terminate_process,
+    _sanitize_prompt_at_paths,
     EMPTY_REPLY,
 )
 
@@ -460,14 +462,17 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
         parts = norm_path.split(os.sep)
         if any(part in _DSH_SKIP_DIR_NAMES for part in parts):
             return
+        if is_sensitive_artifact_path(norm_path, cwd):
+            return
         # 按路径去重（同一文件只回传一次；首个显示名优先）
         if path not in seen:
             seen.add(path)
             result.append((name, path))
 
-    # [name](file:///path | /abs | ./rel | ../rel)
+    # [name](file:///path | /abs | ./rel | ../rel) — allow 1-level balanced () in path/name
     for m in re.finditer(
-        r"\[([^\]]+)\]\((file:///[^)\s]+|/(?:[^)\s]*)|\.\.?/[^)\s]+)\)", text
+        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((file:///(?:[^()\s]|\([^()\s]*\))+|/(?:[^()\s]|\([^()\s]*\))*|\.\.?/(?:[^()\s]|\([^()\s]*\))+)\)",
+        text,
     ):
         _add(m.group(1), m.group(2))
     # bare file:///path with greedy match and trailing CJK/punctuation separation
@@ -486,82 +491,20 @@ def _strip_file_links(display: str) -> str:
     """Remove file:/// and absolute/relative link targets from display text
     so server paths never leak to WeChat users."""
     out = re.sub(
-        r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)",
+        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((?:file:///|/|\.\.?/)(?:[^()\s]|\([^()\s]*\))+\)",
         r"[\1]",
         display,
+    )
+    out = re.sub(
+        r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)",
+        r"[\1]",
+        out,
     )
     def _replace_bare(m: re.Match) -> str:
         _, kept = _parse_bare_file_uri(m.group(0))
         return kept
 
     return _BARE_FILE_URI_RE.sub(_replace_bare, out)
-
-
-_AT_TOKEN_RE = re.compile(r"@([^\s@。，！？；、：”’'\"）)\]\}>》」』〉…]+)")
-_AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
-
-
-def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
-    """Replace @<path> mentions pointing outside session_dir with [blocked-path].
-
-    Recognizes @ tokens (ASCII, CJK, relative ./ and ../, ~/ and file://, and
-    bare relative paths containing .. segments).
-    Path candidates outside realpath(session_dir) are replaced with [blocked-path].
-    Legitimate attachments under session_dir and non-path @mentions are preserved intact,
-    while ~ and ~/ paths under session_dir are rewritten to their absolute forms.
-
-    Known limitation:
-      Paths containing spaces are truncated at the space by token splitting
-      and will be judged as blocked paths.
-    """
-    if not prompt:
-        return ""
-
-    def _replace(m: re.Match) -> str:
-        raw_token = m.group(1)
-        clean_token = raw_token.rstrip(_AT_TRAILING_PUNCT)
-        trailing_punct = raw_token[len(clean_token):]
-
-        candidate = clean_token
-        # Determine whether token is a path candidate
-        parts = candidate.split("/")
-        is_candidate = (
-            candidate.startswith(("/", "./", "../", "~/"))
-            or candidate == "~"
-            or "://" in candidate
-            or candidate.startswith("file:")
-            or ("/" in candidate and ".." in parts)
-        )
-        if not is_candidate:
-            return m.group(0)
-
-        # Resolve path candidate
-        p = candidate
-        if p.startswith("file://"):
-            p = p[len("file://"):]
-        elif p.startswith("file:"):
-            p = p[len("file:"):]
-
-        is_tilde = False
-        if p == "~":
-            p = session_dir
-            is_tilde = True
-        elif p.startswith("~/"):
-            p = os.path.join(session_dir, p[2:])
-            is_tilde = True
-
-        if not os.path.isabs(p):
-            target_path = os.path.normpath(os.path.join(session_dir, p))
-        else:
-            target_path = os.path.normpath(p)
-
-        if path_is_under(target_path, session_dir):
-            if is_tilde:
-                return "@" + target_path + trailing_punct
-            return m.group(0)
-        return "[blocked-path]" + trailing_punct
-
-    return _AT_TOKEN_RE.sub(_replace, prompt)
 
 
 def _build_dsh_command(prompt: str, task_as_env: bool = False) -> list:

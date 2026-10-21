@@ -2983,5 +2983,261 @@ class TestAgyStreamRetry(unittest.IsolatedAsyncioTestCase):
         mock_sleep.assert_not_awaited()
 
 
+class TestAuditHardeningFixes(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for deep-audit security and correctness fixes."""
+
+    def setUp(self):
+        from wechatbridge.config import config as cfg
+        self._cfg = cfg
+        self._tmp = tempfile.TemporaryDirectory()
+        self.session_base = self._tmp.name
+        self._orig_base = cfg.session_base_dir
+        self._orig_backend = cfg.backend
+        cfg.session_base_dir = self.session_base
+
+    def tearDown(self):
+        self._cfg.session_base_dir = self._orig_base
+        self._cfg.backend = self._orig_backend
+        self._tmp.cleanup()
+
+    async def test_agy_send_artifacts_allows_session_dir_and_blocks_sensitive_or_hardlink(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.runner_common import ensure_session_dir
+
+        self._cfg.backend = "agy"
+        uid = "u-agy-sec"
+        sdir = ensure_session_dir(uid)
+
+        # Normal artifact directly in session_dir (should be allowed)
+        good_file = os.path.join(sdir, "report.pdf")
+        with open(good_file, "wb") as f:
+            f.write(b"%PDF-1.4 ok")
+
+        # Normal artifact in .gemini/antigravity-cli/scratch (should be allowed)
+        scratch_dir = os.path.join(sdir, ".gemini", "antigravity-cli", "scratch")
+        os.makedirs(scratch_dir, exist_ok=True)
+        scratch_file = os.path.join(scratch_dir, "chart.png")
+        with open(scratch_file, "wb") as f:
+            f.write(b"PNGDATA")
+
+        # Sensitive files inside session_dir (must be blocked)
+        prefs_file = os.path.join(sdir, "prefs.json")
+        with open(prefs_file, "w") as f:
+            f.write('{"model": "gemini-4-argon"}')
+        gemini_dir = os.path.join(sdir, ".gemini")
+        os.makedirs(gemini_dir, exist_ok=True)
+        token_file = os.path.join(gemini_dir, "antigravity-oauth-token")
+        with open(token_file, "w") as f:
+            f.write("secret-oauth-token")
+
+        # Hardlink inside session_dir pointing to external file (must be blocked)
+        ext_file = os.path.join(self.session_base, "external_secret.txt")
+        with open(ext_file, "w") as f:
+            f.write("top-secret")
+        hardlink_file = os.path.join(sdir, "linked.txt")
+        os.link(ext_file, hardlink_file)
+
+        client = mock.MagicMock()
+        client.state.baseurl = "https://ilink"
+        client.state.bot_token = "tok"
+        client.send_media = AsyncMock(return_value=True)
+        client.send_message = AsyncMock(return_value=True)
+
+        await main_mod.send_artifacts_back(
+            artifacts=[
+                ("report.pdf", good_file),
+                ("chart.png", scratch_file),
+                ("prefs.json", prefs_file),
+                ("antigravity-oauth-token", token_file),
+                ("linked.txt", hardlink_file),
+            ],
+            client=client,
+            from_user=uid,
+            context_token="ctx",
+        )
+
+        sent_paths = [c.kwargs["path"] for c in client.send_media.await_args_list]
+        self.assertEqual(
+            sent_paths,
+            [os.path.realpath(good_file), os.path.realpath(scratch_file)],
+        )
+
+    def test_agy_extract_artifacts_balanced_parens_and_model_tsv_parsing(self):
+        from wechatbridge import agy as agy_mod
+
+        text = (
+            "已生成 [report (1).pdf](file:///tmp/sess/report%20(1).pdf) "
+            "和 [v2 [final].docx](file:///tmp/sess/v2%20[final].docx)。"
+        )
+        arts = agy_mod.extract_artifacts(text)
+        self.assertEqual(
+            arts,
+            [
+                ("report (1).pdf", "/tmp/sess/report (1).pdf"),
+                ("v2 [final].docx", "/tmp/sess/v2 [final].docx"),
+            ],
+        )
+
+        tsv_models = (
+            "gemini-4-argon\tGemini 3.1 Pro (High)\n"
+            "claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n"
+        )
+        self.assertEqual(
+            agy_mod._parse_agy_model_ids(tsv_models),
+            ["gemini-4-argon", "claude-opus-4-6-thinking"],
+        )
+
+    async def test_planning_and_fast_toggle_and_clear_resets_mode(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import load_prefs
+
+        uid = "u-toggle"
+        r1 = await agy_mod.handle_slash_command("/planning", uid)
+        self.assertIn("已开启规划模式", r1)
+        self.assertEqual(load_prefs(uid).get("mode"), "plan")
+
+        # Calling /planning again toggles it off
+        r2 = await agy_mod.handle_slash_command("/planning", uid)
+        self.assertIn("已关闭规划模式", r2)
+        self.assertEqual(load_prefs(uid).get("mode"), "")
+
+        # Enable again and verify /clear resets sticky mode
+        await agy_mod.handle_slash_command("/planning", uid)
+        self.assertEqual(load_prefs(uid).get("mode"), "plan")
+        await agy_mod.handle_slash_command("/clear", uid)
+        self.assertEqual(load_prefs(uid).get("mode"), "")
+
+        # /fast off
+        await agy_mod.handle_slash_command("/fast", uid)
+        self.assertEqual(load_prefs(uid).get("effort"), "low")
+        r_fast_off = await agy_mod.handle_slash_command("/fast off", uid)
+        self.assertIn("已关闭快速模式", r_fast_off)
+        self.assertEqual(load_prefs(uid).get("effort"), "")
+
+    def test_sanitize_prompt_at_paths_allows_session_and_add_dirs_blocks_external(self):
+        from wechatbridge.runner_common import _sanitize_prompt_at_paths, ensure_session_dir
+
+        sdir = ensure_session_dir("u-at")
+        extra_dir = os.path.join(self.session_base, "allowed_extra")
+        os.makedirs(extra_dir, exist_ok=True)
+        prompt = (
+            f"请看 @{sdir}/img.png 和 @{extra_dir}/doc.md "
+            "不要读 @/etc/passwd 或 @../../etc/shadow"
+        )
+        sanitized = _sanitize_prompt_at_paths(prompt, sdir, extra_roots=[extra_dir])
+        self.assertIn(f"@{sdir}/img.png", sanitized)
+        self.assertIn(f"@{extra_dir}/doc.md", sanitized)
+        self.assertNotIn("/etc/passwd", sanitized)
+        self.assertNotIn("/etc/shadow", sanitized)
+        self.assertEqual(sanitized.count("[blocked-path]"), 2)
+
+    async def test_ilink_get_updates_raises_on_5xx_and_encrypt_roundtrip(self):
+        import httpx
+        from wechatbridge.ilink import ILinkClient, _encrypt_aes_ecb, _decrypt_aes_ecb
+
+        key = os.urandom(16)
+        for length in (0, 1, 15, 16, 17, 32, 100):
+            raw = os.urandom(length)
+            enc = _encrypt_aes_ecb(raw, key)
+            self.assertEqual(_decrypt_aes_ecb(enc, key), raw)
+
+        client = ILinkClient()
+        try:
+            req = httpx.Request("POST", "https://ilink/ilink/bot/getupdates")
+            resp_502 = httpx.Response(502, request=req)
+            client.http_client.post = AsyncMock(
+                side_effect=httpx.HTTPStatusError("502 Bad Gateway", request=req, response=resp_502)
+            )
+            client.state.clear = mock.MagicMock()
+            with self.assertRaises(httpx.HTTPStatusError):
+                await client.get_updates("buf1", "https://ilink", "tok")
+            client.state.clear.assert_not_called()
+        finally:
+            await client.close()
+
+    async def test_price_http_error_does_not_leak_url_or_appkey(self):
+        import httpx
+        from wechatbridge import price as price_mod
+
+        req = httpx.Request(
+            "GET",
+            "https://openapi.dataoke.com/api/goods/get-goods-details?appKey=SECRET_DT_KEY_123&id=1",
+        )
+        err = httpx.ConnectError(
+            "Connection failed for https://openapi.dataoke.com/api?appKey=SECRET_DT_KEY_123",
+            request=req,
+        )
+        with mock.patch.object(price_mod, "dt_configured", return_value=True), \
+             mock.patch.object(price_mod, "query_tb_item", side_effect=err):
+            reply = await price_mod.handle_price_query({"kind": "tb_item", "item_id": "1"})
+        self.assertNotIn("SECRET_DT_KEY_123", reply)
+        self.assertIn("比价接口请求失败", reply)
+
+        with self.assertRaises(ValueError):
+            price_mod._resolve_short_link("http://127.0.0.1:8080/admin")
+        self.assertFalse(price_mod._is_allowed_short_url("https://evil.u.jd.com/abc"))
+        self.assertFalse(price_mod._is_allowed_short_url("https://a.3.cn/xyz"))
+        self.assertTrue(price_mod._is_allowed_short_url("https://u.jd.com/abc"))
+
+    def test_ensure_user_gemini_refreshes_stale_oauth_token_and_blocks_copied_secrets(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import is_sensitive_artifact_path, _sanitize_prompt_at_paths
+
+        fake_host_home = os.path.join(self.session_base, "host_home")
+        host_agy = os.path.join(fake_host_home, ".gemini", "antigravity-cli")
+        os.makedirs(host_agy, exist_ok=True)
+        src_token = os.path.join(host_agy, "antigravity-oauth-token")
+        with open(src_token, "w") as f:
+            f.write("old-token-value-111111")
+
+        def _fake_expanduser(p: str) -> str:
+            if p.startswith("~/"):
+                return os.path.join(fake_host_home, p[2:])
+            return p
+
+        with mock.patch("os.path.expanduser", side_effect=_fake_expanduser):
+            sdir = agy_mod.ensure_user_gemini("u-tok-refresh")
+            dst_token = os.path.join(sdir, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+            with open(dst_token) as f:
+                self.assertEqual(f.read(), "old-token-value-111111")
+
+            # Make dst older and update src token
+            os.utime(dst_token, (1000.0, 1000.0))
+            with open(src_token, "w") as f:
+                f.write("refreshed-token-value-222222")
+            os.utime(src_token, (2000.0, 2000.0))
+
+            agy_mod.ensure_user_gemini("u-tok-refresh")
+            with open(dst_token) as f:
+                self.assertEqual(f.read(), "refreshed-token-value-222222")
+
+        # Renamed / copied credentials must still be blocked by is_sensitive_artifact_path
+        copied_secret = os.path.join(sdir, "token.copy")
+        with open(copied_secret, "w") as f:
+            f.write("refreshed-token-value-222222")
+        self.assertTrue(is_sensitive_artifact_path(copied_secret, sdir))
+
+        auth_bak = os.path.join(sdir, "auth.json.bak")
+        with open(auth_bak, "w") as f:
+            f.write("{}")
+        self.assertTrue(is_sensitive_artifact_path(auth_bak, sdir))
+
+        scratch_settings = os.path.join(sdir, ".gemini", "antigravity-cli", "scratch", "settings.json")
+        os.makedirs(os.path.dirname(scratch_settings), exist_ok=True)
+        with open(scratch_settings, "w") as f:
+            f.write("{}")
+        self.assertTrue(is_sensitive_artifact_path(scratch_settings, sdir))
+
+        # @<path> sanitization for bare sensitive names, URL-encoded traversal, and URLs
+        p_out = _sanitize_prompt_at_paths(
+            "read @prefs.json @auth.json.bak @..%2f..%2fetc%2fpasswd @https://evil.com/a",
+            sdir,
+        )
+        self.assertEqual(
+            p_out,
+            "read [blocked-path] [blocked-path] [blocked-path] [blocked-path]",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

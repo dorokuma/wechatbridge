@@ -14,6 +14,7 @@ Graceful degradation: without API keys the interception layer stays inert and
 everything falls through to the CLI flow as before.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -21,6 +22,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -118,7 +120,7 @@ class PriceResult:
 # ---------------------------------------------------------------------------
 
 # Short links whose ONLY realistic purpose is "open this product" → auto trigger
-JD_SHORT_HOSTS = ("u.jd.com", "jd.cn.hn", "3.cn", "jd.com/")
+JD_SHORT_HOSTS = ("u.jd.com", "jd.cn.hn", "3.cn")
 TB_SHORT_HOSTS = ("m.tb.cn", "tb.cn")
 
 # 淘口令: wrapped in fullwidth symbols, e.g. 8.8￥CZ0001 xxxx￥ / ₴...₴
@@ -177,8 +179,6 @@ def detect_price_trigger(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # JD Union official API (sign: MD5(sorted k=v&... + secret))
 # ---------------------------------------------------------------------------
-
-import hashlib
 
 
 def _jd_sign(params: dict) -> str:
@@ -290,18 +290,83 @@ def query_tb_item(item_id: str) -> PriceResult:
 # Short-link resolution (HEAD/GET follow redirects, extract SKU or tkl)
 # ---------------------------------------------------------------------------
 
+_ALLOWED_SHORT_HOSTS = frozenset(JD_SHORT_HOSTS + TB_SHORT_HOSTS + ("dwo.cn", "dt.cn"))
+_ALLOWED_REDIRECT_SUFFIXES = (
+    "jd.com",
+    "3.cn",
+    "jd.cn.hn",
+    "tb.cn",
+    "taobao.com",
+    "tmall.com",
+    "dwo.cn",
+    "dt.cn",
+    "alicdn.com",
+)
+
+
+def _is_allowed_short_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return bool(host and host in _ALLOWED_SHORT_HOSTS)
+
+
+def _is_allowed_redirect_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return any(host == s or host.endswith("." + s) for s in _ALLOWED_REDIRECT_SUFFIXES)
+
+
 def _resolve_short_link(url: str) -> str:
-    """Follow redirects, return final URL (and body sniff for tkl)."""
-    with httpx.Client(timeout=_DT_TIMEOUT, follow_redirects=True, headers={
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-        )
-    }) as client:
-        r = client.get(url)
-        final_url = str(r.url)
+    """Follow redirects safely (hop-by-hop host check), return final URL."""
+    if url.startswith(("dwo.cn/", "dt.cn/")):
+        url = "https://" + url
+    if not _is_allowed_short_url(url):
+        raise ValueError("不支持的短链域名")
+    current_url = url
+    with httpx.Client(
+        timeout=_DT_TIMEOUT,
+        follow_redirects=False,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+        },
+    ) as client:
+        r = None
+        for _ in range(5):
+            r = client.get(current_url)
+            if r.is_redirect:
+                loc = r.headers.get("location", "")
+                if not loc:
+                    break
+                next_url = urljoin(str(r.url), loc)
+                m_jd = JD_ITEM_RE.search(next_url)
+                if m_jd:
+                    return f"https://item.jd.com/{m_jd.group(1)}.html"
+                if TB_ITEM_RE.search(next_url):
+                    return next_url
+                if not _is_allowed_redirect_url(next_url):
+                    raise ValueError("短链跳转目标不在允许的电商域名内")
+                current_url = next_url
+                continue
+            break
+        final_url = str(r.url) if r is not None else current_url
+        body_snippet = (r.text[:20000] if r is not None else "")
         # Some JD share pages embed the SKU in an anchor; sniff once.
-        m = JD_ITEM_RE.search(final_url) or JD_ITEM_RE.search(r.text[:20000])
+        m = JD_ITEM_RE.search(final_url) or JD_ITEM_RE.search(body_snippet)
         if m:
             return f"https://item.jd.com/{m.group(1)}.html"
         return final_url
@@ -317,45 +382,54 @@ async def handle_price_query(trigger: dict) -> str:
         if trigger["kind"] == "jd_item":
             if not jd_configured():
                 return _not_configured("京东联盟")
-            return query_jd_sku(trigger["sku"]).card()
+            res = await asyncio.to_thread(query_jd_sku, trigger["sku"])
+            return res.card()
 
         if trigger["kind"] == "jd_short":
             if not jd_configured():
                 return _not_configured("京东联盟")
-            final = _resolve_short_link(trigger["url"])
+            final = await asyncio.to_thread(_resolve_short_link, trigger["url"])
             m = JD_ITEM_RE.search(final)
             if not m:
                 logger.info("jd short link resolved but no SKU: %s", final)
                 return "❓ 短链解析出来不是商品页，试试直接发商品页链接或用 /price + 链接。"
-            return query_jd_sku(m.group(1)).card()
+            res = await asyncio.to_thread(query_jd_sku, m.group(1))
+            return res.card()
 
         if trigger["kind"] == "tkl":
             if not dt_configured():
                 return _not_configured("大淘客（淘宝口令解析）")
-            data = resolve_tkl(trigger["token"])
+            data = await asyncio.to_thread(resolve_tkl, trigger["token"])
             goods_id = str(data.get("goodsId", "") or data.get("id", ""))
             if not goods_id:
                 return "❓ 口令解析出来了但没拿到商品信息，可能商品未收录。"
-            return query_tb_item(goods_id).card()
+            res = await asyncio.to_thread(query_tb_item, goods_id)
+            return res.card()
 
         if trigger["kind"] == "tb_item":
             if not dt_configured():
                 return _not_configured("大淘客（淘宝商品）")
-            return query_tb_item(trigger["item_id"]).card()
+            res = await asyncio.to_thread(query_tb_item, trigger["item_id"])
+            return res.card()
 
         if trigger["kind"] == "tb_short":
             if not dt_configured():
                 return _not_configured("大淘客（淘宝短链）")
-            final = _resolve_short_link(trigger["url"])
+            final = await asyncio.to_thread(_resolve_short_link, trigger["url"])
             m = TB_ITEM_RE.search(final)
             if m:
-                return query_tb_item(m.group(1)).card()
+                res = await asyncio.to_thread(query_tb_item, m.group(1))
+                return res.card()
             return "❓ 短链解析出来不是商品页，试试直接发商品页链接或用 /price + 链接。"
 
         return "❓ 不支持的链接类型。"
-    except (ValueError, httpx.HTTPError) as e:
+    except ValueError as e:
         logger.warning("price query failed: %s", e)
         return f"⚠️ 比价失败: {e}"
+    except httpx.HTTPError as e:
+        # 绝不将原始 httpx.HTTPError 拼回微信消息（可能含请求 URL 中的 appKey 参数）
+        logger.warning("price HTTP query failed (%s)", type(e).__name__)
+        return "⚠️ 比价接口请求失败，请稍后再试。"
     except Exception:
         logger.exception("price query unexpected error")
         return "⚠️ 比价出了点岔子，请稍后再试。"

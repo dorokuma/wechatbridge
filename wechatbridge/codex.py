@@ -25,6 +25,7 @@ from .runner_common import (
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs, is_bridge_formatted_reply,
     format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
+    MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
 )
 
 logger = logging.getLogger("codex_runner")
@@ -518,6 +519,8 @@ def _collect_codex_artifact(path: str, session_dir: str, since: float, seen: set
         path = os.path.realpath(path)
     except (OSError, ValueError):
         return
+    if is_sensitive_artifact_path(path, session_dir):
+        return
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -540,7 +543,7 @@ def _resolve_add_dirs(raw_dirs: list, session_dir: str, user_id: str = "") -> li
     allowed roots used by the artifact fallback scan.
     """
     validated = []
-    for d in raw_dirs or []:
+    for d in (raw_dirs or [])[:MAX_ADD_DIRS]:
         if not d:
             continue
         try:
@@ -689,6 +692,11 @@ def _parse_codex_output(stdout_text: str, session_dir: str, since: float = 0.0) 
 
     # 去掉文件里的 file:/// 链接（避免把内部路径直出给微信用户）
     last = re.sub(
+        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(file:///(?:[^()\s]|\([^()\s]*\))+\)",
+        r"[\1]",
+        last,
+    )
+    last = re.sub(
         r"\[([^\]]+)\]\(file:///[^)]+\)",
         r"[\1]",
         last,
@@ -754,7 +762,7 @@ def _collect_fallback_artifacts(session_dir: str, snapshot_before: dict, t0: flo
         elif fmtime <= prev:
             continue
         name = os.path.basename(fp)
-        if name in _internal_names or name.startswith(".initialized."):
+        if name in _internal_names or name.startswith(".initialized.") or is_sensitive_artifact_path(fp, session_dir):
             continue
         key = (name, fp)
         if key not in fallback_seen:
@@ -835,8 +843,9 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     # 验证并规范化 add_dirs，确保命令构建与 fallback 扫描使用同一批目录
     validated_add_dirs = _resolve_add_dirs(prefs.get("add_dirs"), session_dir, user_id)
     prefs["add_dirs"] = validated_add_dirs
+    safe_prompt = _sanitize_prompt_at_paths(prompt, session_dir, extra_roots=validated_add_dirs)
     # persona 经 AGENTS.md 由 codex 自动读取，这里无需注入 argv
-    cmd = _build_codex_command(prompt, prefs, first, thread_id)
+    cmd = _build_codex_command(safe_prompt, prefs, first, thread_id)
 
     # 执行前快照现有文件，用于 shell 产物 fallback 扫描（仅 session_dir）
     snapshot_before = _snapshot_regular_files([session_dir])
@@ -922,7 +931,7 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 )
                 clear_initialized(session_dir, backend="codex")
                 _delete_codex_thread_id(session_dir)
-                retry_cmd = _build_codex_command(prompt, prefs, True, "")
+                retry_cmd = _build_codex_command(safe_prompt, prefs, True, "")
                 retry_process = await asyncio.create_subprocess_exec(
                     *retry_cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -1349,13 +1358,26 @@ async def handle_codex_slash_command(text: str, user_id: str) -> str | None:
         session_dir = get_session_dir(user_id)
         clear_initialized(session_dir, backend="codex")
         _delete_codex_thread_id(session_dir)
+        prefs = load_prefs(user_id)
+        if prefs.get("mode"):
+            update_active_prefs(user_id, mode="")
         return "✅ **对话已重置** ✅"
 
     if cmd == "/fast":
+        arg = args.strip().lower()
+        prefs = load_prefs(user_id)
+        if arg in ("off", "0", "false", "no", "normal", "default", "reset", "clear") or (not arg and prefs.get("effort") == "low"):
+            update_active_prefs(user_id, effort="")
+            return "✅ **已关闭快速模式** ✅（恢复默认思考强度）"
         update_active_prefs(user_id, effort="low")
         return "✅ **已开启快速模式** ✅"
 
     if cmd == "/planning":
+        arg = args.strip().lower()
+        prefs = load_prefs(user_id)
+        if arg in ("off", "0", "false", "no", "normal", "default", "reset", "clear", "agent") or (not arg and prefs.get("mode") == "plan"):
+            update_active_prefs(user_id, mode="")
+            return "✅ **已退出规划模式** ✅"
         update_active_prefs(user_id, mode="plan")
         return "✅ **已开启规划模式** ✅（只读沙箱，近似 plan mode）"
 
@@ -1376,6 +1398,8 @@ async def handle_codex_slash_command(text: str, user_id: str) -> str | None:
         prefs = load_prefs(user_id)
         dirs = prefs.get("add_dirs", [])
         if resolved not in dirs:
+            if len(dirs) >= MAX_ADD_DIRS:
+                return f"❌ **附加目录数量已达上限 ({MAX_ADD_DIRS})** ❌"
             dirs.append(resolved)
             prefs["add_dirs"] = dirs
             save_prefs(user_id, prefs)

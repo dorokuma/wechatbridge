@@ -12,6 +12,7 @@ import hashlib
 import mimetypes
 import os
 import random
+import stat
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -177,12 +178,21 @@ def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
 
 
 def _encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
-    """Encrypt plaintext with AES-128-ECB (PKCS7 padded)."""
+    """Encrypt plaintext with AES-128-ECB (PKCS7 padded) without duplicating full buffer."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     cipher = Cipher(algorithms.AES(key), modes.ECB())
     encryptor = cipher.encryptor()
-    return encryptor.update(_pkcs7_pad(plaintext)) + encryptor.finalize()
+    tail_offset = (len(plaintext) // 16) * 16
+    pad_len = 16 - (len(plaintext) - tail_offset)
+    tail_padded = plaintext[tail_offset:] + bytes([pad_len] * pad_len)
+    if tail_offset:
+        return (
+            encryptor.update(memoryview(plaintext)[:tail_offset])
+            + encryptor.update(tail_padded)
+            + encryptor.finalize()
+        )
+    return encryptor.update(tail_padded) + encryptor.finalize()
 
 
 def _aes_padded_size(rawsize: int) -> int:
@@ -409,8 +419,9 @@ class ILinkClient:
                 logger.warning("Bot token rejected (401/403), clearing state")
                 self.state.clear()
                 raise  # Let caller re-login
-            logger.warning("HTTP error in get_updates: %s", e)
-            return [], buf
+            # 5xx / 429 等 HTTP 状态错误同样上抛，由主循环统一做指数退避（避免原地满速重试）
+            logger.warning("HTTP error in get_updates: status=%s", e.response.status_code)
+            raise
         except httpx.RequestError as e:
             # 网络层错误上抛，由主循环做指数退避（避免原地满速重试+日志洪泛）
             logger.warning("Network error in get_updates: %s", e)
@@ -536,9 +547,31 @@ class ILinkClient:
         Reference: hermes weixin.py _send_media ~L2110-2170
         """
         logger.info("send_media: %s for user %s", path, to_user_id)
+        max_out = max(int(config.max_outbound_file_bytes), 1)
         try:
-            with open(path, "rb") as f:
-                plaintext = f.read()
+            open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, open_flags)
+            with os.fdopen(fd, "rb") as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    logger.warning("Refusing non-regular file in send_media: %s", path)
+                    return False
+                if st.st_nlink > 1:
+                    logger.warning(
+                        "Refusing hard-linked file in send_media (nlink=%d): %s",
+                        st.st_nlink, path,
+                    )
+                    return False
+                if st.st_size > max_out:
+                    logger.warning(
+                        "Refusing oversized file in send_media (%d > %d): %s",
+                        st.st_size, max_out, path,
+                    )
+                    return False
+                plaintext = f.read(max_out + 1)
+            if len(plaintext) > max_out:
+                logger.warning("File grew beyond max_outbound_file_bytes during read: %s", path)
+                return False
         except OSError as e:
             logger.error("Cannot read file %s: %s", path, e)
             return False
@@ -552,6 +585,7 @@ class ILinkClient:
             rawsize, rawfilemd5, filekey, aes_key.hex(),
         )
         ciphertext = _encrypt_aes_ecb(plaintext, aes_key)
+        del plaintext
         filesize = len(ciphertext)
 
         # Determine media_type from mime (only common rasters → IMAGE)

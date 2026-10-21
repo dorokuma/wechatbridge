@@ -5,6 +5,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-21
+
+### Fixed
+
+- **agy 会话目录产物回传与安全防护**：允许 `agy` 后端回传用户 `session_dir` 下生成的文档/图片（与 `grok`/`codex`/`dsh` 对齐），同时在全后端与 `send_artifacts_back` 增加 `is_sensitive_artifact_path`（拦截所有隐藏文件/隐藏目录、敏感凭据/配置名及后缀变体、会话凭据内容特征拷贝）与 `os.lstat` / `O_NOFOLLOW` + `os.fstat` 硬链接（`st_nlink == 1`）防逃逸检查。
+- **跨后端 `@<path>` 注入与媒体配文消毒**：将 `_sanitize_prompt_at_paths` 提升至 `runner_common.py`，接入 `agy`/`grok`/`codex`/`dsh` 及图片/文件消息配文（支持 URL 解码、非 `file:` 协议拦截、敏感文件与越界链接拦截，放行会话内附件与最多 `MAX_ADD_DIRS=16` 个工作目录）。
+- **agy 模型列表解析与模式切换闭环**：修复 `agy models` 制表符（`<id>\t<Display Name>`）输出导致的 `/model` 匹配与写入问题；支持 `/planning off`、`/fast off` 或无参二次调用关闭模式，并在 `/clear`、`/new` 时重置残留 `mode`；支持文件名含有一层平衡括号的产物链接提取与剥离；宿主 OAuth token 更新时自动原子刷新至会话目录。
+- **iLink 与比价模块可靠性加固**：`get_updates` 对 5xx/429 状态码上抛触发主循环指数退避；优化 `_encrypt_aes_ecb` 与 `send_media` 内存峰值；`price.py` 修复京东短链域名匹配、将同步 HTTP 请求卸载至 `asyncio.to_thread`、逐跳校验电商重定向域名防 SSRF，并对 `httpx.HTTPError` 脱敏防止回传含 `appKey` 的请求 URL；修复 `deploy/update.sh` 在 `set -euo pipefail` 下因 `grep -q` 触发 `SIGPIPE` 误判未安装的问题。
+
 ## [1.7.0] - 2026-09-10
 
 ### Added

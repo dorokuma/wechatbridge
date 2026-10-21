@@ -10,6 +10,7 @@ import base64
 import contextvars
 import logging
 import os
+import stat
 import sys
 import time
 import uuid
@@ -21,6 +22,8 @@ from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
     KNOWN_BACKENDS,
+    MAX_ADD_DIRS,
+    _sanitize_prompt_at_paths,
     clean_session_media,
     clear_initialized,
     classify_upstream_failure,
@@ -32,6 +35,7 @@ from .runner_common import (
     format_upstream_retry_notice,
     get_session_dir,
     is_dangerous,
+    is_sensitive_artifact_path,
     is_upstream_throttle_reply,
     load_prefs,
     path_is_under,
@@ -748,11 +752,12 @@ async def gate_and_run(
 
 
 async def send_artifacts_back(client, from_user, context_token, artifacts) -> None:
-    """Filter artifacts: only send back those under per-user session dir.
+    """Filter artifacts: only send back safe regular files under per-user session dir.
 
-    For agy: artifacts under .gemini/antigravity-cli/scratch (plus validated --add-dir)
-    For codex: artifacts under session_dir (plus validated --add-dir)
-    For grok: artifacts under session_dir (cwd where grok ran; no add-dir gate)
+    For agy/codex: artifacts under session_dir (plus validated --add-dir roots).
+    For grok/dsh: artifacts under session_dir (cwd where the CLI ran).
+    Bridge-internal credentials, session state, persona files, and multi-hardlink
+    files are always rejected even when located inside an allowed root.
     """
     session_dir = get_session_dir(from_user)
     backend = _get_backend(from_user)
@@ -771,19 +776,18 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
         # so they never match anyway.
         allowed_root = session_dir
     else:
-        # agy writes to .gemini/antigravity-cli/scratch under session_dir
-        allowed_root = os.path.join(session_dir, ".gemini", "antigravity-cli", "scratch")
+        # agy runs with cwd=session_dir, artifacts are under session_dir
+        allowed_root = session_dir
 
     # codex and agy both support --add-dir; re-verify stored roots at send time.
     # Only keep roots that currently exist, are real directories, and still
     # resolve inside the configured allowed roots (session dir + config
-    # add_dir_roots). Deleted dirs, plain files, out-of-bounds paths and
-    # symlink escapes must not become artifact allow roots. Legitimate
-    # directories are kept (and still re-checked against each artifact path
-    # below). session_dir itself is never relaxed. grok does not use add-dir.
+    # add_dir_roots), capped at MAX_ADD_DIRS. Deleted dirs, plain files,
+    # out-of-bounds paths and symlink escapes must not become artifact allow
+    # roots. grok and dsh do not use add-dir.
     if backend in ("codex", "agy"):
         prefs = load_prefs(from_user)
-        for d in prefs.get("add_dirs", []) or []:
+        for d in (prefs.get("add_dirs", []) or [])[:MAX_ADD_DIRS]:
             ok, resolved = validate_add_dir(d, from_user)
             if ok:
                 add_dirs.append(resolved)
@@ -808,15 +812,31 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                         ok_root = True
                         break
                 if not ok_root:
-                    logger.debug("skip non-scratch artifact: %s", art_path)
+                    logger.debug("skip non-allowed artifact: %s", art_path)
                     await _notify_failure(art_name, "skipped")
                     continue
-            if not os.path.isfile(os.path.realpath(art_path)):
+            real_path = os.path.realpath(art_path)
+            if is_sensitive_artifact_path(real_path, session_dir):
+                logger.warning("Blocked sensitive/internal artifact: %s", real_path)
+                await _notify_failure(art_name, "skipped")
+                continue
+            try:
+                st = os.lstat(real_path)
+            except OSError:
+                st = None
+            if st is None or not stat.S_ISREG(st.st_mode):
                 logger.warning("Artifact not found: %s", art_path)
                 await _notify_failure(art_name, "not_found")
                 continue
-            art_path = os.path.realpath(art_path)
-            file_size = os.path.getsize(art_path)
+            if st.st_nlink > 1:
+                logger.warning(
+                    "Blocked hardlinked artifact (st_nlink=%d): %s",
+                    st.st_nlink, real_path,
+                )
+                await _notify_failure(art_name, "skipped")
+                continue
+            art_path = real_path
+            file_size = st.st_size
             if file_size > config.max_outbound_file_bytes:
                 size_mb = file_size / (1024 * 1024)
                 # Never echo server absolute paths to WeChat users
@@ -1009,7 +1029,17 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
                 )
 
                 # Build prompt: user's caption if present, else default
-                prompt = text.strip() if text.strip() else "请描述这张图片的内容"
+                session_dir = get_session_dir(from_user)
+                raw_caption = text.strip()
+                extra_roots = [
+                    r for d in (load_prefs(from_user).get("add_dirs") or [])[:MAX_ADD_DIRS]
+                    for ok_d, r in [validate_add_dir(d, from_user)] if ok_d and r
+                ]
+                prompt = (
+                    _sanitize_prompt_at_paths(raw_caption, session_dir, extra_roots=extra_roots)
+                    if raw_caption
+                    else "请描述这张图片的内容"
+                )
                 logger.info("识图 from=%s: %s @%s", from_user, prompt, save_path)
                 result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
                 if result is None:
@@ -1055,7 +1085,17 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
                     "文件已保存 %s (%d bytes)", save_path, len(plain_bytes),
                 )
 
-                prompt = text.strip() if text.strip() else "请分析这个文件"
+                session_dir = get_session_dir(from_user)
+                raw_caption = text.strip()
+                extra_roots = [
+                    r for d in (load_prefs(from_user).get("add_dirs") or [])[:MAX_ADD_DIRS]
+                    for ok_d, r in [validate_add_dir(d, from_user)] if ok_d and r
+                ]
+                prompt = (
+                    _sanitize_prompt_at_paths(raw_caption, session_dir, extra_roots=extra_roots)
+                    if raw_caption
+                    else "请分析这个文件"
+                )
                 logger.info("文件分析 from=%s: %s @%s", from_user, prompt, save_path)
                 result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
                 if result is None:

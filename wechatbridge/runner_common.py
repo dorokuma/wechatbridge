@@ -16,6 +16,7 @@ import signal
 import stat
 import sys
 import time
+from urllib.parse import unquote
 
 from .config import config, host_dsh_home, is_dsh_home_explicit
 
@@ -92,6 +93,263 @@ def path_is_under(path: str, root: str) -> bool:
         return True
     prefix = root_real if root_real.endswith(os.sep) else root_real + os.sep
     return real.startswith(prefix)
+
+
+# Maximum number of user-configured --add-dir roots per user session
+MAX_ADD_DIRS = 16
+
+# Bridge-internal credentials, session state, and persona/config files that must
+# never be sent back to WeChat as outbound artifacts even when they sit under
+# session_dir or an approved --add-dir root.
+_SENSITIVE_ARTIFACT_FILE_NAMES = frozenset({
+    "prefs.json",
+    "prefs.json.tmp",
+    "auth.json",
+    "antigravity-oauth-token",
+    ".codex_thread_id",
+    "dsh_session_id",
+    ".dsh_session_id",
+    "dsh_memory.json",
+    "dsh_memory.jsonl",
+    ".dsh_memory.json",
+    ".dsh_memory.jsonl",
+    "grok_persona.txt",
+    "gemini.md",
+    "agents.md",
+    "agents.override.md",
+    "claude.md",
+    ".credentials.yaml",
+    "credentials.json",
+    "settings.json",
+    "ilink_state.json",
+    ".env",
+})
+_SENSITIVE_ARTIFACT_PREFIXES = (
+    ".initialized",
+    ".auth.json",
+    ".tmp_sid_",
+    ".tmp_mem_",
+    "prefs.json",
+    "auth.json",
+    "credentials",
+    "antigravity-oauth-token",
+    "dsh_session_id",
+    "dsh_memory",
+    "grok_persona",
+    "gemini.md",
+    "agents.md",
+    "agents.override.md",
+    "claude.md",
+    "settings.json",
+    "ilink_state.json",
+    "id_rsa",
+    "id_ed25519",
+)
+_SENSITIVE_ARTIFACT_DIR_NAMES = frozenset({
+    ".grok",
+    ".codex",
+    ".dsh",
+    ".git",
+    ".ssh",
+    ".gnupg",
+    "__pycache__",
+})
+
+
+def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool:
+    """Return True if *candidate_real* contains the raw bytes of any session
+    credential / state file (defending against copy/rename to an innocent filename
+    such as ``token.copy`` or ``scratch/out.txt``)."""
+    if not sess_real:
+        return False
+    try:
+        st = os.lstat(candidate_real)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 256 * 1024:
+            return False
+    except OSError:
+        return False
+
+    secret_files = (
+        os.path.join(sess_real, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+        os.path.join(sess_real, ".gemini", "antigravity-oauth-token"),
+        os.path.join(sess_real, ".grok", "auth.json"),
+        os.path.join(sess_real, ".codex", "auth.json"),
+        os.path.join(sess_real, "prefs.json"),
+        os.path.join(sess_real, ".codex_thread_id"),
+        os.path.join(sess_real, "grok_persona.txt"),
+        os.path.join(sess_real, ".gemini", "GEMINI.md"),
+        os.path.join(sess_real, "GEMINI.md"),
+        os.path.join(sess_real, "AGENTS.md"),
+        os.path.join(sess_real, ".dsh", "dsh_session_id"),
+    )
+    cand_bytes: bytes | None = None
+    for sf in secret_files:
+        try:
+            if not os.path.exists(sf):
+                continue
+            with open(sf, "rb") as f:
+                secret_data = f.read(65536).strip()
+            if len(secret_data) < 6:
+                continue
+            if cand_bytes is None:
+                with open(candidate_real, "rb") as cf:
+                    cand_bytes = cf.read(256 * 1024)
+            if secret_data in cand_bytes:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
+    """Return True if *path* points to a credential, internal state, or hidden
+    runtime metadata file that must never be sent back as a user artifact.
+
+    Under ``session_dir/.gemini``, only ``.gemini/antigravity-cli/scratch/`` is
+    permitted as an artifact source; everything else under ``.gemini`` (e.g.
+    ``antigravity-oauth-token``, ``GEMINI.md``, ``brain/``, ``settings.json``)
+    is rejected. All dot-files and dot-directories (except the ``.gemini`` path
+    leading to ``scratch/``) and renamed/copied session credentials are blocked.
+    """
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return True
+    base = os.path.basename(real)
+    base_lower = base.lower()
+    if base.startswith("."):
+        return True
+    if base_lower in _SENSITIVE_ARTIFACT_FILE_NAMES:
+        return True
+    if base_lower.startswith(_SENSITIVE_ARTIFACT_PREFIXES):
+        return True
+
+    norm_parts = os.path.normpath(real).split(os.sep)
+    if any(part in _SENSITIVE_ARTIFACT_DIR_NAMES for part in norm_parts[:-1]):
+        return True
+
+    sess_real = ""
+    if session_dir:
+        try:
+            sess_real = os.path.realpath(session_dir)
+        except OSError:
+            sess_real = ""
+
+    if sess_real and path_is_under(real, sess_real):
+        rel = os.path.relpath(real, sess_real)
+        rel_parts = rel.split(os.sep)
+        if rel_parts and rel_parts[0] == ".gemini":
+            scratch_root = os.path.join(sess_real, ".gemini", "antigravity-cli", "scratch")
+            if not path_is_under(real, scratch_root):
+                return True
+            scratch_rel_parts = os.path.relpath(real, scratch_root).split(os.sep)
+            if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in scratch_rel_parts):
+                return True
+        else:
+            if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in rel_parts[:-1]):
+                return True
+    else:
+        if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in norm_parts[:-1] if p == ".gemini"):
+            return True
+
+    if sess_real and _matches_session_secret_content(real, sess_real):
+        return True
+    return False
+
+
+_AT_TOKEN_RE = re.compile(r"@([^\s@。，！？；、：”’'\"）)\]\}>》」』〉…]+)")
+_AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
+
+
+def _sanitize_prompt_at_paths(
+    prompt: str,
+    session_dir: str,
+    extra_roots: list[str] | None = None,
+) -> str:
+    """Replace @<path> mentions pointing outside session_dir (and extra_roots)
+    or referencing sensitive session files with [blocked-path].
+
+    Recognizes @ tokens (ASCII, CJK, URL-encoded %2f/%2e, relative ./ and ../,
+    ~/ and file://, subpaths with /, and bare filenames that resolve to sensitive
+    files or escaping symlinks/hardlinks).
+    """
+    if not prompt:
+        return ""
+
+    allowed_roots = [session_dir]
+    if extra_roots:
+        allowed_roots.extend(r for r in extra_roots if r)
+
+    def _replace(m: re.Match) -> str:
+        raw_token = m.group(1)
+        clean_token = raw_token.rstrip(_AT_TRAILING_PUNCT)
+        trailing_punct = raw_token[len(clean_token):]
+
+        candidate = unquote(clean_token).replace("\\", "/")
+        is_candidate = (
+            candidate.startswith(("/", "./", "../", "~/", "."))
+            or candidate == "~"
+            or "://" in candidate
+            or candidate.startswith("file:")
+            or "/" in candidate
+        )
+        if not is_candidate:
+            # Bare @token without slash: block if it targets a sensitive file
+            # or an existing symlink/hardlink in session_dir that escapes
+            if session_dir and candidate:
+                local_cand = os.path.join(session_dir, candidate)
+                if is_sensitive_artifact_path(local_cand, session_dir):
+                    return "[blocked-path]" + trailing_punct
+                try:
+                    if os.path.lexists(local_cand):
+                        if not path_is_under(local_cand, session_dir):
+                            return "[blocked-path]" + trailing_punct
+                        st = os.lstat(local_cand)
+                        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                            return "[blocked-path]" + trailing_punct
+                except OSError:
+                    return "[blocked-path]" + trailing_punct
+            return m.group(0)
+
+        p = candidate
+        if p.startswith("file://"):
+            p = p[len("file://"):]
+        elif p.startswith("file:"):
+            p = p[len("file:"):]
+        elif "://" in p:
+            return "[blocked-path]" + trailing_punct
+
+        is_tilde = False
+        if p == "~":
+            p = session_dir
+            is_tilde = True
+        elif p.startswith("~/"):
+            p = os.path.join(session_dir, p[2:])
+            is_tilde = True
+
+        if not os.path.isabs(p):
+            target_path = os.path.normpath(os.path.join(session_dir, p))
+        else:
+            target_path = os.path.normpath(p)
+
+        if any(path_is_under(target_path, root) for root in allowed_roots):
+            if not is_tilde and p != session_dir and is_sensitive_artifact_path(target_path, session_dir):
+                return "[blocked-path]" + trailing_punct
+            if is_tilde and p != session_dir and is_sensitive_artifact_path(target_path, session_dir):
+                return "[blocked-path]" + trailing_punct
+            try:
+                if os.path.lexists(target_path):
+                    st = os.lstat(target_path)
+                    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                        return "[blocked-path]" + trailing_punct
+            except OSError:
+                return "[blocked-path]" + trailing_punct
+            if is_tilde:
+                return "@" + target_path + trailing_punct
+            return m.group(0)
+        return "[blocked-path]" + trailing_punct
+
+    return _AT_TOKEN_RE.sub(_replace, prompt)
 
 
 def validate_add_dir(path: str, user_id: str) -> tuple[bool, str]:

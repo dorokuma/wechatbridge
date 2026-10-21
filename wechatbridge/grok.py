@@ -21,7 +21,7 @@ from .runner_common import (
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, is_bridge_formatted_reply, EMPTY_REPLY, validate_add_dir,
-    path_is_under,
+    path_is_under, MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
 )
 
 logger = logging.getLogger("grok_runner")
@@ -454,6 +454,8 @@ def _resolve_grok_artifact_path(fp: str, session_dir: str, since: float, seen: s
         fp = os.path.abspath(fp)
     except (OSError, ValueError):
         return
+    if is_sensitive_artifact_path(fp, session_dir):
+        return
     try:
         if since and os.path.getmtime(fp) < since - 2.0:
             return
@@ -567,6 +569,8 @@ def _scan_grok_session_artifacts(session_dir: str, since: float = 0.0) -> list:
                 real = os.path.realpath(fp)
             except OSError:
                 continue
+            if is_sensitive_artifact_path(real, session_dir):
+                continue
             key = (os.path.basename(real), real)
             if key not in seen:
                 seen.add(key)
@@ -626,6 +630,11 @@ def _parse_grok_output(stdout_text: str, session_dir: str, since: float = 0.0) -
     )
 
     # Strip file:/// links from display (in case grok emits them)
+    display = re.sub(
+        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(file:///(?:[^()\s]|\([^()\s]*\))+\)",
+        r"[\1]",
+        display,
+    )
     display = re.sub(
         r"\[([^\]]+)\]\(file:///[^)]+\)",
         r"[\1]",
@@ -689,7 +698,8 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
         first = True
     prefs = load_prefs(user_id)
     persona_content = _read_persona(session_dir)
-    cmd = _build_grok_command(prompt, prefs, first, persona_content)
+    safe_prompt = _sanitize_prompt_at_paths(prompt, session_dir)
+    cmd = _build_grok_command(safe_prompt, prefs, first, persona_content)
 
     if first:
         logger.info("First message for user %s, running: grok -p ...", user_id)
@@ -752,7 +762,7 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                     user_id,
                 )
                 clear_initialized(session_dir, backend="grok")
-                retry_cmd = _build_grok_command(prompt, prefs, True, persona_content)
+                retry_cmd = _build_grok_command(safe_prompt, prefs, True, persona_content)
                 retry_process = await asyncio.create_subprocess_exec(
                     *retry_cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -1015,13 +1025,26 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
     if cmd in ("/clear", "/new"):
         session_dir = get_session_dir(user_id)
         clear_initialized(session_dir, backend="grok")
+        prefs = load_prefs(user_id)
+        if prefs.get("mode"):
+            update_active_prefs(user_id, mode="")
         return "✅ **对话已重置** ✅"
 
     if cmd == "/fast":
+        arg = args.strip().lower()
+        prefs = load_prefs(user_id)
+        if arg in ("off", "0", "false", "no", "normal", "default", "reset", "clear") or (not arg and prefs.get("effort") == "low"):
+            update_active_prefs(user_id, effort="")
+            return "✅ **已关闭快速模式** ✅（恢复默认思考强度）"
         update_active_prefs(user_id, effort="low")
         return "✅ **已开启快速模式** ✅"
 
     if cmd == "/planning":
+        arg = args.strip().lower()
+        prefs = load_prefs(user_id)
+        if arg in ("off", "0", "false", "no", "normal", "default", "reset", "clear", "agent") or (not arg and prefs.get("mode") == "plan"):
+            update_active_prefs(user_id, mode="")
+            return "✅ **已退出规划模式** ✅"
         update_active_prefs(user_id, mode="plan")
         return "✅ **已开启规划模式** ✅"
 
@@ -1039,6 +1062,8 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
         prefs = load_prefs(user_id)
         dirs = prefs.get("add_dirs", [])
         if resolved not in dirs:
+            if len(dirs) >= MAX_ADD_DIRS:
+                return f"❌ **附加目录数量已达上限 ({MAX_ADD_DIRS})** ❌"
             dirs.append(resolved)
             prefs["add_dirs"] = dirs
             save_prefs(user_id, prefs)
