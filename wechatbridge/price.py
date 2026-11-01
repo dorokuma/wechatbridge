@@ -37,6 +37,7 @@ _JD_APP_KEY = os.getenv("JDUNION_APP_KEY", "")
 # false-positive on this empty getenv default (no literal secret value here).
 _JD_SECRET_KEY = os.getenv("JDUNION_APP_SECRET", "")
 _DT_APP_KEY = os.getenv("DATAOKE_APP_KEY", "")
+_DT_APP_SECRET = os.getenv("DATAOKE_APP_SECRET", "")
 _DT_TIMEOUT = int(os.getenv("PRICE_HTTP_TIMEOUT", "15"))
 
 JD_API_URL = "https://api.jd.com/routerjson"
@@ -48,7 +49,9 @@ def jd_configured() -> bool:
 
 
 def dt_configured() -> bool:
-    return bool(_DT_APP_KEY)
+    # Dataoke rejects unsigned requests: both the appKey and the appSecret
+    # (used only locally to compute `sign`, never sent) are required.
+    return bool(_DT_APP_KEY and _DT_APP_SECRET)
 
 
 def price_feature_ready() -> bool:
@@ -182,11 +185,15 @@ def detect_price_trigger(text: str) -> dict | None:
 
 
 def _jd_sign(params: dict) -> str:
+    # JD gateway rule: MD5(secret + sorted key+value concat + secret), upper.
+    # The secret wraps BOTH ends — appending it only at the end produces a
+    # signature the gateway always rejects.
     plain = "".join(
         f"{k}{v}" for k, v in sorted(params.items()) if k != "sign"
     )
-    plain += _JD_SECRET_KEY
-    return hashlib.md5(plain.encode("utf-8")).hexdigest().upper()
+    return hashlib.md5(
+        (_JD_SECRET_KEY + plain + _JD_SECRET_KEY).encode("utf-8")
+    ).hexdigest().upper()
 
 
 def _jd_call(method: str, param_json: dict) -> dict:
@@ -244,10 +251,23 @@ def query_jd_sku(sku: str) -> PriceResult:
 # 大淘客 (Taobao/Tmall proxy) API
 # ---------------------------------------------------------------------------
 
+def _dt_sign(params: dict) -> str:
+    # Dataoke rule (per the official SDK): sort every request parameter
+    # (appKey and version included, sign excluded) by key, join as
+    # "k1=v1&k2=v2&...", append "&key=<appSecret>", MD5, uppercase.
+    plain = "&".join(
+        f"{k}={v}" for k, v in sorted(params.items()) if k != "sign"
+    )
+    return hashlib.md5(
+        (plain + "&key=" + _DT_APP_SECRET).encode("utf-8")
+    ).hexdigest().upper()
+
+
 def _dt_call(path: str, params: dict) -> dict:
     params = dict(params)
     params["appKey"] = _DT_APP_KEY
     params["version"] = params.get("version", "v2.0.0")
+    params["sign"] = _dt_sign(params)
     resp = httpx.get(f"{DT_API_URL}{path}", params=params, timeout=_DT_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
@@ -257,16 +277,24 @@ def _dt_call(path: str, params: dict) -> dict:
 
 
 def resolve_tkl(token: str) -> dict:
-    """Parse taokouling → item info via dataoke tpwd API."""
+    """Parse taokouling → item info via dataoke's universal parse API.
+
+    The endpoint for turning a share token / share text into a goods id is
+    /tb-service/parse-content (param: content). The privilege-link endpoint
+    only converts an already-known goodsId into a promotion link and cannot
+    parse tokens.
+    """
     return _dt_call(
-        "/goods/get-privilege-link",
-        {"taoCommand": token, "apiName": "generous"},
+        "/tb-service/parse-content",
+        {"content": token, "version": "v1.0.0"},
     )
 
 
 def query_tb_item(item_id: str) -> PriceResult:
     """Query Taobao/Tmall item via dataoke goods detail API."""
-    data = _dt_call("/goods/get-goods-details", {"id": item_id})
+    # get-goods-details takes the Taobao item id as `goodsId`, not `id`
+    # (`id` is dataoke's own internal goods id and matches nothing here).
+    data = _dt_call("/goods/get-goods-details", {"goodsId": str(item_id)})
     goods = data.get("goods", data)
     quan_price = float(goods.get("quanPrice", 0) or 0)
     actual_price = float(goods.get("actualPrice", goods.get("originalPrice", 0)) or 0)
@@ -400,7 +428,11 @@ async def handle_price_query(trigger: dict) -> str:
             if not dt_configured():
                 return _not_configured("大淘客（淘宝口令解析）")
             data = await asyncio.to_thread(resolve_tkl, trigger["token"])
-            goods_id = str(data.get("goodsId", "") or data.get("id", ""))
+            goods_id = str(
+                data.get("goodsId", "")
+                or data.get("itemId", "")
+                or data.get("id", "")
+            )
             if not goods_id:
                 return "❓ 口令解析出来了但没拿到商品信息，可能商品未收录。"
             res = await asyncio.to_thread(query_tb_item, goods_id)
@@ -440,5 +472,5 @@ def _not_configured(what: str) -> str:
         f"ℹ️ **比价功能未启用** ℹ️\n\n{what} 的 API key 还没配置。\n"
         "在桥的 .env 里设置后重启即可：\n"
         "`JDUNION_APP_KEY` / `JDUNION_APP_SECRET`（京东）\n"
-        "`DATAOKE_APP_KEY`（淘宝/天猫）"
+        "`DATAOKE_APP_KEY` / `DATAOKE_APP_SECRET`（淘宝/天猫）"
     )

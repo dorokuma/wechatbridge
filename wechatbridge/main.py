@@ -467,7 +467,7 @@ async def _cmd_price(args: str) -> str:
             "ℹ️ **比价功能未启用** ℹ️\n\n"
             "在桥的 .env 里配置以下任一项后重启：\n"
             "`JDUNION_APP_KEY` / `JDUNION_APP_SECRET`（京东联盟）\n"
-            "`DATAOKE_APP_KEY`（淘宝/天猫，大淘客代理）"
+            "`DATAOKE_APP_KEY` / `DATAOKE_APP_SECRET`（淘宝/天猫，大淘客代理）"
         )
     trigger = detect_price_trigger(target)
     if not trigger:

@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-11-01
+
+### Fixed
+
+- **比价模块对接修复（此前从未真正跑通）**：京东联盟签名改为官方规则 `MD5(secret + 参数升序拼接 + secret)`（原实现只在末尾拼 secret，网关必然验签失败）；大淘客请求补上签名（新增 `DATAOKE_APP_SECRET` 配置，`sign = MD5(参数升序 k=v&… + &key=secret)` 大写，原实现未签名、且未保存 secret）；淘口令解析改走正确接口 `/tb-service/parse-content`（原误用转链接口 `/goods/get-privilege-link`）；商品详情参数由 `id` 改为 `goodsId`。新增 `tests/test_price.py` 以样本载荷锁定签名向量与解析契约。
+
 ## [1.7.1] - 2026-10-21
 
 ### Fixed
