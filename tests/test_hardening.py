@@ -1218,6 +1218,19 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
             m["_kind"] = kind
         return m
 
+    async def _pump_until(self, predicate, tries=100):
+        """Yield to the loop until predicate() holds (bounded).
+
+        A single sleep(0) is not enough on Python <= 3.11: the pre-3.12
+        asyncio.wait_for in _safe_process_message costs extra loop passes
+        before process_message is entered, so first-entry assertions must
+        pump instead of assuming one yield suffices.
+        """
+        for _ in range(tries):
+            if predicate():
+                return
+            await asyncio.sleep(0)
+
     async def test_same_user_serializes(self):
         """同 user 两条消息：第一条阻塞期间，第二条必须排队等待。"""
         released = asyncio.Event()
@@ -1234,7 +1247,7 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(self.main, "process_message", new=_pm):
             t1 = asyncio.create_task(self.main._safe_process_message(client, msg1))
             t2 = asyncio.create_task(self.main._safe_process_message(client, msg2))
-            await asyncio.sleep(0)
+            await self._pump_until(lambda: len(started) >= 1)
             # 仅第一条进入 process_message；第二条被同 user 锁串行化阻塞
             self.assertEqual(started, ["alice"])
             self.assertEqual(ended, [])
@@ -1286,7 +1299,7 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
                 t_clear = asyncio.create_task(
                     self.main._safe_process_message(client, msg_clear)
                 )
-                await asyncio.sleep(0)
+                await self._pump_until(lambda: "run_start" in order)
                 # run 仍阻塞时，clear 被同 user 锁串行化阻塞，尚未删除 thread_id
                 self.assertIn("run_start", order)
                 self.assertNotIn("clear", order)

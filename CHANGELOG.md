@@ -14,6 +14,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Fixed
 
 - `TestGrokThrottlePreserve` 补上 `_grok_has_credentials` 的 mock：该检查读宿主机 `~/.grok/auth.json` / `XAI_API_KEY`，未 mock 时两个限流用例只在装有 grok 并已登录的机器上通过、干净机器必挂（与 `tests/test_grok_auth.py` 既有做法对齐）。
+- `TestPerUserLockContract` 两个串行化用例改用有界泵送等待首条消息进入处理：原用例只 `sleep(0)` 一次便断言，在 Python 3.10 / 3.11 上因 `asyncio.wait_for` 多耗事件循环轮次而必挂（3.12 重写了 `wait_for` 才恰好通过），与版本无关地对齐。
 
 ## [1.7.2] - 2026-11-01
 
