@@ -1934,6 +1934,12 @@ class TestGrokThrottlePreserve(unittest.IsolatedAsyncioTestCase):
             mock.patch(
                 "wechatbridge.grok._sync_grok_auth", return_value=True
             ),
+            # run_grok gates on _grok_has_credentials(), which reads the real
+            # host auth.json / XAI_API_KEY; without this the subprocess tests
+            # only pass on machines where grok is already signed in.
+            mock.patch(
+                "wechatbridge.grok._grok_has_credentials", return_value=True
+            ),
         ]
         for p in self._patchers:
             p.start()
