@@ -5,6 +5,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-11-03
+
+### Fixed
+
+- **比价模块审计修复（京东/大淘客对接）**：京东签名与请求按官方 SDK `areNotEmpty` 语义过滤空值参数（`access_token=""` 不再参与签名也不发送）；京东 `timestamp` 显式按 GMT+8（北京时间）生成，不再依赖服务器本地时区（网关容差仅 6–10 分钟，UTC 机器差 8 小时必然验签失败）；大淘客签名升级为官方 `signRan`（`MD5(appKey&timer&nonce&key)` 大写，业务参数不签名，不再发送旧版 `sign`）；`get-goods-details` 版本号显式指定为 `v1.2.4`；`handle_price_query` 的 `goods_id` 回退移除 `data.get("id")`（大淘客内部 id 不再被错当淘宝 id）。
+- **测试凭据隔离**：`tests/test_price.py` 移除 `os.environ.setdefault` 注入，改为 `mock.patch.object` 修补模块常量，测试不再读取宿主真实 `JDUNION_*`/`DATAOKE_*` 环境变量；签名期望值同步更新为新算法。
+- **发布前置测试**：`release.yml` 在校验 tag 与包版本一致之前先对 tag 检出代码运行 `python -m unittest discover -s tests`，测试失败即中止发布。
+
 ## [1.7.3] - 2026-11-01
 
 ### Added
