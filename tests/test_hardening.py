@@ -4321,6 +4321,20 @@ class TestAgyDisplayStripsFilePaths(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(display, "see [csv] here")
         self.assertNotIn(self.td, display)
 
+    async def test_fullwidth_paren_wrapped_bare_uri(self):
+        """回归：全角括号（file:///abs）中的裸 URI——）必须被当作尾随
+        标点剥离 URI 本体（产物可提取），且展示文本不得吞掉 ）。"""
+        f = self._mkfile(self.session, "report.pdf")
+        display, arts = await self._run_with_stdout(
+            f"请查收（file://{f}）"
+        )
+        self.assertNotIn("file://", display)
+        self.assertNotIn(self.td, display)
+        # ） 保留：URI 剥除后留下空的全角括号
+        self.assertEqual(display, "请查收（）")
+        # 产物正常提取（）不再粘连在 URI 尾部）
+        self.assertEqual([n for n, _ in arts], ["report.pdf"])
+
 
 class TestAgyImportWithoutYaml(unittest.TestCase):
     """S2: 默认 agy 后端不得因 import dsh 而依赖顶层 yaml。"""

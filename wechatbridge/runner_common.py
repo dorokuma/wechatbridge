@@ -2260,7 +2260,7 @@ _FILE_LINK_TARGET_FALLBACK_RE = re.compile(
 )
 
 # Trailing CJK commentary / punctuation that may be glued to a bare URI match.
-_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\")])}>》」』〉…,.!?;:"
+_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
 
 
 def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
