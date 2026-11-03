@@ -191,6 +191,44 @@ _BUSY_USER_TEXT = (
     "同时处理的消息太多，请过几秒再发。"
 )
 
+# One-shot UX notices (fire-and-forget; failures must never affect the flow).
+_QUEUE_NOTICE_TEXT = (
+    "⏳ 上一条消息仍在处理中，本条已加入排队，请稍候…"
+)
+_PROGRESS_NOTICE_TEXT = (
+    "⏳ 任务较复杂，仍在处理中，请稍候…"
+)
+
+
+async def _progress_notice_watcher(
+    client: ILinkClient,
+    from_user: str,
+    context_token: str,
+    delay: float,
+) -> None:
+    """Send a one-shot "still working" notice if the task runs past ``delay``.
+
+    Bound to the message's own task lifecycle: the caller cancels this watcher
+    when the message finishes (success or failure), so it never outlives the
+    task. send_message failures are swallowed to debug — a notice must never
+    break processing or interfere with locks.
+    """
+    try:
+        await asyncio.sleep(delay)
+        if not context_token or not from_user:
+            return
+        await client.send_message(
+            to_user_id=from_user,
+            text=_PROGRESS_NOTICE_TEXT,
+            context_token=context_token,
+            baseurl=client.state.baseurl,
+            bot_token=client.state.bot_token,
+        )
+    except asyncio.CancelledError:
+        raise  # normal path: task finished before the delay
+    except Exception as e:
+        logger.debug("进度提示发送失败 from=%s: %s", from_user, e)
+
 
 class SlotReacquireTimeout(Exception):
     """Global concurrency slot could not be re-acquired after a released sleep."""
@@ -994,6 +1032,42 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         from_user, msg.get("message_type", 0), len(item_list),
     )
 
+    # Long-task progress notice: one-shot watcher bound to this message's
+    # lifecycle — created before any work, cancelled in finally so no
+    # background task is left behind on any return path.
+    _progress_task = (
+        asyncio.create_task(
+            _progress_notice_watcher(
+                client, from_user, context_token,
+                config.progress_notice_delay,
+            )
+        )
+        if config.progress_notice
+        else None
+    )
+    try:
+        await _process_message_impl(client, msg)
+    finally:
+        if _progress_task is not None:
+            _progress_task.cancel()
+            try:
+                await _progress_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+
+async def _process_message_impl(client: ILinkClient, msg: dict) -> None:
+    """Message body of process_message (runs under the progress watcher).
+
+    Same contract as before: early returns are fine — the caller's finally
+    cancels the progress watcher on every path.
+    """
+    from_user = msg.get("from_user_id", "")
+    context_token = msg.get("context_token", "")
+    item_list = msg.get("item_list", [])
+
     # Extract image media and text from item_list
     text = ""
     image_media = None
@@ -1555,6 +1629,22 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
 
     _user_lock_refs[from_user] = _user_lock_refs.get(from_user, 0) + 1
     try:
+        # Queue notice: the user lock is held → a previous message for this
+        # user is still running. Tell them once, before waiting on the lock.
+        # Fire-and-forget: a failed notice must never break the queue or the
+        # lock acquisition below.
+        if config.queue_notice and user_locks[from_user].locked():
+            try:
+                if context_token and from_user:
+                    await client.send_message(
+                        to_user_id=from_user,
+                        text=_QUEUE_NOTICE_TEXT,
+                        context_token=context_token,
+                        baseurl=client.state.baseurl,
+                        bot_token=client.state.bot_token,
+                    )
+            except Exception as e:
+                logger.debug("排队提示发送失败 from=%s: %s", from_user, e)
         async with user_locks[from_user]:
             # C/B before global slot — do not sleep while holding a concurrent slot
             await _await_upstream_preflight(client, from_user, context_token)

@@ -164,6 +164,9 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信文件大小上限（100 MB） |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | 入站图片/文件下载后上限（20 MB） |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局同时处理上限；同用户串行且排队不占全局槽；满了回「忙」（小内存主机可调小此项以避免并发 CLI 内存峰值；见[内存限制](#内存限制)） |
+| `WECHATBRIDGE_QUEUE_NOTICE` | `true` | 同用户上一条仍在处理时，后续消息入队前先发一次「已加入排队」提示；置 `0`/`false`/`no` 关闭 |
+| `WECHATBRIDGE_PROGRESS_NOTICE` | `true` | 单条消息处理超过 `WECHATBRIDGE_PROGRESS_NOTICE_DELAY` 秒时发一次「仍在处理中」提示；置 `0`/`false`/`no` 关闭 |
+| `WECHATBRIDGE_PROGRESS_NOTICE_DELAY` | `30` | 进度提示触发阈值（秒） |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | 危险闸门确认口令 |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | 是否启用 `/mcp` 说明指令 |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | 是否启用 `/agent` 提示改写指令 |

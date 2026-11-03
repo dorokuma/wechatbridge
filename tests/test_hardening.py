@@ -1394,6 +1394,210 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("alice", main.user_locks)
 
 
+class TestQueueAndProgressNotice(unittest.IsolatedAsyncioTestCase):
+    """UX notices: same-user queue notice + long-task progress notice.
+
+    Both are fire-and-forget — failures must never affect processing, locks,
+    or leak background tasks. State isolation mirrors TestPerUserLockContract.
+    """
+
+    def setUp(self):
+        from wechatbridge import main as main_mod
+        self.main = main_mod
+        self._orig_locks = main_mod.user_locks
+        self._orig_refs = dict(main_mod._user_lock_refs)
+        self._orig_sem = main_mod._global_task_sem
+        main_mod.user_locks = {}
+        main_mod._user_lock_refs.clear()
+        main_mod._global_task_sem = None
+        self._sem_patch = mock.patch.object(
+            main_mod.config, "max_concurrent_tasks", 16
+        )
+        self._sem_patch.start()
+        self.addCleanup(self._sem_patch.stop)
+
+    def tearDown(self):
+        self.main.user_locks = self._orig_locks
+        self.main._user_lock_refs.clear()
+        self.main._user_lock_refs.update(self._orig_refs)
+        self.main._global_task_sem = self._orig_sem
+
+    def _client(self):
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://example.test"
+        client.state.bot_token = "tok"
+        client.send_message = AsyncMock(return_value=True)
+        return client
+
+    def _msg(self, uid):
+        return {"from_user_id": uid, "context_token": "ctx-" + uid}
+
+    async def _pump_until(self, predicate, tries=200):
+        for _ in range(tries):
+            if predicate():
+                return
+            await asyncio.sleep(0)
+        self.fail("pump_until predicate never satisfied")
+
+    async def test_queue_notice_sent_when_user_lock_held(self):
+        """同 user 第二条消息在锁被占用时收到一次性排队提示。"""
+        released = asyncio.Event()
+        started = []
+
+        async def _pm(client, msg):
+            started.append(msg.get("from_user_id"))
+            await released.wait()
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "queue_notice", True), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            # t1 holds the user lock; wait until t2 sent the queue notice
+            await self._pump_until(
+                lambda: client.send_message.await_count >= 1
+            )
+            texts = [
+                c.kwargs.get("text", "")
+                for c in client.send_message.await_args_list
+            ]
+            self.assertIn("排队", "".join(texts))
+            # Only one notice while still queued
+            self.assertEqual(client.send_message.await_count, 1)
+            released.set()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+        self.assertEqual(started, ["alice", "alice"])
+        # Notice is one-shot per message: nothing more after entering the lock
+        self.assertEqual(client.send_message.await_count, 1)
+
+    async def test_queue_notice_disabled_by_env(self):
+        """WECHATBRIDGE_QUEUE_NOTICE 关闭时不发排队提示。"""
+        released = asyncio.Event()
+
+        async def _pm(client, msg):
+            await released.wait()
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "queue_notice", False), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            # t2 must be queued behind the lock — pump enough loop passes
+            await self._pump_until(
+                lambda: self.main._user_lock_refs.get("alice", 0) >= 2
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(client.send_message.await_count, 0)
+            released.set()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_queue_notice_failure_does_not_break_queue(self):
+        """排队提示 send_message 抛错：排队与锁流程不受影响。"""
+        released = asyncio.Event()
+        ended = []
+
+        async def _pm(client, msg):
+            await released.wait()
+            ended.append(msg.get("from_user_id"))
+
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=RuntimeError("ilink down"))
+        with mock.patch.object(self.main.config, "queue_notice", True), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            await self._pump_until(
+                lambda: client.send_message.await_count >= 1
+            )
+            released.set()
+            results = await asyncio.gather(t1, t2, return_exceptions=True)
+        # Neither task raised; both ran process_message to completion
+        self.assertEqual(results, [None, None])
+        self.assertEqual(ended, ["alice", "alice"])
+        # Lock released cleanly — no residual refs
+        self.assertNotIn("alice", self.main._user_lock_refs)
+
+    async def test_progress_notice_fires_once_after_delay(self):
+        """任务超过延迟阈值 → 发一次进度提示；任务结束不重复发。
+
+        watcher 在 process_message 包装层里，故 mock 更深的 _process_message_impl
+        保留真实 watcher 生命周期。
+        """
+        async def _impl(client, msg):
+            await asyncio.sleep(0.35)
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        texts = [
+            c.kwargs.get("text", "")
+            for c in client.send_message.await_args_list
+        ]
+        self.assertEqual(
+            1, sum("仍在处理中" in t for t in texts),
+            "进度提示应恰好发一次",
+        )
+
+    async def test_progress_notice_disabled_by_env(self):
+        """WECHATBRIDGE_PROGRESS_NOTICE 关闭时不发进度提示。"""
+        async def _impl(client, msg):
+            await asyncio.sleep(0.15)
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", False), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_progress_notice_not_sent_for_fast_task(self):
+        """任务在阈值内完成 → 不发提示、watcher 已取消无残留。"""
+        async def _impl(client, msg):
+            return
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        await asyncio.sleep(0.1)  # watcher window passes with nothing to send
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_progress_notice_send_failure_swallowed(self):
+        """进度提示发送抛错：吞掉只记 debug，主流程正常结束。"""
+        done = []
+
+        async def _impl(client, msg):
+            await asyncio.sleep(0.15)
+            done.append(1)
+
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=RuntimeError("ilink down"))
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        self.assertEqual(done, [1])
+        self.assertGreaterEqual(client.send_message.await_count, 1)
+
+
 class TestFormatCliErrorRateQuota(unittest.TestCase):
     """Split eligibility/429/quota so users are not told they spam when
     Google control-plane eligibility is temporarily RESOURCE_EXHAUSTED.

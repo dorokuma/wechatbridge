@@ -26,12 +26,23 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
   - **出站数量上限**：`MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10`，超出只发前 10 个并合并提示。
 - **入站原文件名透传**：文件消息落盘文件名仍为 `uuid.hex[:12]+ext`（安全不变），prompt 附带清洗后的原始文件名（去控制字符/换行/`@`，截前 80 字符）；无附加文本为 `请分析这个文件 @<path> （原文件名：X）`，有附加文本为 `<text>\n\n[附件（原文件名：X）: @<path>]`。
 - **消息类型/多附件提示**：消息仅含不支持类型（视频 type=5、表情包、卡片等）时回复“暂不支持该消息类型”气泡；单条消息多于 1 个媒体项时处理首个并在回复前追加“仅处理首个附件”提示。
+- **同用户排队提示（默认开）**：同一用户上一条消息仍在处理时，后续消息在等锁前先发一次 `⏳ 上一条消息仍在处理中，本条已加入排队，请稍候…`。锁被占用即提示一次，进入锁后不再重复；发送失败吞掉只记 debug，绝不影响排队与锁释放。`WECHATBRIDGE_QUEUE_NOTICE=0`/`false`/`no` 关闭。
+- **长任务进度提示（默认开）**：单条消息处理超过 30 秒未结束，向用户发一次 `⏳ 任务较复杂，仍在处理中，请稍候…`（每条任务只发一次）。watcher 绑在该消息自身的 task 生命周期上，完成/失败/取消均在 finally 中取消，不残留后台 task；发送失败吞掉只记 debug。`WECHATBRIDGE_PROGRESS_NOTICE=0`/`false`/`no` 关闭，阈值可用 `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`（秒）调整。
+- 两个开关均在 `config.py` 解析为 `config.queue_notice` / `config.progress_notice`，默认 `true`。
+
+### Documentation
+
+- `README.md` / `README.zh-CN.md` 环境变量表补充 `WECHATBRIDGE_QUEUE_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE_DELAY`；`deploy/wechatbridge.env.example` 同步。
+
+### Tests
+
+- `tests/test_hardening.py` 新增 `TestQueueAndProgressNotice`（7 条）：排队提示触发/置关不发/发送异常不破队、进度提示按时只发一次/置关不发/快任务不发/发送异常吞掉。锁顺序与 `_prune_user_locks`/`_user_lock_refs` 未动。
 
 ### Changed
 
 - `format_cli_error` 的 `command not found` 文案末尾追加「或发送 `/backend` 切换其它助手引擎」；`unknown` 兜底文案改为「这次没处理好，请稍后再试。若连续失败，可发送 `/new` 开启新对话或 `/backend` 切换引擎。」
 - `_*_subcommand` 通用 `Exception` 兜底文案改为「命令执行失败，请稍后重试。」
-- `README.md` / `README.zh-CN.md`：更正 `/fast`、`/planning` 的「只开不关」过时说明，补充 `/add-dir` 列表/清空用法与 `/price` 条目。
+- `README.md` / `README.zh-CN.md`：更正 `/fast`、`/planning` 的「只开不关」过时说明，补充 `/add-dir` 列表/清空用法与 `/price` 条目；环境变量表补充 `WECHATBRIDGE_QUEUE_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE_DELAY`；`deploy/wechatbridge.env.example` 同步。
 - `codex._snapshot_regular_files` / `_collect_fallback_artifacts` / `_merge_codex_artifacts` 改为 `runner_common` 共用实现的兼容封装（扫描目录排除集保持原 codex 语义）。
 
 ## [1.8.0] - 2026-11-03
