@@ -298,6 +298,182 @@ def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Bounded session_dir snapshot + fallback artifact collection
+#
+# Shared by codex / agy / dsh runners: some CLIs write real deliverables via
+# shell without emitting a file link in stdout. A bounded before/after
+# snapshot of the *per-user session dir* recovers them safely.
+#
+# Safety contract (never relax):
+#   - only the single-user ``session_dir`` is ever a scan root; the shared
+#     multi-user ``config.agy_scratch_dir`` is NEVER scanned (cross-user leak);
+#   - internal metadata dirs are never descended, and every candidate must
+#     pass ``is_sensitive_artifact_path`` (which itself blocks every dotfile
+#     and every dot-dir except the per-user ``.gemini/antigravity-cli/scratch``
+#     artifact region);
+#   - every candidate must be a regular file with ``st_nlink == 1`` whose
+#     ``realpath`` stays inside ``session_dir`` and matches the caller's
+#     extension whitelist.
+# ---------------------------------------------------------------------------
+
+# Directories never descended during artifact fallback snapshots. Hidden dirs
+# are walked (the per-user ``.gemini/antigravity-cli/scratch`` region is a
+# legitimate artifact source) but ``is_sensitive_artifact_path`` downstream
+# rejects anything they contain outside that one exception.
+_SNAPSHOT_SKIP_DIR_NAMES = frozenset({
+    ".codex", ".git", "__pycache__", "node_modules", "venv", ".venv",
+    "cache", ".cache",
+})
+
+# Bridge-private top-level files inside a per-user session dir that must never
+# be returned as artifacts even when they carry a whitelisted extension.
+_SNAPSHOT_EXCLUDE_TOP_LEVEL_NAMES = frozenset({
+    "prefs.json",
+    "dsh_memory.jsonl",
+})
+
+# Extension whitelist for session_dir snapshot-fallback artifacts: user
+# deliverables only (documents / images / archives / markup), no scripts or
+# configs. Hard-coded — do not make configurable.
+ARTIFACT_FALLBACK_EXTENSIONS = frozenset({
+    ".pdf", ".docx", ".xlsx", ".pptx", ".csv",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".zip", ".html",
+})
+
+
+def _snapshot_regular_files(roots: list) -> dict:
+    """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
+
+    Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
+    dict if any limit is exceeded (never partial results).
+
+    ``os.walk(followlinks=False)`` naturally excludes symlink traversal;
+    ``_SNAPSHOT_SKIP_DIR_NAMES`` plus the dot-dir rule skip hidden/internal
+    metadata dirs; only regular files (not dirs/symlinks/special) are
+    collected.
+    """
+    snap = {}
+    t_start = time.monotonic()
+    file_count = 0
+    dir_count = 0
+    _MAX_FILES = 200
+    _MAX_DIRS = 50
+    _MAX_SCAN_TIME = 2.0
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dir_count += 1
+            if dir_count > _MAX_DIRS:
+                return {}
+            if time.monotonic() - t_start > _MAX_SCAN_TIME:
+                return {}
+            # Exclude internal metadata directories in-place
+            dirnames[:] = [
+                d for d in dirnames if d not in _SNAPSHOT_SKIP_DIR_NAMES
+            ]
+            for fn in filenames:
+                file_count += 1
+                if file_count > _MAX_FILES:
+                    return {}
+                fp = os.path.join(dirpath, fn)
+                try:
+                    if not os.path.isfile(fp) or os.path.islink(fp):
+                        continue
+                    # Verify candidate is under one of the allowed roots
+                    if not any(path_is_under(fp, r) for r in roots):
+                        continue
+                    snap[fp] = os.path.getmtime(fp)
+                except OSError:
+                    continue
+    return snap
+
+
+def collect_session_fallback_artifacts(
+    session_dir: str,
+    snapshot_before: dict,
+    t0: float,
+    ext_whitelist=None,
+) -> list:
+    """Scan *session_dir* for files created or overwritten during this turn.
+
+    ``snapshot_before`` must come from ``_snapshot_regular_files([session_dir])``
+    taken before the subprocess ran; ``t0`` is the turn's wall-clock start.
+    Returns ``(name, realpath)`` tuples for files that are new since the
+    snapshot or whose mtime advanced.
+
+    ``ext_whitelist`` is a frozenset of lowercase extensions (e.g.
+    ``ARTIFACT_FALLBACK_EXTENSIONS``); ``None`` accepts any extension (codex
+    legacy behaviour — send-side filtering still applies).
+
+    Callers must only invoke this after the subprocess exited successfully
+    (returncode 0, not timed out, not failed). Never scan on failure and never
+    pass any shared/global directory as *session_dir*.
+    """
+    try:
+        sess_real = os.path.realpath(session_dir)
+    except OSError:
+        return []
+    if not sess_real or not os.path.isdir(sess_real):
+        return []
+    fallback = []
+    for fp, fmtime in _snapshot_regular_files([sess_real]).items():
+        prev = snapshot_before.get(fp)
+        if prev is None:
+            # Mirror codex's freshness tolerance: only count as "new" when the
+            # mtime is not clearly older than the turn start (mtime granularity
+            # may lag ``time.time()`` slightly on some filesystems).
+            if fmtime < t0 - 2.0:
+                continue
+        elif fmtime <= prev:
+            continue
+        if ext_whitelist is not None:
+            if os.path.splitext(fp)[1].lower() not in ext_whitelist:
+                continue
+        name = os.path.basename(fp)
+        try:
+            real = os.path.realpath(fp)
+        except (OSError, ValueError):
+            continue
+        # realpath must stay inside session_dir (no symlink/hardlink escape)
+        if not path_is_under(real, sess_real) or real == sess_real:
+            continue
+        try:
+            st = os.stat(real)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            continue
+        if os.path.dirname(real) == sess_real and name in _SNAPSHOT_EXCLUDE_TOP_LEVEL_NAMES:
+            continue
+        if is_sensitive_artifact_path(real, sess_real):
+            continue
+        fallback.append((name, real))
+    return fallback
+
+
+def merge_artifact_groups(*groups) -> list:
+    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            name, path = item
+            try:
+                key = os.path.realpath(path)
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((name, path))
+    return merged
+
+
 _AT_TOKEN_RE = re.compile(r"@([^\s@。，！？；、：”’'\"）)\]\}>》」』〉…]+)")
 _AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
 

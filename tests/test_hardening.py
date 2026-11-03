@@ -3778,6 +3778,341 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
             msg=str(cm.output),
         )
 
+class TestAgyExtractArtifactsFourModes(unittest.TestCase):
+    """P0-3a: agy extract_artifacts supports 4 link modes like dsh,
+    gated on allowed roots + file existence."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="wb-agy-ext-")
+        self.session = os.path.join(self.td, "session")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.session)
+        os.makedirs(self.scratch)
+        # Real files under allowed roots
+        for rel in (
+            os.path.join(self.session, "a.pdf"),
+            os.path.join(self.session, "b.docx"),
+            os.path.join(self.session, "sub", "c.csv"),
+            os.path.join(self.scratch, "d.png"),
+        ):
+            os.makedirs(os.path.dirname(rel), exist_ok=True)
+            with open(rel, "w") as f:
+                f.write("x")
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _extract(self, text):
+        from wechatbridge.agy import extract_artifacts
+        return extract_artifacts(
+            text, session_dir=self.session,
+            allowed_roots=[self.scratch],
+        )
+
+    def test_all_four_modes(self):
+        text = (
+            f"[report](file:///{self.session}/a.pdf) "
+            f"[doc]({self.session}/b.docx) "
+            f"[csv](./sub/c.csv) "
+            f"and bare file:///{self.scratch}/d.png done"
+        )
+        arts = self._extract(text)
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.join(self.session, "a.pdf"), paths)
+        self.assertIn(os.path.join(self.session, "b.docx"), paths)
+        self.assertIn(os.path.join(self.session, "sub", "c.csv"), paths)
+        self.assertIn(os.path.join(self.scratch, "d.png"), paths)
+
+    def test_outside_allowed_root_skipped(self):
+        outside = os.path.join(self.td, "outside")
+        os.makedirs(outside)
+        ext = os.path.join(outside, "e.pdf")
+        with open(ext, "w") as f:
+            f.write("x")
+        arts = self._extract(f"[e](file:///{ext})")
+        self.assertEqual(arts, [])
+
+    def test_nonexistent_file_skipped(self):
+        arts = self._extract(f"[gone](file:///{self.session}/gone.pdf)")
+        self.assertEqual(arts, [])
+
+
+class TestSessionFallbackArtifacts(unittest.TestCase):
+    """P0-3b: session_dir snapshot fallback for agy/dsh/codex."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="wb-fb-")
+        self.session = os.path.join(self.td, "session")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.session)
+        os.makedirs(self.scratch)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _snapshot(self):
+        from wechatbridge.runner_common import _snapshot_regular_files
+        return _snapshot_regular_files([self.session])
+
+    def _collect(self, before, t0):
+        from wechatbridge.runner_common import (
+            ARTIFACT_FALLBACK_EXTENSIONS,
+            collect_session_fallback_artifacts,
+        )
+        return collect_session_fallback_artifacts(
+            self.session, before, t0,
+            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+        )
+
+    def test_new_pdf_collected(self):
+        t0 = time.time()
+        before = self._snapshot()
+        pdf = os.path.join(self.session, "out.pdf")
+        with open(pdf, "wb") as f:
+            f.write(b"%PDF")
+        arts = self._collect(before, t0)
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.realpath(pdf), paths)
+
+    def test_mtime_bump_collected(self):
+        old = os.path.join(self.session, "old.docx")
+        with open(old, "wb") as f:
+            f.write(b"x")
+        os.utime(old, (1000.0, 1000.0))
+        t0 = time.time()
+        before = self._snapshot()
+        os.utime(old, None)
+        arts = self._collect(before, t0)
+        self.assertIn(os.path.realpath(old), {p for _, p in arts})
+
+    def test_sensitive_excluded(self):
+        t0 = time.time()
+        before = self._snapshot()
+        for name in ("prefs.json", ".initialized.agy", ".codex_thread_id"):
+            with open(os.path.join(self.session, name), "w") as f:
+                f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_whitelist_extension_only(self):
+        t0 = time.time()
+        before = self._snapshot()
+        with open(os.path.join(self.session, "script.py"), "w") as f:
+            f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_hardlink_rejected(self):
+        ext = os.path.join(self.td, "external.txt")
+        with open(ext, "w") as f:
+            f.write("secret")
+        t0 = time.time()
+        before = self._snapshot()
+        hl = os.path.join(self.session, "linked.txt")
+        os.link(ext, hl)
+        arts = self._collect(before, t0)
+        self.assertNotIn(os.path.realpath(hl), {p for _, p in arts})
+
+    def test_symlink_escape_rejected(self):
+        ext = os.path.join(self.td, "secret.pdf")
+        with open(ext, "w") as f:
+            f.write("x")
+        t0 = time.time()
+        before = self._snapshot()
+        link = os.path.join(self.session, "escape.pdf")
+        os.symlink(ext, link)
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_shared_scratch_never_scanned(self):
+        """红线: snapshot roots only ever contain session_dir, never the shared
+        config.agy_scratch_dir — files created there must NOT appear."""
+        t0 = time.time()
+        before = self._snapshot()
+        with open(os.path.join(self.scratch, "shared.pdf"), "w") as f:
+            f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+
+class TestSendArtifactsBackZeroAndCap(unittest.IsolatedAsyncioTestCase):
+    """P0-3c 0-byte skip + P1-3b outbound cap."""
+
+    async def test_zero_byte_skipped_no_notice(self):
+        from wechatbridge.main import send_artifacts_back
+        with tempfile.TemporaryDirectory() as td:
+            empty = os.path.join(td, "empty.pdf")
+            with open(empty, "wb") as f:
+                pass
+            ok_file = os.path.join(td, "ok.pdf")
+            with open(ok_file, "wb") as f:
+                f.write(b"x")
+            client = MagicMock()
+            client.state.baseurl = "https://x"
+            client.state.bot_token = "t"
+            client.send_message = AsyncMock(return_value=True)
+            client.send_media = AsyncMock(return_value=True)
+            with mock.patch(
+                "wechatbridge.main.get_session_dir", return_value=td
+            ), mock.patch(
+                "wechatbridge.main._get_backend", return_value="agy"
+            ):
+                await send_artifacts_back(
+                    client, "u1", "ctx", [("empty.pdf", empty), ("ok.pdf", ok_file)]
+                )
+            sent = {c.kwargs["path"] for c in client.send_media.await_args_list}
+            self.assertIn(os.path.realpath(ok_file), sent)
+            self.assertNotIn(empty, sent)
+
+    async def test_cap_ten_and_notice(self):
+        from wechatbridge.main import send_artifacts_back, MAX_OUTBOUND_ARTIFACTS_PER_TURN
+        with tempfile.TemporaryDirectory() as td:
+            arts = []
+            for i in range(15):
+                p = os.path.join(td, f"f{i}.pdf")
+                with open(p, "wb") as f:
+                    f.write(b"x")
+                arts.append((f"f{i}.pdf", p))
+            client = MagicMock()
+            client.state.baseurl = "https://x"
+            client.state.bot_token = "t"
+            client.send_message = AsyncMock(return_value=True)
+            client.send_media = AsyncMock(return_value=True)
+            with mock.patch(
+                "wechatbridge.main.get_session_dir", return_value=td
+            ), mock.patch(
+                "wechatbridge.main._get_backend", return_value="agy"
+            ):
+                await send_artifacts_back(client, "u1", "ctx", arts)
+            self.assertEqual(
+                len(client.send_media.await_args_list),
+                MAX_OUTBOUND_ARTIFACTS_PER_TURN,
+            )
+            texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+            self.assertTrue(any("共生成 15 个文件" in t for t in texts))
+
+
+class TestDisplayFilenameAndNotices(unittest.TestCase):
+    def test_sanitize_display_filename(self):
+        from wechatbridge.main import _sanitize_display_filename
+        self.assertEqual(_sanitize_display_filename("a@b\nc.pdf"), "abc.pdf")
+        self.assertEqual(len(_sanitize_display_filename("x" * 200 + ".pdf")), 80)
+        self.assertEqual(_sanitize_display_filename("normal.pdf"), "normal.pdf")
+
+
+class TestProcessMessageMediaNotices(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+        self.main = main_mod
+        self.td = tempfile.mkdtemp(prefix="wb-pm-")
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            mock.patch.object(config, "allowed_senders", ["*"]),
+            mock.patch.object(config, "admin_users", []),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _client(self):
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://x"
+        client.state.bot_token = "t"
+        client.send_message = AsyncMock(return_value=True)
+        return client
+
+    async def test_unsupported_type_notice(self):
+        client = self._client()
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [{"type": 5, "video_item": {}}],
+        }
+        await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        self.assertTrue(any("暂不支持该消息类型" in t for t in texts))
+
+    async def test_empty_item_list_silent(self):
+        client = self._client()
+        msg = {"from_user_id": "u1", "context_token": "ctx", "item_list": []}
+        await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        self.assertFalse(any("暂不支持该消息类型" in t for t in texts))
+
+    async def test_multi_media_notice(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 2, "image_item": {"media": media}},
+                {"type": 4, "file_item": {"media": media, "file_name": "f.pdf"}},
+            ],
+        }
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(return_value=("ok", []))
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"\x89PNG\x00")
+        ):
+            await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        self.assertTrue(any("仅处理首个附件" in t for t in texts))
+
+    async def test_file_message_carries_orig_filename(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 4, "file_item": {"media": media, "file_name": "报告 (终版).pdf"}},
+            ],
+        }
+        captured = []
+        async def _gate(client, from_user, ctx, prompt, **kw):
+            captured.append(prompt)
+            return "done", []
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(side_effect=_gate)
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"%PDF")
+        ):
+            await self.main.process_message(client, msg)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("请分析这个文件 @", captured[0])
+        self.assertIn("原文件名：报告 (终版).pdf", captured[0])
+
+    async def test_file_message_with_caption_uses_bracket(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 1, "text_item": {"text": "帮我看看"}},
+                {"type": 4, "file_item": {"media": media, "file_name": "data.xlsx"}},
+            ],
+        }
+        captured = []
+        async def _gate(client, from_user, ctx, prompt, **kw):
+            captured.append(prompt)
+            return "done", []
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(side_effect=_gate)
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"PK")
+        ):
+            await self.main.process_message(client, msg)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("[附件（原文件名：data.xlsx）: @", captured[0])
+
 
 if __name__ == "__main__":
     unittest.main()
