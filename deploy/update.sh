@@ -40,10 +40,52 @@ if [ "$CURRENT_USER" != "$TARGET_USER" ]; then
     echo "(pipx will run as '$TARGET_USER'; override with WECHATBRIDGE_USER=<user>)"
 fi
 
+# --- Helper: report the recorded install source of wechatbridge-cli ---
+# wechatbridge-cli may have been installed from a local path
+# (e.g. `pipx install /root/wechatbridge`); pipx then records that path as
+# package_or_url and `pipx upgrade` is a no-op for it — such installs must be
+# refreshed with `pipx reinstall` instead. This echoes the recorded
+# package_or_url (a bare PyPI name has no '/'; paths/URLs do).
+# Prefers `pipx list --json` (pipx >= 1.0), falls back to parsing `pipx list`,
+# where local-path installs show the path in parentheses after the version.
+pipx_package_or_url() {
+    local json src
+    if json="$(run_pipx list --json 2>/dev/null)" && [ -n "$json" ]; then
+        src="$(printf '%s' "$json" | python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+meta = ((data.get("venvs") or {}).get("wechatbridge-cli") or {}).get("metadata") or {}
+print((meta.get("main_package") or {}).get("package_or_url") or "")
+' 2>/dev/null || true)"
+        if [ -n "$src" ]; then
+            printf '%s\n' "$src"
+            return 0
+        fi
+    fi
+    run_pipx list 2>/dev/null | awk '
+        /^[[:space:]]*package[[:space:]]+wechatbridge-cli([[:space:]]|,|$)/ {
+            if (match($0, /\([^()]*\)/)) {
+                s = substr($0, RSTART + 1, RLENGTH - 2)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                print s
+            }
+            exit
+        }'
+}
+
 # --- Upgrade (or install if not present) ---
 echo "Upgrading WeChatBridge..."
 if run_pipx list --short 2>/dev/null | awk '{print $1}' | grep -x "wechatbridge-cli" >/dev/null || run_pipx list 2>/dev/null | grep -E "(^|[[:space:]])package[[:space:]]+wechatbridge-cli([[:space:]]|,|$)|(^|[[:space:]])wechatbridge-cli([[:space:]]|$)" >/dev/null; then
-    run_pipx upgrade wechatbridge-cli
+    PKG_SRC="$(pipx_package_or_url)"
+    if [[ "$PKG_SRC" == */* ]]; then
+        echo "wechatbridge-cli was installed from a path/URL source: $PKG_SRC"
+        echo "(pipx upgrade only tracks PyPI releases; using pipx reinstall)"
+        run_pipx reinstall wechatbridge-cli --python python3
+    else
+        run_pipx upgrade wechatbridge-cli
+    fi
 else
     echo "WeChatBridge not yet installed under '$TARGET_USER'. Installing..."
     run_pipx install wechatbridge-cli
