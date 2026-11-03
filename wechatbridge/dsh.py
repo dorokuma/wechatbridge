@@ -47,6 +47,7 @@ from .runner_common import (
     format_error,
     format_notice,
     format_cli_error,
+    format_timeout_error,
     get_dsh_state_dir,
     get_session_dir,
     is_bridge_formatted_reply,
@@ -914,7 +915,7 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             user_id,
         )
         await terminate_process(process, graceful=True)
-        err = format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。")
+        err = format_timeout_error(timeout, backend="dsh")
         if not resume_mode and notice_bubble:
             return f"{notice_bubble}\n\n{err}", []
         return err, []
@@ -923,6 +924,14 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
         await terminate_process(process, graceful=False)
         raise
+
+    except FileNotFoundError as e:
+        logger.error("CLI binary not found for %s: %s", "dsh", e)
+        await terminate_process(process, graceful=False)
+        err = format_cli_error("command not found", backend="dsh")
+        if not resume_mode and notice_bubble:
+            return f"{notice_bubble}\n\n{err}", []
+        return err, []
 
     except Exception as e:
         logger.exception("Unexpected error running dsh: %s", e)
@@ -962,9 +971,20 @@ def _cmd_help() -> str:
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — **重置对话**（清空记忆并开始全新会话）",
+        "- `/fast` — 开启/关闭**快速模式**（当前 dsh 引擎暂不支持，可带 on/off）",
+        "- `/planning` — 开启/关闭**规划模式**（当前 dsh 引擎暂不支持，可带 on/off）",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
+        "- `/version` — 查看版本与更新状态",
+    ]
+    try:
+        from .price import price_feature_ready
+        if price_feature_ready():
+            lines.append("- `/price <链接/口令/词>` — 京东/淘宝查券比价")
+    except ImportError:
+        pass
+    lines += [
         "",
         "提示：其他 `/` 指令会直接交给助手处理。",
     ]

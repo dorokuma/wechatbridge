@@ -3494,5 +3494,290 @@ class TestDshHostCredentialContentMatch(unittest.TestCase):
                 self.assertTrue(rc.is_sensitive_artifact_path(c_out, ""))
 
 
+class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
+    """v1.9.0 UX batch: FileNotFoundError 归类、超时/unknown 文案、
+    /model /add-dir 无参行为、二维码清理、poll 恢复日志、price 防御解析。"""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        self._cfg = config
+        self._tmp = tempfile.TemporaryDirectory()
+        self.session_base = self._tmp.name
+        self._orig_base = config.session_base_dir
+        config.session_base_dir = self.session_base
+
+    def tearDown(self):
+        self._cfg.session_base_dir = self._orig_base
+        self._tmp.cleanup()
+
+    # ---- FileNotFoundError → command not found 归类 ---------------------------
+
+    async def _assert_fnf_maps_to_command_not_found(self, run_coro):
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", "missing-cli")
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await run_coro()
+        self.assertEqual(artifacts, [])
+        self.assertTrue(display.startswith("❌"), msg=display[:80])
+        self.assertIn("助手不可用", display)
+        self.assertIn("/backend", display)
+
+    async def test_run_agy_binary_missing(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: agy_mod.run_agy("hi", "u-fnf-agy")
+            )
+
+    async def test_run_grok_binary_missing(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "grok_binary_path", "/nonexistent/grok"), \
+             mock.patch("wechatbridge.grok._sync_grok_auth", return_value=True), \
+             mock.patch("wechatbridge.grok._grok_has_credentials", return_value=True):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: grok_mod.run_grok("hi", "u-fnf-grok")
+            )
+
+    async def test_run_codex_binary_missing(self):
+        from wechatbridge import codex as codex_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "codex_binary_path", "/nonexistent/codex"):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: codex_mod.run_codex("hi", "u-fnf-codex")
+            )
+
+    async def test_run_dsh_binary_missing(self):
+        from wechatbridge import dsh as dsh_mod
+        from wechatbridge.config import config
+
+        host_home = os.path.join(self.session_base, "dsh-home")
+        os.makedirs(host_home, exist_ok=True)
+        with open(os.path.join(host_home, ".credentials.yaml"), "w") as f:
+            f.write("provider: deepseek\n")
+        with mock.patch.object(config, "dsh_binary_path", "/nonexistent/dsh"), \
+             mock.patch.object(config, "dsh_home", host_home):
+            display, artifacts = await dsh_mod.run_dsh("hi", "u-fnf-dsh")
+        self.assertEqual(artifacts, [])
+        self.assertIn("助手不可用", display)
+        self.assertIn("/backend", display)
+
+    async def test_agy_subcommand_binary_missing(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", "agy")
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            out = await agy_mod._run_agy_subcommand(["models"], "u-fnf-sub")
+        self.assertIn("助手不可用", out)
+
+    # ---- format_timeout_error / format_cli_error unknown 日志 ------------------
+
+    def test_format_timeout_error_backends(self):
+        from wechatbridge.runner_common import format_timeout_error
+
+        for be in ("agy", "grok", "codex"):
+            out = format_timeout_error(90, backend=be)
+            self.assertTrue(out.startswith("❌"), msg=be)
+            self.assertIn("处理超时", out)
+            self.assertIn("超过 90 秒", out)
+            self.assertIn("/fast", out)
+            self.assertIn("/new", out)
+        dsh_out = format_timeout_error(90, backend="dsh")
+        self.assertIn("处理超时", dsh_out)
+        self.assertIn("/new", dsh_out)
+        self.assertNotIn("/fast", dsh_out)
+
+    def test_format_cli_error_unknown_logs_detail(self):
+        from wechatbridge.runner_common import format_cli_error
+
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            out = format_cli_error("totally weird backend gibberish", backend="agy")
+        self.assertTrue(out.startswith("❌"))
+        self.assertIn("执行失败", out)
+        self.assertIn("/new", out)
+        self.assertIn("/backend", out)
+        self.assertTrue(
+            any("unknown detail" in m and "weird backend gibberish" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+    def test_format_cli_error_command_not_found_hint(self):
+        from wechatbridge.runner_common import format_cli_error
+
+        out = format_cli_error("command not found", backend="grok")
+        self.assertIn("助手不可用", out)
+        self.assertIn("/backend", out)
+
+    # ---- /model /add-dir 无参与 clear -----------------------------------------
+
+    async def test_agy_model_no_arg_shows_current(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs("u-m-noparam", {"model": "gemini-x"})
+        out = await agy_mod._cmd_model("", "u-m-noparam")
+        self.assertIn("当前模型", out)
+        self.assertIn("gemini-x", out)
+        self.assertIn("/model <", out)
+
+    async def test_grok_model_no_arg_shows_current(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs("u-m-noparam-g", {"model": "grok-9"})
+        out = await grok_mod._cmd_model("", "u-m-noparam-g")
+        self.assertIn("当前模型", out)
+        self.assertIn("grok-9", out)
+        self.assertIn("/model <", out)
+
+    def test_agy_add_dir_list_and_clear(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import save_prefs, load_prefs
+
+        out_empty = agy_mod._cmd_add_dir("", "u-add-1")
+        self.assertIn("/add-dir <", out_empty)
+        save_prefs("u-add-1", {"add_dirs": ["/tmp/a", "/tmp/b"]})
+        out_list = agy_mod._cmd_add_dir("", "u-add-1")
+        self.assertIn("/tmp/a", out_list)
+        self.assertIn("/tmp/b", out_list)
+        out_clear = agy_mod._cmd_add_dir("clear", "u-add-1")
+        self.assertIn("已清空", out_clear)
+        self.assertEqual(load_prefs("u-add-1").get("add_dirs"), [])
+
+    # ---- codex rc=0 结构化错误日志 --------------------------------------------
+
+    async def test_codex_rc0_structured_error_logs_warning(self):
+        from wechatbridge import codex as codex_mod
+        from wechatbridge.config import config
+
+        err_jsonl = json.dumps(
+            {"type": "turn.failed", "error": {"message": "rate limit exceeded"}}
+        )
+
+        async def spawn(*_a, **_k):
+            return _FakeGrokProc(err_jsonl, "", rc=0)
+
+        with mock.patch.object(config, "codex_binary_path", "codex"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             self.assertLogs("codex_runner", level="WARNING") as cm:
+            display, _ = await codex_mod.run_codex("hi", "u-rc0-err")
+        self.assertTrue(display.startswith("🔔"), msg=display[:80])
+        self.assertTrue(
+            any("structured error (rc=0)" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+    # ---- 登录二维码清理 --------------------------------------------------------
+
+    async def test_login_flow_removes_qr_files(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+
+        png = os.path.join(self.session_base, "qrcode.png")
+        urlf = os.path.join(self.session_base, ".current_qrcode_url.txt")
+        os.makedirs(self.session_base, exist_ok=True)
+        for p in (png, urlf):
+            with open(p, "w") as f:
+                f.write("x")
+
+        client = MagicMock()
+        client.get_qrcode = AsyncMock(return_value=("qrstr", ""))
+        client.poll_qrcode_status = AsyncMock(return_value=("tok", "https://b"))
+        client.state = MagicMock()
+
+        with mock.patch.object(config, "qrcode_png_path", png), \
+             mock.patch.object(config, "qrcode_url_path", urlf):
+            ok = await main_mod.login_flow(client)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(png))
+        self.assertFalse(os.path.exists(urlf))
+
+    # ---- price 防御解析 --------------------------------------------------------
+
+    def test_price_safe_env_int(self):
+        from wechatbridge import price as price_mod
+
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "abc"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 15)
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "0"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 15)
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "8"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 8)
+
+    def test_price_module_import_with_bad_env(self):
+        """非法 PRICE_HTTP_TIMEOUT 不应在 import 时抛 ValueError。"""
+        import importlib
+        import sys
+
+        saved = sys.modules.pop("wechatbridge.price", None)
+        try:
+            with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "notanint"}, clear=False):
+                mod = importlib.import_module("wechatbridge.price")
+            self.assertEqual(mod._DT_TIMEOUT, 15)
+        finally:
+            sys.modules.pop("wechatbridge.price", None)
+            if saved is not None:
+                sys.modules["wechatbridge.price"] = saved
+
+    # ---- 长轮询恢复日志 --------------------------------------------------------
+
+    async def test_poll_loop_logs_recovery_after_errors(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+
+        calls = 0
+
+        class _Client:
+            def __init__(self):
+                self.state = MagicMock()
+                self.state.bot_token = "tok"
+                self.state.baseurl = "https://b"
+                self.state.load = MagicMock(return_value=True)
+
+            async def get_updates(self, buf, baseurl, bot_token):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("boom")
+                if calls == 2:
+                    return [], "buf2"
+                # 恢复确认后退出主循环（CancelledError 不被内层 except Exception 吞掉）
+                raise asyncio.CancelledError()
+
+            async def close(self):
+                return None
+
+        client = _Client()
+
+        def _swallow_bg(coro):
+            coro.close()  # _spawn_bg 被 mock 掉，直接关闭避免 unawaited 告警
+
+        with mock.patch.object(main_mod, "ILinkClient", return_value=client), \
+             mock.patch.object(main_mod, "ensure_runtime_dirs"), \
+             mock.patch.object(main_mod, "clean_scratch"), \
+             mock.patch.object(main_mod, "_prune_user_locks"), \
+             mock.patch.object(main_mod, "_log_access_control_state"), \
+             mock.patch.object(main_mod, "_spawn_bg", side_effect=_swallow_bg), \
+             mock.patch.object(config, "update_check_enabled", False), \
+             mock.patch.object(main_mod.asyncio, "sleep", new=AsyncMock()), \
+             self.assertLogs("wechatbridge", level="INFO") as cm:
+            with self.assertRaises(asyncio.CancelledError):
+                await main_mod.main_loop()
+
+        self.assertTrue(
+            any("Poll loop recovered after 1 consecutive error(s)" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,27 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-03
+
+### Added
+
+- **`runner_common.format_timeout_error(timeout, backend)`**：四个 `run_*` 的超时分支统一改用它——agy/grok/codex 在原有文案后追加「建议将问题拆小后重试，或发送 `/fast` 切换快速模式、`/new` 开启新对话」；dsh 不支持 `/fast`，提示去掉该句。
+- `agy`/`grok`/`codex`/`dsh` 的 `run_*` 与 `_*_subcommand` 显式捕获 `FileNotFoundError`：记 `CLI binary not found` 错误日志后走 `command not found` 归类（提示可 `/backend` 切换引擎），不再落入通用 `Exception` 分支。
+- `/help` 统一更新：`/backend` 参数补 `dsh`；`/fast`、`/planning` 说明更正为可 toggle / 可带 `on`/`off`；新增 `/version` 条目；配置好比价密钥时追加 `/price` 条目。dsh 帮助同步补充 `/fast`、`/planning`（标注暂不支持）。
+- `agy`/`grok` 的 `/model` 无参时对齐 codex：显示当前模型卡片及切换示例，不再报「缺少参数」。
+- 三后端 `/add-dir`：无参显示当前列表+用法（无列表时仅用法），`/add-dir clear` 清空已存目录。
+- `price.py` `_safe_env_int(name, default, min_val)`：`PRICE_HTTP_TIMEOUT` 非法值或小于 1 时回退默认 15 并记 warning，不再抛 `ValueError`。
+- 登录成功后自动删除二维码临时文件 `qrcode.png` 与 `.current_qrcode_url.txt`。
+- 长轮询连续异常后首次恢复时记 `Poll loop recovered after N consecutive error(s)` info 日志。
+- codex 零退出但 stdout 含结构化错误（`turn.failed`/`error`）时新增 `codex reported structured error (rc=0)` warning 日志（含重试分支）。
+- `format_cli_error` 归类为 `unknown` 且有清洗后详情时新增 warning 日志，便于排查未识别错误。
+
+### Changed
+
+- `format_cli_error` 的 `command not found` 文案末尾追加「或发送 `/backend` 切换其它助手引擎」；`unknown` 兜底文案改为「这次没处理好，请稍后再试。若连续失败，可发送 `/new` 开启新对话或 `/backend` 切换引擎。」
+- `_*_subcommand` 通用 `Exception` 兜底文案改为「命令执行失败，请稍后重试。」
+- `README.md` / `README.zh-CN.md`：更正 `/fast`、`/planning` 的「只开不关」过时说明，补充 `/add-dir` 列表/清空用法与 `/price` 条目。
+
 ## [1.8.0] - 2026-11-03
 
 ### Changed

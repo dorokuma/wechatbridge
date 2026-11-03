@@ -21,7 +21,7 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, is_sensitive_artifact_path, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
-    format_error, format_cli_error, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
+    format_error, format_cli_error, format_timeout_error, format_model_label, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir,
 )
 
@@ -382,12 +382,17 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             user_id,
         )
         await terminate_process(process, graceful=True)
-        return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
+        return format_timeout_error(timeout, backend="agy"), []
 
     except asyncio.CancelledError:
         # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
         await terminate_process(process, graceful=False)
         raise
+
+    except FileNotFoundError as e:
+        logger.error("CLI binary not found for %s: %s", "agy", e)
+        await terminate_process(process, graceful=False)
+        return format_cli_error("command not found", backend="agy"), []
 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
@@ -449,12 +454,16 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
     except asyncio.CancelledError:
         await terminate_process(process, graceful=False)
         raise
+    except FileNotFoundError as e:
+        logger.error("CLI binary not found for %s: %s", "agy", e)
+        await terminate_process(process, graceful=False)
+        return format_cli_error("command not found", backend="agy")
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
         await terminate_process(process, graceful=False)
         return format_error(
             "执行出错",
-            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+            "命令执行失败，请稍后重试。",
         )
 
 
@@ -466,15 +475,15 @@ def _cmd_help() -> str:
         "**模型控制**",
         "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
         "- `/models` — 查看可用模型列表",
-        "- `/backend <agy|grok|codex>` — 切换助手引擎",
+        "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — 重置对话（开始新会话）",
-        "- `/fast` — 开启**快速模式**（回答更快，思考更少）",
-        "- `/planning` — 开启**规划模式**（先想清楚再动手）",
+        "- `/fast` — 开启/关闭**快速模式**（回答更快，思考更少，可带 on/off）",
+        "- `/planning` — 开启/关闭**规划模式**（先想清楚再动手，可带 on/off）",
         "",
         "**工具**",
-        "- `/add-dir <路径>` — 添加工作目录",
+        "- `/add-dir <路径>` — 添加工作目录（`clear` 清空，无参查看当前列表）",
         "- `/agents` — 查看可用助手",
         "",
         "**扩展工具 & 子助手**",
@@ -486,6 +495,15 @@ def _cmd_help() -> str:
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
+        "- `/version` — 查看版本与更新状态",
+    ]
+    try:
+        from .price import price_feature_ready
+        if price_feature_ready():
+            lines.append("- `/price <链接/口令/词>` — 京东/淘宝查券比价")
+    except ImportError:
+        pass
+    lines += [
         "",
         "提示：其他 `/` 指令（如 `/goal`、`/grill-me`、`/schedule` 等）会直接交给助手处理。",
     ]
@@ -612,15 +630,31 @@ def _cmd_planning(user_id: str, args: str = "") -> str:
 
 
 def _cmd_add_dir(args: str, user_id: str) -> str:
-    """Handle /add-dir <path>: add path to add_dirs list (dedup, validated, capped)."""
+    """Handle /add-dir <path>: add path to add_dirs list (dedup, validated, capped).
+
+    ``/add-dir`` with no args shows the current list plus usage;
+    ``/add-dir clear`` empties the stored list.
+    """
     path = args.strip()
+    prefs = load_prefs(user_id)
     if not path:
-        return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
+        dirs = prefs.get("add_dirs", []) or []
+        if dirs:
+            listing = "\n".join(f"- `{d}`" for d in dirs)
+            return (
+                "📋 **当前工作目录** 📋\n\n"
+                f"{listing}\n\n"
+                "`/add-dir <路径>` 添加，`/add-dir clear` 清空。"
+            )
+        return "ℹ️ **/add-dir 用法** ℹ️\n\n`/add-dir <路径>` 添加工作目录，`/add-dir clear` 清空。"
+    if path.lower() == "clear":
+        prefs["add_dirs"] = []
+        save_prefs(user_id, prefs)
+        return "✅ **已清空工作目录** ✅"
     ok, result = validate_add_dir(path, user_id)
     if not ok:
         return f"❌ **目录不允许** ❌\n\n{result}"
     resolved = result
-    prefs = load_prefs(user_id)
     dirs = prefs.get("add_dirs", [])
     if resolved not in dirs:
         if len(dirs) >= MAX_ADD_DIRS:
@@ -660,7 +694,12 @@ async def _cmd_model(args: str, user_id: str) -> str:
     """
     name = args.strip()
     if not name:
-        return "❌ **缺少参数** ❌\n\n`/model <名称>`"
+        prefs = load_prefs(user_id)
+        return (
+            "📋 **当前模型** 📋\n\n"
+            f"`{format_model_label(prefs.get('model', ''))}`\n\n"
+            "用 `/models` 查看可用模型，`/model <名称>` 切换。"
+        )
 
     output = await _run_agy_subcommand(["models"], user_id)
     # 认 ❌/🔔 格式化错误气泡与限流通知，勿把中文错误当模型列表 parse

@@ -40,7 +40,28 @@ _JD_APP_KEY = os.getenv("JDUNION_APP_KEY", "")
 _JD_SECRET_KEY = os.getenv("JDUNION_APP_SECRET", "")
 _DT_APP_KEY = os.getenv("DATAOKE_APP_KEY", "")
 _DT_APP_SECRET = os.getenv("DATAOKE_APP_SECRET", "")
-_DT_TIMEOUT = int(os.getenv("PRICE_HTTP_TIMEOUT", "15"))
+
+
+def _safe_env_int(name: str, default: int, min_val: int | None = None) -> int:
+    """Parse an int env var defensively: invalid/low values fall back to default."""
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        parsed = int(val)
+    except ValueError:
+        logger.warning("Invalid %s=%r, falling back to %d", name, val, default)
+        return default
+    if min_val is not None and parsed < min_val:
+        logger.warning(
+            "Out-of-range %s=%r (< %d), falling back to %d",
+            name, val, min_val, default,
+        )
+        return default
+    return parsed
+
+
+_DT_TIMEOUT = _safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1)
 
 JD_API_URL = "https://api.jd.com/routerjson"
 DT_API_URL = "https://openapi.dataoke.com/api"
