@@ -19,9 +19,11 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -50,7 +52,7 @@ def jd_configured() -> bool:
 
 def dt_configured() -> bool:
     # Dataoke rejects unsigned requests: both the appKey and the appSecret
-    # (used only locally to compute `sign`, never sent) are required.
+    # (used only locally to compute `signRan`, never sent) are required.
     return bool(_DT_APP_KEY and _DT_APP_SECRET)
 
 
@@ -185,11 +187,12 @@ def detect_price_trigger(text: str) -> dict | None:
 
 
 def _jd_sign(params: dict) -> str:
-    # JD gateway rule: MD5(secret + sorted key+value concat + secret), upper.
-    # The secret wraps BOTH ends — appending it only at the end produces a
-    # signature the gateway always rejects.
+    # JD gateway rule (per the official SDK's areNotEmpty semantic): MD5 of
+    # secret + sorted non-empty key+value concat + secret, upper. Params with
+    # empty values participate in NEITHER the signature NOR the request — the
+    # secret wraps both ends.
     plain = "".join(
-        f"{k}{v}" for k, v in sorted(params.items()) if k != "sign"
+        f"{k}{v}" for k, v in sorted(params.items()) if k != "sign" and v != ""
     )
     return hashlib.md5(
         (_JD_SECRET_KEY + plain + _JD_SECRET_KEY).encode("utf-8")
@@ -198,18 +201,22 @@ def _jd_sign(params: dict) -> str:
 
 def _jd_call(method: str, param_json: dict) -> dict:
     # JD gateway contract: form field is `360buy_param_json`; the signature
-    # covers every field except `sign` itself (access_token="" participates).
+    # covers every non-empty field except `sign` itself. access_token="" is
+    # dropped (empty values are neither signed nor sent). timestamp must be
+    # Beijing time (GMT+8) — the gateway tolerance is only ~6–10 minutes, so
+    # a UTC-local server clock would fail verification by 8 hours.
     params = {
         "method": method,
         "app_key": _JD_APP_KEY,
         "access_token": "",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
         "format": "json",
         "v": "1.0",
         "sign_method": "md5",
         "360buy_param_json": json.dumps(param_json, ensure_ascii=False, separators=(",", ":")),
     }
     params["sign"] = _jd_sign(params)
+    params = {k: v for k, v in params.items() if v != ""}
     resp = httpx.post(JD_API_URL, data=params, timeout=_DT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
@@ -251,23 +258,21 @@ def query_jd_sku(sku: str) -> PriceResult:
 # 大淘客 (Taobao/Tmall proxy) API
 # ---------------------------------------------------------------------------
 
-def _dt_sign(params: dict) -> str:
-    # Dataoke rule (per the official SDK): sort every request parameter
-    # (appKey and version included, sign excluded) by key, join as
-    # "k1=v1&k2=v2&...", append "&key=<appSecret>", MD5, uppercase.
-    plain = "&".join(
-        f"{k}={v}" for k, v in sorted(params.items()) if k != "sign"
-    )
-    return hashlib.md5(
-        (plain + "&key=" + _DT_APP_SECRET).encode("utf-8")
-    ).hexdigest().upper()
-
-
 def _dt_call(path: str, params: dict) -> dict:
+    # Dataoke signRan rule (official SDK): business params are NOT signed.
+    # signRan = MD5("appKey=<appKey>&timer=<ms>&nonce=<rand6>&key=<appSecret>")
+    # upper; the request carries appKey/version/timer/nonce/signRan plus the
+    # business params — no legacy `sign` field is sent.
     params = dict(params)
     params["appKey"] = _DT_APP_KEY
     params["version"] = params.get("version", "v2.0.0")
-    params["sign"] = _dt_sign(params)
+    timer = int(time.time() * 1000)
+    nonce = str(random.randint(100000, 999999))
+    params["timer"] = timer
+    params["nonce"] = nonce
+    params["signRan"] = hashlib.md5(
+        f"appKey={_DT_APP_KEY}&timer={timer}&nonce={nonce}&key={_DT_APP_SECRET}".encode("utf-8")
+    ).hexdigest().upper()
     resp = httpx.get(f"{DT_API_URL}{path}", params=params, timeout=_DT_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
@@ -294,7 +299,10 @@ def query_tb_item(item_id: str) -> PriceResult:
     """Query Taobao/Tmall item via dataoke goods detail API."""
     # get-goods-details takes the Taobao item id as `goodsId`, not `id`
     # (`id` is dataoke's own internal goods id and matches nothing here).
-    data = _dt_call("/goods/get-goods-details", {"goodsId": str(item_id)})
+    data = _dt_call(
+        "/goods/get-goods-details",
+        {"goodsId": str(item_id), "version": "v1.2.4"},
+    )
     goods = data.get("goods", data)
     quan_price = float(goods.get("quanPrice", 0) or 0)
     actual_price = float(goods.get("actualPrice", goods.get("originalPrice", 0)) or 0)
@@ -431,7 +439,6 @@ async def handle_price_query(trigger: dict) -> str:
             goods_id = str(
                 data.get("goodsId", "")
                 or data.get("itemId", "")
-                or data.get("id", "")
             )
             if not goods_id:
                 return "❓ 口令解析出来了但没拿到商品信息，可能商品未收录。"
