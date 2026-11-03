@@ -278,14 +278,17 @@ class AppConfig:
     # CDN upload timeout (seconds)
     cdn_upload_timeout: int = _env_int("CDN_UPLOAD_TIMEOUT", 120)
 
-    # Access control: comma-separated wxid list, empty = allow all
+    # Access control: comma-separated wxid list.
+    # Non-empty = only listed users; single "*" = explicit allow-all.
+    # Empty = fail-closed: only WECHATBRIDGE_ADMINS members (both empty = deny all).
     allowed_senders: list = [
         s.strip()
         for s in os.getenv("WECHATBRIDGE_ALLOWED_SENDERS", "").split(",")
         if s.strip()
     ]
 
-    # Admin users: comma-separated wxid list, receive update notifications etc.
+    # Admin users: comma-separated wxid list; also the fallback allowlist when
+    # WECHATBRIDGE_ALLOWED_SENDERS is empty (fail-closed default).
     admin_users: list = [
         s.strip()
         for s in os.getenv("WECHATBRIDGE_ADMINS", "").split(",")

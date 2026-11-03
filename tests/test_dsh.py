@@ -411,6 +411,9 @@ class _DshIntegrationBase:
         p4.start(); self._patchers.append(p4)
         p_ck = mock.patch.object(config, "confirm_keywords", [])
         p_ck.start(); self._patchers.append(p_ck)
+        # fail-closed 白名单下，集成用例走 process_message 需显式放开
+        p_as = mock.patch.object(config, "allowed_senders", ["*"])
+        p_as.start(); self._patchers.append(p_as)
         p_env = mock.patch.dict(os.environ, {"WECHATBRIDGE_CONFIRM_KEYWORDS": ""}, clear=False)
         p_env.start(); self._patchers.append(p_env)
 

@@ -247,6 +247,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         process = await asyncio.create_subprocess_exec(
 
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=session_dir,
@@ -304,6 +305,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         await asyncio.sleep(3)
                     retry_process = await asyncio.create_subprocess_exec(
                         *cmd,
+                        stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=session_dir,
@@ -414,6 +416,7 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
         env = sanitize_env(session_dir)
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=session_dir,

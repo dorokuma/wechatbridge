@@ -5,6 +5,27 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-03
+
+### Changed
+
+- **白名单默认收紧（fail-closed）**：`WECHATBRIDGE_ALLOWED_SENDERS` 为空不再表示放开所有人——此时仅 `WECHATBRIDGE_ADMINS` 中的用户可用，两者皆空则拒绝所有人；非空列表语义不变；显式设为 `*` 才恢复放开所有人（升级后如需保持全开，请设置 `WECHATBRIDGE_ALLOWED_SENDERS=*`）。启动日志会按当前生效模式打印一条提示（只打数量，不打 wxid 列表）。
+
+### Fixed
+
+- `user_locks` 清理的两个竞态：`_prune_user_locks()` 原先在 `asyncio.to_thread` 的工作线程里遍历/修改事件循环状态，现移回事件循环线程；并为每用户锁增加引用计数（取锁前 +1、结束后 -1），消除「锁刚释放、等待者未被唤醒时 `locked()` 为 False 被误删导致后来者拿到新锁打破串行」的空隙。
+- 附件出站内容比对原先只覆盖会话目录内的凭据文件，遗漏了 dsh/grok/codex 使用的宿主级凭据文件——子进程可读取并改名复制后经会话目录作为附件发出；现已纳入比对清单，且不依赖会话目录是否存在。
+- dsh 每用户会话 id 的比对路径更正为其实际存储位置（原清单项指向会话目录内不存在的路径，属于死代码）。
+- 白名单中 `*` 与其它项混用时启动日志新增一条告警：`*` 只在单独配置时表示放开所有人，混用时被当作字面用户 id。
+- `update.sh` 升级完成后检查目标用户的访问控制配置，未生效配置时打印醒目警告（不阻断升级）。
+- codex 首轮/续轮命令的 prompt 参数前统一加 `--` 分隔，以 `-` 开头的消息不再被 codex CLI 解析为选项。
+- agy 后端三处 `create_subprocess_exec` 未关闭子进程 stdin，现统一 `stdin=DEVNULL`（与 codex 一致）。
+- 删除 `tests/test_hardening.py` 中部一处遗留的 `if __name__ == "__main__": unittest.main()`（保留文件末尾的一处）。
+
+### Security
+
+- 白名单改默认拒绝未知用户（见 Changed）；附件出站额外阻断改名/复制发出的宿主凭据内容；命令行参数注入防护（`--` 分隔）。
+
 ## [1.7.4] - 2026-11-03
 
 ### Fixed

@@ -43,13 +43,23 @@ class TestBuildCodexCommand(unittest.TestCase):
         self.assertEqual(
             cmd,
             ["codex", "exec", "--json", "--skip-git-repo-check",
-             "--dangerously-bypass-approvals-and-sandbox", "hello"],
+             "--dangerously-bypass-approvals-and-sandbox", "--", "hello"],
         )
 
     def test_prompt_is_last_positional(self):
         cmd = self._cmd(prompt="a b c")
         self.assertEqual(cmd[-1], "a b c")
+        self.assertEqual(cmd[-2], "--")
         self.assertNotIn("resume", cmd)
+
+    def test_dash_prompt_after_separator(self):
+        # 以 '-' 开头的 prompt 必须跟在 "--" 之后，否则被 codex CLI 当选项。
+        cmd = self._cmd(prompt="--help")
+        self.assertEqual(cmd[-1], "--help")
+        self.assertEqual(cmd[-2], "--")
+        # prompt 本身就是 "--" 时也必须保留（fake_codex 只删第一个分隔符）
+        cmd = self._cmd(prompt="--")
+        self.assertEqual(cmd[-2:], ["--", "--"])
 
     def test_plan_mode_uses_readonly_sandbox(self):
         cmd = self._cmd(prefs={"mode": "plan"})
@@ -92,9 +102,10 @@ class TestBuildCodexCommand(unittest.TestCase):
         cmd = self._cmd(first=False, thread_id="tid-123")
         self.assertIn("resume", cmd)
         self.assertIn("tid-123", cmd)
-        # resume 是子命令，options 在前，prompt 在最后
+        # resume 是子命令，options 在前，"--" 分隔符之后是 prompt
         self.assertEqual(cmd[cmd.index("resume") + 1], "tid-123")
         self.assertEqual(cmd[-1], "hello")
+        self.assertEqual(cmd[-2], "--")
 
     def test_resume_no_yolo_skip_when_plan(self):
         cmd = self._cmd(first=False, thread_id="tid", prefs={"mode": "plan"})
