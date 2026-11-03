@@ -5,6 +5,52 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-03
+
+### Added
+
+- **`runner_common.format_timeout_error(timeout, backend)`**：四个 `run_*` 的超时分支统一改用它——agy/grok/codex 在原有文案后追加「建议将问题拆小后重试，或发送 `/fast` 切换快速模式、`/new` 开启新对话」；dsh 不支持 `/fast`，提示去掉该句。
+- `agy`/`grok`/`codex`/`dsh` 的 `run_*` 与 `_*_subcommand` 显式捕获 `FileNotFoundError`：记 `CLI binary not found` 错误日志后走 `command not found` 归类（提示可 `/backend` 切换引擎），不再落入通用 `Exception` 分支。
+- `/help` 统一更新：`/backend` 参数补 `dsh`；`/fast`、`/planning` 说明更正为可 toggle / 可带 `on`/`off`；新增 `/version` 条目；配置好比价密钥时追加 `/price` 条目。dsh 帮助同步补充 `/fast`、`/planning`（标注暂不支持）。
+- `agy`/`grok` 的 `/model` 无参时对齐 codex：显示当前模型卡片及切换示例，不再报「缺少参数」。
+- 三后端 `/add-dir`：无参显示当前列表+用法（无列表时仅用法），`/add-dir clear` 清空已存目录。
+- `price.py` `_safe_env_int(name, default, min_val)`：`PRICE_HTTP_TIMEOUT` 非法值或小于 1 时回退默认 15 并记 warning，不再抛 `ValueError`。
+- 登录成功后自动删除二维码临时文件 `qrcode.png` 与 `.current_qrcode_url.txt`。
+- 长轮询连续异常后首次恢复时记 `Poll loop recovered after N consecutive error(s)` info 日志。
+- codex 零退出但 stdout 含结构化错误（`turn.failed`/`error`）时新增 `codex reported structured error (rc=0)` warning 日志（含重试分支）。
+- `format_cli_error` 归类为 `unknown` 且有清洗后详情时新增 warning 日志，便于排查未识别错误。
+- **产物识别/回传扩展（批次二）**：
+  - `agy` 的 `extract_artifacts` 对齐 `dsh`，支持 4 种产物引用形式：`[name](file:///abs)`、`[name](/abs)`、`[name](./rel)` / `../rel`（相对路径基于 `session_dir` 解析）与裸 `file:///abs`；仅当路径解析后位于允许根（`session_dir` / `config.agy_scratch_dir` / 已验证 `--add-dir`）且文件存在时才收录，显示文本重写不变。
+  - **session_dir 快照回退扫描**：把 `codex` 的有界快照工具（200 文件 / 50 子目录 / 2 秒上限）抽为 `runner_common._snapshot_regular_files`，并新增 `collect_session_fallback_artifacts` / `merge_artifact_groups` 共用工具；`run_agy` 与 `run_dsh` 在进程成功退出后对**单用户 `session_dir`**（绝不扫共享 `config.agy_scratch_dir`）做前后快照对比，把本轮新增/mtime 变新且扩展名在白名单（`.pdf .docx .xlsx .pptx .csv .png .jpg .jpeg .gif .webp .svg .zip .html`）内的文件作为链接提取的去重补充（按 realpath 去重）。每个候选经 `is_sensitive_artifact_path` + `st_nlink == 1` + `realpath` 在 `session_dir` 内三重校验；非零退出/超时/失败不扫描。
+  - `send_artifacts_back` 跳过 0 字节产物（仅日志不通知）。
+  - **出站数量上限**：`MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10`，超出只发前 10 个并合并提示。
+- **入站原文件名透传**：文件消息落盘文件名仍为 `uuid.hex[:12]+ext`（安全不变），prompt 附带清洗后的原始文件名（去控制字符/换行/`@`，截前 80 字符）；无附加文本为 `请分析这个文件 @<path> （原文件名：X）`，有附加文本为 `<text>\n\n[附件（原文件名：X）: @<path>]`。
+- **消息类型/多附件提示**：消息仅含不支持类型（视频 type=5、表情包、卡片等）时回复“暂不支持该消息类型”气泡；单条消息多于 1 个媒体项时处理首个并在回复前追加“仅处理首个附件”提示。
+- **同用户排队提示（默认开）**：同一用户上一条消息仍在处理时，后续消息在等锁前先发一次 `⏳ 上一条消息仍在处理中，本条已加入排队，请稍候…`。锁被占用即提示一次，进入锁后不再重复；发送失败吞掉只记 debug，绝不影响排队与锁释放。`WECHATBRIDGE_QUEUE_NOTICE=0`/`false`/`no` 关闭。
+- **长任务进度提示（默认开）**：单条消息处理超过 30 秒未结束，向用户发一次 `⏳ 任务较复杂，仍在处理中，请稍候…`（每条任务只发一次）。watcher 绑在该消息自身的 task 生命周期上，完成/失败/取消均在 finally 中取消，不残留后台 task；发送失败吞掉只记 debug。`WECHATBRIDGE_PROGRESS_NOTICE=0`/`false`/`no` 关闭，阈值可用 `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`（秒）调整。
+- 两个开关均在 `config.py` 解析为 `config.queue_notice` / `config.progress_notice`，默认 `true`。
+
+### Fixed
+
+- agy 显示文本泄露服务器路径：裸 `file:///abs` URI 与 `[x](/abs)` / `[x](./rel)` 链接形式此前只剥 `[x](file:///...)`，现与 dsh 同规则只保留链接文字。
+- `FileNotFoundError` 误报：session_dir/cwd 不存在或 try 内其它 ENOENT 不再被误报为「助手不可用/未安装」。
+- 快照键不一致：`_snapshot_regular_files` 以 realpath 归一化 root，修复 `collect_session_fallback_artifacts` 前后键不匹配。
+- `multi_media_notice` 末尾补 `\n\n`，与 `cancelled_notice` 一致。
+
+### Tests
+
+- `tests/test_hardening.py` 新增 `TestQueueAndProgressNotice`（7 条）：排队提示触发/置关不发/发送异常不破队、进度提示按时只发一次/置关不发/快任务不发/发送异常吞掉。锁顺序与 `_prune_user_locks`/`_user_lock_refs` 未动。
+- 批次一（UX error & help）：`TestUxErrorAndHelp`——FileNotFoundError → `command not found` 归类（四后端 run_* + agy subcommand）、`format_timeout_error` 各后端文案、`format_cli_error` unknown 日志与 `command not found` 提示、`/model` `/add-dir` 无参行为、登录二维码清理、price 防御解析、poll 恢复日志。
+- 批次二（artifacts & media）：`TestAgyExtractArtifactsFourModes`（agy 4 种产物引用 + 允许根/存在性门禁）、`TestSessionFallbackArtifacts`（快照回退新增/mtime/敏感排除/扩展名白名单/硬链接/软链接逃逸/共享 scratch 不扫）、`TestSendArtifactsBackZeroAndCap`（0 字节跳过 + 出站上限 10）、`TestProcessMessageMediaNotices`（不支持类型提示/空列表静默/多附件提示/原文件名透传）。
+- 本轮返修：`TestAgyDisplayStripsFilePaths`（agy 显示文本剥裸 `file:///`、`[x](file:///abs)`、`[x](/abs)`、`[x](./rel)`）、`TestAgyImportWithoutYaml`（屏蔽 yaml 后 import wechatbridge.agy 成功）、`TestSnapshotRealpathKeys`（软链接父目录下快照前后键一致）、`TestUxErrorAndHelp` 增补 FNF `e.filename` 指向 session_dir 时不误报「助手不可用」（agy + grok）、`test_fallback_scan_timeout` 改为 patch `runner_common._snapshot_regular_files`、`test_multi_media_notice` 断言提示与正文间有空行。
+
+### Changed
+
+- `format_cli_error` 的 `command not found` 文案末尾追加「或发送 `/backend` 切换其它助手引擎」；`unknown` 兜底文案改为「这次没处理好，请稍后再试。若连续失败，可发送 `/new` 开启新对话或 `/backend` 切换引擎。」
+- `_*_subcommand` 通用 `Exception` 兜底文案改为「命令执行失败，请稍后重试。」
+- `README.md` / `README.zh-CN.md`：更正 `/fast`、`/planning` 的「只开不关」过时说明，补充 `/add-dir` 列表/清空用法与 `/price` 条目；环境变量表补充 `WECHATBRIDGE_QUEUE_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE_DELAY`；`deploy/wechatbridge.env.example` 同步。
+- `codex._snapshot_regular_files` / `_collect_fallback_artifacts` / `_merge_codex_artifacts` 改为 `runner_common` 共用实现的兼容封装（扫描目录排除集保持原 codex 语义）。
+
 ## [1.8.0] - 2026-11-03
 
 ### Changed

@@ -164,6 +164,9 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply (on small RAM hosts, lower this to avoid concurrent CLI memory spikes; see [Memory limits](#memory-limits)) |
+| `WECHATBRIDGE_QUEUE_NOTICE` | `true` | one-shot "queued" notice when the user's previous message is still running; set `0`/`false`/`no` to disable |
+| `WECHATBRIDGE_PROGRESS_NOTICE` | `true` | one-shot "still working" notice after a message runs past `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`; set `0`/`false`/`no` to disable |
+| `WECHATBRIDGE_PROGRESS_NOTICE_DELAY` | `30` | seconds before the progress notice fires |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | reply this token to approve a gated dangerous prompt |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | enable the `/mcp` help text command |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | enable the `/agent` prompt-rewrite command |
@@ -285,11 +288,12 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | `/clear` or `/new` | start a new conversation (agy/grok: drops continue flag; codex: clears thread ID; dsh: clears window memory or persistent session ID) |
 | `/model <name>` | set model (all backends validate against a live list: agy/grok via CLI `models`; codex via `codex debug models` [then `--bundled`]; unknown name or list-fetch failure refuse and do not write prefs; see `/models`) |
 | `/models` | list models — agy/grok/codex all query the live CLI (codex: `debug models`; falls back to a built-in reference note only if the live list cannot be fetched) |
-| `/fast` | set low reasoning effort (**on only** — not a toggle; no “off” command) |
-| `/planning` | set planning mode (**on only** — not a toggle) |
-| `/add-dir <path>` | **agy:** pass `--add-dir` on later runs if path is allowed. **grok:** recorded only; not passed to the CLI yet |
+| `/fast` | fast-mode toggle: low reasoning effort (accepts `on`/`off`; a second bare `/fast` turns it off) |
+| `/planning` | planning-mode toggle (accepts `on`/`off`; a second bare `/planning` turns it off) |
+| `/add-dir <path>` | **agy/codex:** pass `--add-dir` on later runs if path is allowed. **grok:** recorded only; not passed to the CLI yet. No-arg shows the current list, `/add-dir clear` empties it (dsh unsupported) |
 | `/agents` | list agents via the active CLI |
 | `/persona <text>` | set persona (`show` / `clear` / `reset` subcommands) |
+| `/price <link/token/keyword>` | JD/Taobao coupon & price lookup (requires `JDUNION_*` or `DATAOKE_*` keys) |
 | `/version` | show current version, instance name, and backend; if a newer version is available, show upgrade hint |
 | `/mcp` | short MCP **usage hint** text (can disable with `WECHATBRIDGE_ENABLE_MCP`) |
 | `/agent <name> <task>` | craft a "invoke subagent …" prompt and run the CLI (can disable with `WECHATBRIDGE_ENABLE_SUBAGENT`) |

@@ -1394,6 +1394,210 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("alice", main.user_locks)
 
 
+class TestQueueAndProgressNotice(unittest.IsolatedAsyncioTestCase):
+    """UX notices: same-user queue notice + long-task progress notice.
+
+    Both are fire-and-forget — failures must never affect processing, locks,
+    or leak background tasks. State isolation mirrors TestPerUserLockContract.
+    """
+
+    def setUp(self):
+        from wechatbridge import main as main_mod
+        self.main = main_mod
+        self._orig_locks = main_mod.user_locks
+        self._orig_refs = dict(main_mod._user_lock_refs)
+        self._orig_sem = main_mod._global_task_sem
+        main_mod.user_locks = {}
+        main_mod._user_lock_refs.clear()
+        main_mod._global_task_sem = None
+        self._sem_patch = mock.patch.object(
+            main_mod.config, "max_concurrent_tasks", 16
+        )
+        self._sem_patch.start()
+        self.addCleanup(self._sem_patch.stop)
+
+    def tearDown(self):
+        self.main.user_locks = self._orig_locks
+        self.main._user_lock_refs.clear()
+        self.main._user_lock_refs.update(self._orig_refs)
+        self.main._global_task_sem = self._orig_sem
+
+    def _client(self):
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://example.test"
+        client.state.bot_token = "tok"
+        client.send_message = AsyncMock(return_value=True)
+        return client
+
+    def _msg(self, uid):
+        return {"from_user_id": uid, "context_token": "ctx-" + uid}
+
+    async def _pump_until(self, predicate, tries=200):
+        for _ in range(tries):
+            if predicate():
+                return
+            await asyncio.sleep(0)
+        self.fail("pump_until predicate never satisfied")
+
+    async def test_queue_notice_sent_when_user_lock_held(self):
+        """同 user 第二条消息在锁被占用时收到一次性排队提示。"""
+        released = asyncio.Event()
+        started = []
+
+        async def _pm(client, msg):
+            started.append(msg.get("from_user_id"))
+            await released.wait()
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "queue_notice", True), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            # t1 holds the user lock; wait until t2 sent the queue notice
+            await self._pump_until(
+                lambda: client.send_message.await_count >= 1
+            )
+            texts = [
+                c.kwargs.get("text", "")
+                for c in client.send_message.await_args_list
+            ]
+            self.assertIn("排队", "".join(texts))
+            # Only one notice while still queued
+            self.assertEqual(client.send_message.await_count, 1)
+            released.set()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+        self.assertEqual(started, ["alice", "alice"])
+        # Notice is one-shot per message: nothing more after entering the lock
+        self.assertEqual(client.send_message.await_count, 1)
+
+    async def test_queue_notice_disabled_by_env(self):
+        """WECHATBRIDGE_QUEUE_NOTICE 关闭时不发排队提示。"""
+        released = asyncio.Event()
+
+        async def _pm(client, msg):
+            await released.wait()
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "queue_notice", False), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            # t2 must be queued behind the lock — pump enough loop passes
+            await self._pump_until(
+                lambda: self.main._user_lock_refs.get("alice", 0) >= 2
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(client.send_message.await_count, 0)
+            released.set()
+            await asyncio.gather(t1, t2, return_exceptions=True)
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_queue_notice_failure_does_not_break_queue(self):
+        """排队提示 send_message 抛错：排队与锁流程不受影响。"""
+        released = asyncio.Event()
+        ended = []
+
+        async def _pm(client, msg):
+            await released.wait()
+            ended.append(msg.get("from_user_id"))
+
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=RuntimeError("ilink down"))
+        with mock.patch.object(self.main.config, "queue_notice", True), \
+             mock.patch.object(self.main, "process_message", new=_pm):
+            t1 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            t2 = asyncio.create_task(
+                self.main._safe_process_message(client, self._msg("alice"))
+            )
+            await self._pump_until(
+                lambda: client.send_message.await_count >= 1
+            )
+            released.set()
+            results = await asyncio.gather(t1, t2, return_exceptions=True)
+        # Neither task raised; both ran process_message to completion
+        self.assertEqual(results, [None, None])
+        self.assertEqual(ended, ["alice", "alice"])
+        # Lock released cleanly — no residual refs
+        self.assertNotIn("alice", self.main._user_lock_refs)
+
+    async def test_progress_notice_fires_once_after_delay(self):
+        """任务超过延迟阈值 → 发一次进度提示；任务结束不重复发。
+
+        watcher 在 process_message 包装层里，故 mock 更深的 _process_message_impl
+        保留真实 watcher 生命周期。
+        """
+        async def _impl(client, msg):
+            await asyncio.sleep(0.35)
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        texts = [
+            c.kwargs.get("text", "")
+            for c in client.send_message.await_args_list
+        ]
+        self.assertEqual(
+            1, sum("仍在处理中" in t for t in texts),
+            "进度提示应恰好发一次",
+        )
+
+    async def test_progress_notice_disabled_by_env(self):
+        """WECHATBRIDGE_PROGRESS_NOTICE 关闭时不发进度提示。"""
+        async def _impl(client, msg):
+            await asyncio.sleep(0.15)
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", False), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_progress_notice_not_sent_for_fast_task(self):
+        """任务在阈值内完成 → 不发提示、watcher 已取消无残留。"""
+        async def _impl(client, msg):
+            return
+
+        client = self._client()
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        await asyncio.sleep(0.1)  # watcher window passes with nothing to send
+        self.assertEqual(client.send_message.await_count, 0)
+
+    async def test_progress_notice_send_failure_swallowed(self):
+        """进度提示发送抛错：吞掉只记 debug，主流程正常结束。"""
+        done = []
+
+        async def _impl(client, msg):
+            await asyncio.sleep(0.15)
+            done.append(1)
+
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=RuntimeError("ilink down"))
+        with mock.patch.object(self.main.config, "progress_notice", True), \
+             mock.patch.object(self.main.config, "progress_notice_delay", 0.05), \
+             mock.patch.object(self.main, "_process_message_impl", new=_impl):
+            await self.main._safe_process_message(client, self._msg("bob"))
+        self.assertEqual(done, [1])
+        self.assertGreaterEqual(client.send_message.await_count, 1)
+
+
 class TestFormatCliErrorRateQuota(unittest.TestCase):
     """Split eligibility/429/quota so users are not told they spam when
     Google control-plane eligibility is temporarily RESOURCE_EXHAUSTED.
@@ -3492,6 +3696,833 @@ class TestDshHostCredentialContentMatch(unittest.TestCase):
                 # 会话目录为空串时宿主凭据内容匹配仍生效
                 self.assertTrue(rc.is_sensitive_artifact_path(g_out, ""))
                 self.assertTrue(rc.is_sensitive_artifact_path(c_out, ""))
+
+
+class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
+    """v1.9.0 UX batch: FileNotFoundError 归类、超时/unknown 文案、
+    /model /add-dir 无参行为、二维码清理、poll 恢复日志、price 防御解析。"""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        self._cfg = config
+        self._tmp = tempfile.TemporaryDirectory()
+        self.session_base = self._tmp.name
+        self._orig_base = config.session_base_dir
+        config.session_base_dir = self.session_base
+
+    def tearDown(self):
+        self._cfg.session_base_dir = self._orig_base
+        self._tmp.cleanup()
+
+    # ---- FileNotFoundError → command not found 归类 ---------------------------
+
+    async def _assert_fnf_maps_to_command_not_found(self, run_coro, missing_name):
+        """ENOENT must name the spawned binary (e.filename == cmd[0]) to map
+        to 「助手不可用」— mocking the real asyncio failure semantics."""
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", missing_name)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await run_coro()
+        self.assertEqual(artifacts, [])
+        self.assertTrue(display.startswith("❌"), msg=display[:80])
+        self.assertIn("助手不可用", display)
+        self.assertIn("/backend", display)
+
+    async def test_run_agy_binary_missing(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: agy_mod.run_agy("hi", "u-fnf-agy"), "/nonexistent/agy"
+            )
+
+    async def test_run_grok_binary_missing(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "grok_binary_path", "/nonexistent/grok"), \
+             mock.patch("wechatbridge.grok._sync_grok_auth", return_value=True), \
+             mock.patch("wechatbridge.grok._grok_has_credentials", return_value=True):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: grok_mod.run_grok("hi", "u-fnf-grok"), "/nonexistent/grok"
+            )
+
+    async def test_run_codex_binary_missing(self):
+        from wechatbridge import codex as codex_mod
+        from wechatbridge.config import config
+
+        with mock.patch.object(config, "codex_binary_path", "/nonexistent/codex"):
+            await self._assert_fnf_maps_to_command_not_found(
+                lambda: codex_mod.run_codex("hi", "u-fnf-codex"), "/nonexistent/codex"
+            )
+
+    async def test_run_dsh_binary_missing(self):
+        from wechatbridge import dsh as dsh_mod
+        from wechatbridge.config import config
+
+        host_home = os.path.join(self.session_base, "dsh-home")
+        os.makedirs(host_home, exist_ok=True)
+        with open(os.path.join(host_home, ".credentials.yaml"), "w") as f:
+            f.write("provider: deepseek\n")
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", "/nonexistent/dsh")
+
+        with mock.patch.object(config, "dsh_binary_path", "/nonexistent/dsh"), \
+             mock.patch.object(config, "dsh_home", host_home), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await dsh_mod.run_dsh("hi", "u-fnf-dsh")
+        self.assertEqual(artifacts, [])
+        self.assertIn("助手不可用", display)
+        self.assertIn("/backend", display)
+
+    async def test_agy_subcommand_binary_missing(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", "/nonexistent/agy")
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            out = await agy_mod._run_agy_subcommand(["models"], "u-fnf-sub")
+        self.assertIn("助手不可用", out)
+
+    # ---- FileNotFoundError 指向 session_dir/其它路径 → 不得报「未安装」 -------
+
+    async def test_run_agy_fnf_other_path_not_binary_missing(self):
+        """session_dir / 其它 ENOENT 走通用错误，不误报「助手不可用」。"""
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", self.session_base)
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await agy_mod.run_agy("hi", "u-fnf-cwd")
+        self.assertEqual(artifacts, [])
+        self.assertIn("执行出错", display)
+        self.assertNotIn("助手不可用", display)
+        self.assertNotIn(self.session_base, display)
+
+    async def test_run_grok_fnf_other_path_not_binary_missing(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", self.session_base)
+
+        with mock.patch.object(config, "grok_binary_path", "/nonexistent/grok"), \
+             mock.patch("wechatbridge.grok._sync_grok_auth", return_value=True), \
+             mock.patch("wechatbridge.grok._grok_has_credentials", return_value=True), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await grok_mod.run_grok("hi", "u-fnf-cwd-g")
+        self.assertEqual(artifacts, [])
+        self.assertIn("执行出错", display)
+        self.assertNotIn("助手不可用", display)
+
+    # ---- format_timeout_error / format_cli_error unknown 日志 ------------------
+
+    def test_format_timeout_error_backends(self):
+        from wechatbridge.runner_common import format_timeout_error
+
+        for be in ("agy", "grok", "codex"):
+            out = format_timeout_error(90, backend=be)
+            self.assertTrue(out.startswith("❌"), msg=be)
+            self.assertIn("处理超时", out)
+            self.assertIn("超过 90 秒", out)
+            self.assertIn("/fast", out)
+            self.assertIn("/new", out)
+        dsh_out = format_timeout_error(90, backend="dsh")
+        self.assertIn("处理超时", dsh_out)
+        self.assertIn("/new", dsh_out)
+        self.assertNotIn("/fast", dsh_out)
+
+    def test_format_cli_error_unknown_logs_detail(self):
+        from wechatbridge.runner_common import format_cli_error
+
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            out = format_cli_error("totally weird backend gibberish", backend="agy")
+        self.assertTrue(out.startswith("❌"))
+        self.assertIn("执行失败", out)
+        self.assertIn("/new", out)
+        self.assertIn("/backend", out)
+        self.assertTrue(
+            any("unknown detail" in m and "weird backend gibberish" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+    def test_format_cli_error_command_not_found_hint(self):
+        from wechatbridge.runner_common import format_cli_error
+
+        out = format_cli_error("command not found", backend="grok")
+        self.assertIn("助手不可用", out)
+        self.assertIn("/backend", out)
+
+    # ---- /model /add-dir 无参与 clear -----------------------------------------
+
+    async def test_agy_model_no_arg_shows_current(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs("u-m-noparam", {"model": "gemini-x"})
+        out = await agy_mod._cmd_model("", "u-m-noparam")
+        self.assertIn("当前模型", out)
+        self.assertIn("gemini-x", out)
+        self.assertIn("/model <", out)
+
+    async def test_grok_model_no_arg_shows_current(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs("u-m-noparam-g", {"model": "grok-9"})
+        out = await grok_mod._cmd_model("", "u-m-noparam-g")
+        self.assertIn("当前模型", out)
+        self.assertIn("grok-9", out)
+        self.assertIn("/model <", out)
+
+    def test_agy_add_dir_list_and_clear(self):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import save_prefs, load_prefs
+
+        out_empty = agy_mod._cmd_add_dir("", "u-add-1")
+        self.assertIn("/add-dir <", out_empty)
+        save_prefs("u-add-1", {"add_dirs": ["/tmp/a", "/tmp/b"]})
+        out_list = agy_mod._cmd_add_dir("", "u-add-1")
+        self.assertIn("/tmp/a", out_list)
+        self.assertIn("/tmp/b", out_list)
+        out_clear = agy_mod._cmd_add_dir("clear", "u-add-1")
+        self.assertIn("已清空", out_clear)
+        self.assertEqual(load_prefs("u-add-1").get("add_dirs"), [])
+
+    # ---- codex rc=0 结构化错误日志 --------------------------------------------
+
+    async def test_codex_rc0_structured_error_logs_warning(self):
+        from wechatbridge import codex as codex_mod
+        from wechatbridge.config import config
+
+        err_jsonl = json.dumps(
+            {"type": "turn.failed", "error": {"message": "rate limit exceeded"}}
+        )
+
+        async def spawn(*_a, **_k):
+            return _FakeGrokProc(err_jsonl, "", rc=0)
+
+        with mock.patch.object(config, "codex_binary_path", "codex"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             self.assertLogs("codex_runner", level="WARNING") as cm:
+            display, _ = await codex_mod.run_codex("hi", "u-rc0-err")
+        self.assertTrue(display.startswith("🔔"), msg=display[:80])
+        self.assertTrue(
+            any("structured error (rc=0)" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+    # ---- 登录二维码清理 --------------------------------------------------------
+
+    async def test_login_flow_removes_qr_files(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+
+        png = os.path.join(self.session_base, "qrcode.png")
+        urlf = os.path.join(self.session_base, ".current_qrcode_url.txt")
+        os.makedirs(self.session_base, exist_ok=True)
+        for p in (png, urlf):
+            with open(p, "w") as f:
+                f.write("x")
+
+        client = MagicMock()
+        client.get_qrcode = AsyncMock(return_value=("qrstr", ""))
+        client.poll_qrcode_status = AsyncMock(return_value=("tok", "https://b"))
+        client.state = MagicMock()
+
+        with mock.patch.object(config, "qrcode_png_path", png), \
+             mock.patch.object(config, "qrcode_url_path", urlf):
+            ok = await main_mod.login_flow(client)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(png))
+        self.assertFalse(os.path.exists(urlf))
+
+    # ---- price 防御解析 --------------------------------------------------------
+
+    def test_price_safe_env_int(self):
+        from wechatbridge import price as price_mod
+
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "abc"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 15)
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "0"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 15)
+        with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "8"}, clear=False):
+            self.assertEqual(price_mod._safe_env_int("PRICE_HTTP_TIMEOUT", 15, min_val=1), 8)
+
+    def test_price_module_import_with_bad_env(self):
+        """非法 PRICE_HTTP_TIMEOUT 不应在 import 时抛 ValueError。"""
+        import importlib
+        import sys
+
+        saved = sys.modules.pop("wechatbridge.price", None)
+        try:
+            with mock.patch.dict(os.environ, {"PRICE_HTTP_TIMEOUT": "notanint"}, clear=False):
+                mod = importlib.import_module("wechatbridge.price")
+            self.assertEqual(mod._DT_TIMEOUT, 15)
+        finally:
+            sys.modules.pop("wechatbridge.price", None)
+            if saved is not None:
+                sys.modules["wechatbridge.price"] = saved
+
+    # ---- 长轮询恢复日志 --------------------------------------------------------
+
+    async def test_poll_loop_logs_recovery_after_errors(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+
+        calls = 0
+
+        class _Client:
+            def __init__(self):
+                self.state = MagicMock()
+                self.state.bot_token = "tok"
+                self.state.baseurl = "https://b"
+                self.state.load = MagicMock(return_value=True)
+
+            async def get_updates(self, buf, baseurl, bot_token):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("boom")
+                if calls == 2:
+                    return [], "buf2"
+                # 恢复确认后退出主循环（CancelledError 不被内层 except Exception 吞掉）
+                raise asyncio.CancelledError()
+
+            async def close(self):
+                return None
+
+        client = _Client()
+
+        def _swallow_bg(coro):
+            coro.close()  # _spawn_bg 被 mock 掉，直接关闭避免 unawaited 告警
+
+        with mock.patch.object(main_mod, "ILinkClient", return_value=client), \
+             mock.patch.object(main_mod, "ensure_runtime_dirs"), \
+             mock.patch.object(main_mod, "clean_scratch"), \
+             mock.patch.object(main_mod, "_prune_user_locks"), \
+             mock.patch.object(main_mod, "_log_access_control_state"), \
+             mock.patch.object(main_mod, "_spawn_bg", side_effect=_swallow_bg), \
+             mock.patch.object(config, "update_check_enabled", False), \
+             mock.patch.object(main_mod.asyncio, "sleep", new=AsyncMock()), \
+             self.assertLogs("wechatbridge", level="INFO") as cm:
+            with self.assertRaises(asyncio.CancelledError):
+                await main_mod.main_loop()
+
+        self.assertTrue(
+            any("Poll loop recovered after 1 consecutive error(s)" in m for m in cm.output),
+            msg=str(cm.output),
+        )
+
+class TestAgyExtractArtifactsFourModes(unittest.TestCase):
+    """P0-3a: agy extract_artifacts supports 4 link modes like dsh,
+    gated on allowed roots + file existence."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="wb-agy-ext-")
+        self.session = os.path.join(self.td, "session")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.session)
+        os.makedirs(self.scratch)
+        # Real files under allowed roots
+        for rel in (
+            os.path.join(self.session, "a.pdf"),
+            os.path.join(self.session, "b.docx"),
+            os.path.join(self.session, "sub", "c.csv"),
+            os.path.join(self.scratch, "d.png"),
+        ):
+            os.makedirs(os.path.dirname(rel), exist_ok=True)
+            with open(rel, "w") as f:
+                f.write("x")
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _extract(self, text):
+        from wechatbridge.agy import extract_artifacts
+        return extract_artifacts(
+            text, session_dir=self.session,
+            allowed_roots=[self.scratch],
+        )
+
+    def test_all_four_modes(self):
+        text = (
+            f"[report](file:///{self.session}/a.pdf) "
+            f"[doc]({self.session}/b.docx) "
+            f"[csv](./sub/c.csv) "
+            f"and bare file:///{self.scratch}/d.png done"
+        )
+        arts = self._extract(text)
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.join(self.session, "a.pdf"), paths)
+        self.assertIn(os.path.join(self.session, "b.docx"), paths)
+        self.assertIn(os.path.join(self.session, "sub", "c.csv"), paths)
+        self.assertIn(os.path.join(self.scratch, "d.png"), paths)
+
+    def test_outside_allowed_root_skipped(self):
+        outside = os.path.join(self.td, "outside")
+        os.makedirs(outside)
+        ext = os.path.join(outside, "e.pdf")
+        with open(ext, "w") as f:
+            f.write("x")
+        arts = self._extract(f"[e](file:///{ext})")
+        self.assertEqual(arts, [])
+
+    def test_nonexistent_file_skipped(self):
+        arts = self._extract(f"[gone](file:///{self.session}/gone.pdf)")
+        self.assertEqual(arts, [])
+
+
+class TestSessionFallbackArtifacts(unittest.TestCase):
+    """P0-3b: session_dir snapshot fallback for agy/dsh/codex."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="wb-fb-")
+        self.session = os.path.join(self.td, "session")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.session)
+        os.makedirs(self.scratch)
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _snapshot(self):
+        from wechatbridge.runner_common import _snapshot_regular_files
+        return _snapshot_regular_files([self.session])
+
+    def _collect(self, before, t0):
+        from wechatbridge.runner_common import (
+            ARTIFACT_FALLBACK_EXTENSIONS,
+            collect_session_fallback_artifacts,
+        )
+        return collect_session_fallback_artifacts(
+            self.session, before, t0,
+            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+        )
+
+    def test_new_pdf_collected(self):
+        t0 = time.time()
+        before = self._snapshot()
+        pdf = os.path.join(self.session, "out.pdf")
+        with open(pdf, "wb") as f:
+            f.write(b"%PDF")
+        arts = self._collect(before, t0)
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.realpath(pdf), paths)
+
+    def test_mtime_bump_collected(self):
+        old = os.path.join(self.session, "old.docx")
+        with open(old, "wb") as f:
+            f.write(b"x")
+        os.utime(old, (1000.0, 1000.0))
+        t0 = time.time()
+        before = self._snapshot()
+        os.utime(old, None)
+        arts = self._collect(before, t0)
+        self.assertIn(os.path.realpath(old), {p for _, p in arts})
+
+    def test_sensitive_excluded(self):
+        t0 = time.time()
+        before = self._snapshot()
+        for name in ("prefs.json", ".initialized.agy", ".codex_thread_id"):
+            with open(os.path.join(self.session, name), "w") as f:
+                f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_whitelist_extension_only(self):
+        t0 = time.time()
+        before = self._snapshot()
+        with open(os.path.join(self.session, "script.py"), "w") as f:
+            f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_hardlink_rejected(self):
+        ext = os.path.join(self.td, "external.txt")
+        with open(ext, "w") as f:
+            f.write("secret")
+        t0 = time.time()
+        before = self._snapshot()
+        hl = os.path.join(self.session, "linked.txt")
+        os.link(ext, hl)
+        arts = self._collect(before, t0)
+        self.assertNotIn(os.path.realpath(hl), {p for _, p in arts})
+
+    def test_symlink_escape_rejected(self):
+        ext = os.path.join(self.td, "secret.pdf")
+        with open(ext, "w") as f:
+            f.write("x")
+        t0 = time.time()
+        before = self._snapshot()
+        link = os.path.join(self.session, "escape.pdf")
+        os.symlink(ext, link)
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+    def test_shared_scratch_never_scanned(self):
+        """红线: snapshot roots only ever contain session_dir, never the shared
+        config.agy_scratch_dir — files created there must NOT appear."""
+        t0 = time.time()
+        before = self._snapshot()
+        with open(os.path.join(self.scratch, "shared.pdf"), "w") as f:
+            f.write("x")
+        arts = self._collect(before, t0)
+        self.assertEqual(arts, [])
+
+
+class TestSendArtifactsBackZeroAndCap(unittest.IsolatedAsyncioTestCase):
+    """P0-3c 0-byte skip + P1-3b outbound cap."""
+
+    async def test_zero_byte_skipped_no_notice(self):
+        from wechatbridge.main import send_artifacts_back
+        with tempfile.TemporaryDirectory() as td:
+            empty = os.path.join(td, "empty.pdf")
+            with open(empty, "wb") as f:
+                pass
+            ok_file = os.path.join(td, "ok.pdf")
+            with open(ok_file, "wb") as f:
+                f.write(b"x")
+            client = MagicMock()
+            client.state.baseurl = "https://x"
+            client.state.bot_token = "t"
+            client.send_message = AsyncMock(return_value=True)
+            client.send_media = AsyncMock(return_value=True)
+            with mock.patch(
+                "wechatbridge.main.get_session_dir", return_value=td
+            ), mock.patch(
+                "wechatbridge.main._get_backend", return_value="agy"
+            ):
+                await send_artifacts_back(
+                    client, "u1", "ctx", [("empty.pdf", empty), ("ok.pdf", ok_file)]
+                )
+            sent = {c.kwargs["path"] for c in client.send_media.await_args_list}
+            self.assertIn(os.path.realpath(ok_file), sent)
+            self.assertNotIn(empty, sent)
+
+    async def test_cap_ten_and_notice(self):
+        from wechatbridge.main import send_artifacts_back, MAX_OUTBOUND_ARTIFACTS_PER_TURN
+        with tempfile.TemporaryDirectory() as td:
+            arts = []
+            for i in range(15):
+                p = os.path.join(td, f"f{i}.pdf")
+                with open(p, "wb") as f:
+                    f.write(b"x")
+                arts.append((f"f{i}.pdf", p))
+            client = MagicMock()
+            client.state.baseurl = "https://x"
+            client.state.bot_token = "t"
+            client.send_message = AsyncMock(return_value=True)
+            client.send_media = AsyncMock(return_value=True)
+            with mock.patch(
+                "wechatbridge.main.get_session_dir", return_value=td
+            ), mock.patch(
+                "wechatbridge.main._get_backend", return_value="agy"
+            ):
+                await send_artifacts_back(client, "u1", "ctx", arts)
+            self.assertEqual(
+                len(client.send_media.await_args_list),
+                MAX_OUTBOUND_ARTIFACTS_PER_TURN,
+            )
+            texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+            self.assertTrue(any("共生成 15 个文件" in t for t in texts))
+
+
+class TestDisplayFilenameAndNotices(unittest.TestCase):
+    def test_sanitize_display_filename(self):
+        from wechatbridge.main import _sanitize_display_filename
+        self.assertEqual(_sanitize_display_filename("a@b\nc.pdf"), "abc.pdf")
+        self.assertEqual(len(_sanitize_display_filename("x" * 200 + ".pdf")), 80)
+        self.assertEqual(_sanitize_display_filename("normal.pdf"), "normal.pdf")
+
+
+class TestAgyDisplayStripsFilePaths(unittest.IsolatedAsyncioTestCase):
+    """S1: agy 显示文本不得泄露服务器路径——裸 file:///、[x](file:///abs)、
+    [x](/abs)、[x](./rel) 与 dsh 同规则剥除，仅保留链接文字。"""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        from wechatbridge.runner_common import get_session_dir
+        self._cfg = config
+        self.td = tempfile.mkdtemp(prefix="wb-agy-disp-")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.scratch)
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            mock.patch.object(config, "agy_scratch_dir", self.scratch),
+        ]
+        for p in self._patchers:
+            p.start()
+        # 真实 per-user session_dir（ensure_user_gemini 会按需创建）
+        self.session = get_session_dir("u-agydisp")
+        os.makedirs(self.session)
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _mkfile(self, root, name):
+        path = os.path.join(root, name)
+        with open(path, "w") as f:
+            f.write("x")
+        return path
+
+    async def _run_with_stdout(self, stdout_text):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            return _FakeAgyProc(stdout_text, "", rc=0)
+
+        with mock.patch.object(config, "agy_binary_path", "agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=AsyncMock()):
+            return await agy_mod.run_agy("hi", "u-agydisp")
+
+    async def test_bare_file_uri_stripped_from_display(self):
+        f = self._mkfile(self.session, "x.pdf")
+        display, arts = await self._run_with_stdout(
+            f"已生成 file://{f} 请查收"
+        )
+        self.assertNotIn(self.td, display)
+        self.assertNotIn("file://", display)
+        self.assertNotIn(f, display)
+        # 产物仍正常提取
+        self.assertEqual([n for n, _ in arts], ["x.pdf"])
+
+    async def test_markdown_file_uri_link_keeps_name_only(self):
+        f = self._mkfile(self.session, "report.pdf")
+        display, _ = await self._run_with_stdout(
+            f"see [report.pdf](file://{f}) done"
+        )
+        self.assertEqual(display, "see [report.pdf] done")
+        self.assertNotIn(self.td, display)
+
+    async def test_markdown_abs_link_keeps_name_only(self):
+        f = self._mkfile(self.session, "b.docx")
+        display, _ = await self._run_with_stdout(f"see [doc]({f}) here")
+        self.assertEqual(display, "see [doc] here")
+        self.assertNotIn(self.td, display)
+
+    async def test_markdown_rel_link_keeps_name_only(self):
+        os.makedirs(os.path.join(self.session, "sub"), exist_ok=True)
+        f = self._mkfile(os.path.join(self.session, "sub"), "c.csv")
+        display, _ = await self._run_with_stdout("see [csv](./sub/c.csv) here")
+        self.assertEqual(display, "see [csv] here")
+        self.assertNotIn(self.td, display)
+
+    async def test_fullwidth_paren_wrapped_bare_uri(self):
+        """回归：全角括号（file:///abs）中的裸 URI——）必须被当作尾随
+        标点剥离 URI 本体（产物可提取），且展示文本不得吞掉 ）。"""
+        f = self._mkfile(self.session, "report.pdf")
+        display, arts = await self._run_with_stdout(
+            f"请查收（file://{f}）"
+        )
+        self.assertNotIn("file://", display)
+        self.assertNotIn(self.td, display)
+        # ） 保留：URI 剥除后留下空的全角括号
+        self.assertEqual(display, "请查收（）")
+        # 产物正常提取（）不再粘连在 URI 尾部）
+        self.assertEqual([n for n, _ in arts], ["report.pdf"])
+
+
+class TestAgyImportWithoutYaml(unittest.TestCase):
+    """S2: 默认 agy 后端不得因 import dsh 而依赖顶层 yaml。"""
+
+    def test_agy_imports_without_yaml(self):
+        import importlib
+        import sys
+
+        orig_yaml = sys.modules.get("yaml")
+        orig_dsh = sys.modules.get("wechatbridge.dsh")
+        orig_agy = sys.modules.get("wechatbridge.agy")
+        sys.modules["yaml"] = None
+        sys.modules.pop("wechatbridge.dsh", None)
+        sys.modules.pop("wechatbridge.agy", None)
+        try:
+            mod = importlib.import_module("wechatbridge.agy")
+            self.assertTrue(hasattr(mod, "run_agy"))
+            self.assertNotIn("wechatbridge.dsh", sys.modules)
+        finally:
+            if orig_yaml is not None:
+                sys.modules["yaml"] = orig_yaml
+            else:
+                sys.modules.pop("yaml", None)
+            if orig_dsh is not None:
+                sys.modules["wechatbridge.dsh"] = orig_dsh
+            else:
+                sys.modules.pop("wechatbridge.dsh", None)
+            sys.modules["wechatbridge.agy"] = mod
+            if orig_agy is not None:
+                sys.modules["wechatbridge.agy"] = orig_agy
+
+
+class TestSnapshotRealpathKeys(unittest.TestCase):
+    """S3: session_dir 经软链接父目录访问时，快照前后键一致（realpath）。"""
+
+    def test_symlinked_session_dir_keys_match(self):
+        from wechatbridge.runner_common import (
+            ARTIFACT_FALLBACK_EXTENSIONS,
+            _snapshot_regular_files,
+            collect_session_fallback_artifacts,
+        )
+
+        td = tempfile.mkdtemp(prefix="wb-snap-")
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        real_dir = os.path.join(td, "real_session")
+        os.makedirs(real_dir)
+        link_path = os.path.join(td, "link_session")
+        os.symlink(real_dir, link_path)
+
+        # 预先存在、mtime 在 t0-2s 内的文件：不得当作新产物
+        old_file = os.path.join(real_dir, "old.pdf")
+        with open(old_file, "wb") as f:
+            f.write(b"x")
+        os.utime(old_file, (1000000.0, 1000000.0))
+
+        t0 = time.time()
+        before = _snapshot_regular_files([link_path])
+        # 快照键必须是 realpath 形式
+        self.assertEqual(set(before), {os.path.realpath(old_file)})
+
+        # 本轮新建文件仍被回收
+        new_file = os.path.join(real_dir, "new.pdf")
+        with open(new_file, "wb") as f:
+            f.write(b"x")
+        arts = collect_session_fallback_artifacts(
+            link_path, before, t0, ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS
+        )
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.realpath(new_file), paths)
+        self.assertNotIn(os.path.realpath(old_file), paths)
+
+
+
+class TestProcessMessageMediaNotices(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.config import config
+        self.main = main_mod
+        self.td = tempfile.mkdtemp(prefix="wb-pm-")
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            mock.patch.object(config, "allowed_senders", ["*"]),
+            mock.patch.object(config, "admin_users", []),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _client(self):
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://x"
+        client.state.bot_token = "t"
+        client.send_message = AsyncMock(return_value=True)
+        return client
+
+    async def test_unsupported_type_notice(self):
+        client = self._client()
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [{"type": 5, "video_item": {}}],
+        }
+        await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        self.assertTrue(any("暂不支持该消息类型" in t for t in texts))
+
+    async def test_empty_item_list_silent(self):
+        client = self._client()
+        msg = {"from_user_id": "u1", "context_token": "ctx", "item_list": []}
+        await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        self.assertFalse(any("暂不支持该消息类型" in t for t in texts))
+
+    async def test_multi_media_notice(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 2, "image_item": {"media": media}},
+                {"type": 4, "file_item": {"media": media, "file_name": "f.pdf"}},
+            ],
+        }
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(return_value=("ok", []))
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"\x89PNG\x00")
+        ):
+            await self.main.process_message(client, msg)
+        texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
+        hit = [t for t in texts if "仅处理首个附件" in t]
+        self.assertTrue(hit)
+        # 提示与正文之间须有空行（与 cancelled_notice 一致）
+        self.assertIn("请分条发送。\n\nok", hit[0])
+
+    async def test_file_message_carries_orig_filename(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 4, "file_item": {"media": media, "file_name": "报告 (终版).pdf"}},
+            ],
+        }
+        captured = []
+        async def _gate(client, from_user, ctx, prompt, **kw):
+            captured.append(prompt)
+            return "done", []
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(side_effect=_gate)
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"%PDF")
+        ):
+            await self.main.process_message(client, msg)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("请分析这个文件 @", captured[0])
+        self.assertIn("原文件名：报告 (终版).pdf", captured[0])
+
+    async def test_file_message_with_caption_uses_bracket(self):
+        client = self._client()
+        media = {"encrypt_query_param": "q", "aes_key": "AAAA"}
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": 1, "text_item": {"text": "帮我看看"}},
+                {"type": 4, "file_item": {"media": media, "file_name": "data.xlsx"}},
+            ],
+        }
+        captured = []
+        async def _gate(client, from_user, ctx, prompt, **kw):
+            captured.append(prompt)
+            return "done", []
+        with mock.patch.object(
+            self.main, "gate_and_run", new=AsyncMock(side_effect=_gate)
+        ), mock.patch.object(
+            client, "download_and_decrypt_media", new=AsyncMock(return_value=b"PK")
+        ):
+            await self.main.process_message(client, msg)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("[附件（原文件名：data.xlsx）: @", captured[0])
 
 
 if __name__ == "__main__":

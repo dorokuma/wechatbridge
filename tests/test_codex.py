@@ -1145,20 +1145,29 @@ class TestCodexRunFakeCli(unittest.IsolatedAsyncioTestCase):
 
     def test_fallback_scan_timeout(self):
         """When snapshot takes >2s, fallback scan returns empty."""
-        from wechatbridge import codex as codex_mod
-        original = codex_mod._snapshot_regular_files
+        # Patch the shared implementation actually invoked by the post-scan
+        # (runner_common.collect_session_fallback_artifacts calls its own
+        # module-level _snapshot_regular_files); patching the thin codex
+        # re-export would only slow the pre-run snapshot.
+        from wechatbridge import runner_common as runner_common_mod
+        original = runner_common_mod._snapshot_regular_files
+        calls = []
 
         def slow_snapshot(roots):
             import time
+            calls.append(list(roots))
             time.sleep(2.5)
             return {"/fake/file.txt": 1.0}
 
-        codex_mod._snapshot_regular_files = slow_snapshot
-        try:
+        with mock.patch.object(
+            runner_common_mod, "_snapshot_regular_files", slow_snapshot
+        ):
             display, artifacts = self._run("hi", "u-scan-timeout", mode="ok")
             self.assertEqual(artifacts, [], "slow snapshot -> empty")
-        finally:
-            codex_mod._snapshot_regular_files = original
+        self.assertIs(runner_common_mod._snapshot_regular_files, original)
+        # 证明 patch 命中的是后置 fallback 扫描（pre-snapshot 走 codex 的
+        # _rc_snapshot_regular_files 别名，不受影响）。
+        self.assertEqual(len(calls), 1)
 
     def test_fallback_scan_not_on_failure(self):
         """Fallback scan must NOT run when process fails."""

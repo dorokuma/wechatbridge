@@ -24,9 +24,12 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs, is_bridge_formatted_reply,
-    format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
+    format_error, format_cli_error, format_timeout_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
     MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
+    collect_session_fallback_artifacts, merge_artifact_groups,
+    _is_cli_binary_missing,
 )
+from .runner_common import _snapshot_regular_files as _rc_snapshot_regular_files
 
 logger = logging.getLogger("codex_runner")
 
@@ -558,52 +561,9 @@ def _resolve_add_dirs(raw_dirs: list, session_dir: str, user_id: str = "") -> li
     return validated
 
 
-_EXCLUDED_SCAN_NAMES = frozenset({".codex", ".git", "__pycache__", "node_modules", "venv", ".venv", "cache", ".cache"})
-
-
 def _snapshot_regular_files(roots: list) -> dict:
-    """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
-
-    Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
-    dict if any limit is exceeded (never partial results).
-
-    ``os.walk(followlinks=False)`` naturally excludes symlink traversal;
-    ``_EXCLUDED_SCAN_NAMES`` skips internal metadata dirs; only regular files
-    (not dirs/symlinks/special) are collected.
-    """
-    snap = {}
-    t_start = time.monotonic()
-    file_count = 0
-    dir_count = 0
-    _MAX_FILES = 200
-    _MAX_DIRS = 50
-    _MAX_SCAN_TIME = 2.0
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dir_count += 1
-            if dir_count > _MAX_DIRS:
-                return {}
-            if time.monotonic() - t_start > _MAX_SCAN_TIME:
-                return {}
-            # Exclude internal metadata directories in-place
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_SCAN_NAMES]
-            for fn in filenames:
-                file_count += 1
-                if file_count > _MAX_FILES:
-                    return {}
-                fp = os.path.join(dirpath, fn)
-                try:
-                    if not os.path.isfile(fp) or os.path.islink(fp):
-                        continue
-                    # Verify candidate is under one of the allowed roots
-                    if not any(path_is_under(fp, r) for r in roots):
-                        continue
-                    snap[fp] = os.path.getmtime(fp)
-                except OSError:
-                    continue
-    return snap
+    """Thin wrapper kept for backwards compatibility; shared impl in runner_common."""
+    return _rc_snapshot_regular_files(roots)
 
 
 def _parse_codex_output(stdout_text: str, session_dir: str, since: float = 0.0) -> tuple:
@@ -748,49 +708,16 @@ def _extract_codex_error_messages(stdout_text: str) -> list:
 def _collect_fallback_artifacts(session_dir: str, snapshot_before: dict, t0: float) -> list:
     """Scan session_dir for files created or overwritten during this turn.
 
-    Codex often emits a ``file_change`` for a helper script and then writes
-    the real pdf/docx via the shell. Always merge this list with structured
-    artifacts (dedupe by realpath). Scans only session_dir (never add_dirs).
-    Excludes internal metadata dirs. Each candidate is verified under session_dir.
+    Thin wrapper over ``runner_common.collect_session_fallback_artifacts``
+    (no extension whitelist — codex collects all new/modified files; every
+    send-side filter still applies). Scans only session_dir (never add_dirs).
     """
-    _internal_names = {".codex_thread_id"}
-    fallback = []
-    fallback_seen = set()
-    for fp, fmtime in _snapshot_regular_files([session_dir]).items():
-        prev = snapshot_before.get(fp)
-        if prev is None:
-            if fmtime < t0:
-                continue
-        elif fmtime <= prev:
-            continue
-        name = os.path.basename(fp)
-        if name in _internal_names or name.startswith(".initialized.") or is_sensitive_artifact_path(fp, session_dir):
-            continue
-        key = (name, fp)
-        if key not in fallback_seen:
-            fallback_seen.add(key)
-            fallback.append(key)
-    return fallback
+    return collect_session_fallback_artifacts(session_dir, snapshot_before, t0)
 
 
 def _merge_codex_artifacts(*groups) -> list:
-    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
-    merged = []
-    seen = set()
-    for group in groups:
-        for item in group or []:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                continue
-            name, path = item
-            try:
-                key = os.path.realpath(path)
-            except OSError:
-                key = path
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append((name, path))
-    return merged
+    """Thin wrapper kept for backwards compatibility; shared impl in runner_common."""
+    return merge_artifact_groups(*groups)
 
 async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     """Execute codex CLI for a given user message.
@@ -895,6 +822,11 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
         display, artifacts, parsed_thread_id, parse_failed = _parse_codex_output(stdout_text, session_dir, since=t0)
+        if parse_failed and process.returncode == 0:
+            logger.warning(
+                "codex reported structured error (rc=0): %s",
+                clean_output(display or stderr_text)[:500],
+            )
 
         # 失败判定：非零退出一律视为失败（与 grok 行为对齐）；
         # 零退出但 stdout 含结构化错误事件（turn.failed / error）也算失败。
@@ -958,6 +890,11 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 r_stdout_text = r_stdout.decode("utf-8", errors="replace").strip()
                 r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
                 r_display, r_artifacts, r_thread_id, r_parse_failed = _parse_codex_output(r_stdout_text, session_dir, since=t0)
+                if r_parse_failed and retry_process.returncode == 0:
+                    logger.warning(
+                        "codex reported structured error (rc=0): %s",
+                        clean_output(r_display or r_stderr_text)[:500],
+                    )
                 r_failed = retry_process.returncode != 0 or r_parse_failed
                 if retry_process.returncode != 0:
                     logger.warning(
@@ -1018,12 +955,23 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     except asyncio.TimeoutError:
         logger.warning("codex execution timed out after %ss for user %s", timeout, user_id)
         await terminate_process(process, graceful=True)
-        return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
+        return format_timeout_error(timeout, backend="codex"), []
 
     except asyncio.CancelledError:
         # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
         await terminate_process(process, graceful=False)
         raise
+
+    except FileNotFoundError as e:
+        await terminate_process(process, graceful=False)
+        if _is_cli_binary_missing(e, config.codex_binary_path):
+            logger.error("CLI binary not found for %s: %s", "codex", e)
+            return format_cli_error("command not found", backend="codex"), []
+        logger.exception("Unexpected error running codex: %s", e)
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        ), []
 
     except Exception as e:
         logger.exception("Unexpected error running codex: %s", e)
@@ -1099,12 +1047,22 @@ async def _run_codex_subcommand(subcmd_args: list, user_id: str) -> str:
     except asyncio.CancelledError:
         await terminate_process(process, graceful=False)
         raise
+    except FileNotFoundError as e:
+        await terminate_process(process, graceful=False)
+        if _is_cli_binary_missing(e, config.codex_binary_path):
+            logger.error("CLI binary not found for %s: %s", "codex", e)
+            return format_cli_error("command not found", backend="codex")
+        logger.exception("codex subcommand error: %s", e)
+        return format_error(
+            "执行出错",
+            "命令执行失败，请稍后重试。",
+        )
     except Exception as e:
         logger.exception("codex subcommand error: %s", e)
         await terminate_process(process, graceful=False)
         return format_error(
             "执行出错",
-            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+            "命令执行失败，请稍后重试。",
         )
 
     finally:
@@ -1306,21 +1264,30 @@ def _cmd_help() -> str:
         "**模型控制**",
         "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
         "- `/models` — 查看可用模型列表",
-        "- `/backend <agy|grok|codex>` — 切换助手引擎",
+        "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — 重置对话（开始新会话）",
-        "- `/fast` — 开启**快速模式**（回答更快，思考更少）",
-        "- `/planning` — 开启**规划模式**（只读沙箱，近似 plan mode）",
+        "- `/fast` — 开启/关闭**快速模式**（回答更快，思考更少，可带 on/off）",
+        "- `/planning` — 开启/关闭**规划模式**（只读沙箱，近似 plan mode，可带 on/off）",
         "",
         "**工具**",
-        "- `/add-dir <路径>` — 添加工作目录（真正生效，后续带 `--add-dir`）",
+        "- `/add-dir <路径>` — 添加工作目录（真正生效，后续带 `--add-dir`；`clear` 清空，无参查看列表）",
         "",
         "**人格**",
         "- `/persona <内容>` — 设置你专属的人格文档（另有 show / clear / reset）",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
+        "- `/version` — 查看版本与更新状态",
+    ]
+    try:
+        from .price import price_feature_ready
+        if price_feature_ready():
+            lines.append("- `/price <链接/口令/词>` — 京东/淘宝查券比价")
+    except ImportError:
+        pass
+    lines += [
         "",
         "提示：其他 `/` 指令会直接交给助手处理。",
     ]
@@ -1391,13 +1358,25 @@ async def handle_codex_slash_command(text: str, user_id: str) -> str | None:
 
     if cmd == "/add-dir":
         path = args.strip()
+        prefs = load_prefs(user_id)
         if not path:
-            return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
+            dirs = prefs.get("add_dirs", []) or []
+            if dirs:
+                listing = "\n".join(f"- `{d}`" for d in dirs)
+                return (
+                    "📋 **当前工作目录** 📋\n\n"
+                    f"{listing}\n\n"
+                    "`/add-dir <路径>` 添加，`/add-dir clear` 清空。"
+                )
+            return "ℹ️ **/add-dir 用法** ℹ️\n\n`/add-dir <路径>` 添加工作目录，`/add-dir clear` 清空。"
+        if path.lower() == "clear":
+            prefs["add_dirs"] = []
+            save_prefs(user_id, prefs)
+            return "✅ **已清空工作目录** ✅"
         ok, result = validate_add_dir(path, user_id)
         if not ok:
             return f"❌ **目录不允许** ❌\n\n{result}"
         resolved = result
-        prefs = load_prefs(user_id)
         dirs = prefs.get("add_dirs", [])
         if resolved not in dirs:
             if len(dirs) >= MAX_ADD_DIRS:

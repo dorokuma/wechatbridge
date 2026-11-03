@@ -316,6 +316,15 @@ class AppConfig:
     # Confirmation keyword users must reply to execute dangerous prompt
     confirm_token: str = os.getenv("WECHATBRIDGE_CONFIRM_TOKEN", "y")
 
+    # UX notices (default ON; set "0"/"false"/"no" to disable)
+    # Queue notice: when a user's previous message is still running, later
+    # messages get a one-shot "queued" notice before waiting on the user lock.
+    queue_notice: bool = os.getenv("WECHATBRIDGE_QUEUE_NOTICE", "true").lower() not in ("0", "false", "no")
+    # Progress notice: after a single message runs longer than
+    # progress_notice_delay seconds, send a one-shot "still working" notice.
+    progress_notice: bool = os.getenv("WECHATBRIDGE_PROGRESS_NOTICE", "true").lower() not in ("0", "false", "no")
+    progress_notice_delay: float = _env_float("WECHATBRIDGE_PROGRESS_NOTICE_DELAY", 30.0)
+
     # Upstream throttle guard (process-wide, covers agy/grok/codex)
     # Extra retries after the first attempt for short-window throttle (default 2 → 3 total)
     upstream_retry_max: int = _env_int("WECHATBRIDGE_UPSTREAM_RETRY_MAX", 2)

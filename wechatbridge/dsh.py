@@ -47,6 +47,7 @@ from .runner_common import (
     format_error,
     format_notice,
     format_cli_error,
+    format_timeout_error,
     get_dsh_state_dir,
     get_session_dir,
     is_bridge_formatted_reply,
@@ -59,6 +60,14 @@ from .runner_common import (
     sanitize_user_id,
     terminate_process,
     _sanitize_prompt_at_paths,
+    _snapshot_regular_files,
+    collect_session_fallback_artifacts,
+    merge_artifact_groups,
+    _is_cli_binary_missing,
+    _parse_bare_file_uri,
+    _strip_file_links,
+    _BARE_FILE_URI_RE,
+    ARTIFACT_FALLBACK_EXTENSIONS,
     EMPTY_REPLY,
 )
 
@@ -326,10 +335,6 @@ _DSH_SKIP_DIR_NAMES = frozenset({
 })
 
 
-_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
-_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
-
-
 # ---------------------------------------------------------------------------
 # Persistent-session id management (codex-style resume)
 #
@@ -406,30 +411,6 @@ def clear_session_id(user_id: str) -> bool:
     return removed
 
 
-def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
-    """Parse bare file:/// URI and separate trailing CJK commentary / punctuation.
-
-    Returns:
-        tuple[str, str]: (clean_file_uri, trailing_kept_text)
-    """
-    cleaned = raw.rstrip(_TRAILING_PUNCT_CHARS)
-    punct = raw[len(cleaned):]
-    if cleaned.startswith("file://"):
-        full_path = unquote(cleaned[len("file://"):])
-        if full_path.startswith("/") and os.path.exists(full_path):
-            return cleaned, punct
-    last_slash = cleaned.rfind("/")
-    cjk_kept = ""
-    if last_slash != -1:
-        basename = cleaned[last_slash + 1:]
-        if re.search(r"[a-zA-Z0-9._~%+=:-][\u4e00-\u9fff]+$", basename):
-            cjk_m = re.search(r"[\u4e00-\u9fff]+$", basename)
-            if cjk_m:
-                cjk_kept = cjk_m.group(0)
-                cleaned = cleaned[:-len(cjk_kept)]
-    return cleaned, cjk_kept + punct
-
-
 def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
     """Extract (name, absolute_path) tuples of file references from dsh output.
 
@@ -485,26 +466,6 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
     return result
-
-
-def _strip_file_links(display: str) -> str:
-    """Remove file:/// and absolute/relative link targets from display text
-    so server paths never leak to WeChat users."""
-    out = re.sub(
-        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((?:file:///|/|\.\.?/)(?:[^()\s]|\([^()\s]*\))+\)",
-        r"[\1]",
-        display,
-    )
-    out = re.sub(
-        r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)",
-        r"[\1]",
-        out,
-    )
-    def _replace_bare(m: re.Match) -> str:
-        _, kept = _parse_bare_file_uri(m.group(0))
-        return kept
-
-    return _BARE_FILE_URI_RE.sub(_replace_bare, out)
 
 
 def _build_dsh_command(prompt: str, task_as_env: bool = False) -> list:
@@ -834,6 +795,10 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     if is_dangerous(safe_prompt) and not is_dangerous(prompt):
         logger.warning("[AUDIT] dangerous keyword in safe_prompt from user=%s", user_id)
 
+    # 执行前快照本用户 session_dir（绝不碰共享 scratch），用于成功退出后
+    # 的产物回退扫描。
+    snapshot_before = _snapshot_regular_files([session_dir])
+
     process = None
     try:
         env = sanitize_env(session_dir)
@@ -892,6 +857,19 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             mark_initialized(session_dir, backend="dsh")
 
+        # Fallback: 成功退出后补扫本用户 session_dir（绝不扫共享 scratch），
+        # 把本轮新增/mtime 变新且扩展名在白名单的文件按 realpath 去重合并。
+        extra = collect_session_fallback_artifacts(
+            session_dir, snapshot_before, t0,
+            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+        )
+        if extra:
+            before = len(artifacts)
+            artifacts = merge_artifact_groups(artifacts, extra)
+            added = len(artifacts) - before
+            if added:
+                logger.info("Fallback scan collected %d additional dsh artifacts", added)
+
         # Persist the turn into long-term memory for continuity on next message.
         # (常驻模式下会话本身持有上下文，无需窗口记忆)
         if not resume_mode and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
@@ -914,7 +892,7 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             user_id,
         )
         await terminate_process(process, graceful=True)
-        err = format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。")
+        err = format_timeout_error(timeout, backend="dsh")
         if not resume_mode and notice_bubble:
             return f"{notice_bubble}\n\n{err}", []
         return err, []
@@ -923,6 +901,23 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
         await terminate_process(process, graceful=False)
         raise
+
+    except FileNotFoundError as e:
+        await terminate_process(process, graceful=False)
+        if _is_cli_binary_missing(e, config.dsh_binary_path):
+            logger.error("CLI binary not found for %s: %s", "dsh", e)
+            err = format_cli_error("command not found", backend="dsh")
+            if not resume_mode and notice_bubble:
+                return f"{notice_bubble}\n\n{err}", []
+            return err, []
+        logger.exception("Unexpected error running dsh: %s", e)
+        err = format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        )
+        if not resume_mode and notice_bubble:
+            return f"{notice_bubble}\n\n{err}", []
+        return err, []
 
     except Exception as e:
         logger.exception("Unexpected error running dsh: %s", e)
@@ -962,9 +957,20 @@ def _cmd_help() -> str:
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — **重置对话**（清空记忆并开始全新会话）",
+        "- `/fast` — 开启/关闭**快速模式**（当前 dsh 引擎暂不支持，可带 on/off）",
+        "- `/planning` — 开启/关闭**规划模式**（当前 dsh 引擎暂不支持，可带 on/off）",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
+        "- `/version` — 查看版本与更新状态",
+    ]
+    try:
+        from .price import price_feature_ready
+        if price_feature_ready():
+            lines.append("- `/price <链接/口令/词>` — 京东/淘宝查券比价")
+    except ImportError:
+        pass
+    lines += [
         "",
         "提示：其他 `/` 指令会直接交给助手处理。",
     ]

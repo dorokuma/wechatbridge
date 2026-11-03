@@ -298,6 +298,196 @@ def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Bounded session_dir snapshot + fallback artifact collection
+#
+# Shared by codex / agy / dsh runners: some CLIs write real deliverables via
+# shell without emitting a file link in stdout. A bounded before/after
+# snapshot of the *per-user session dir* recovers them safely.
+#
+# Safety contract (never relax):
+#   - only the single-user ``session_dir`` is ever a scan root; the shared
+#     multi-user ``config.agy_scratch_dir`` is NEVER scanned (cross-user leak);
+#   - internal metadata dirs are never descended, and every candidate must
+#     pass ``is_sensitive_artifact_path`` (which itself blocks every dotfile
+#     and every dot-dir except the per-user ``.gemini/antigravity-cli/scratch``
+#     artifact region);
+#   - every candidate must be a regular file with ``st_nlink == 1`` whose
+#     ``realpath`` stays inside ``session_dir`` and matches the caller's
+#     extension whitelist.
+# ---------------------------------------------------------------------------
+
+# Directories never descended during artifact fallback snapshots. Hidden dirs
+# are walked (the per-user ``.gemini/antigravity-cli/scratch`` region is a
+# legitimate artifact source) but ``is_sensitive_artifact_path`` downstream
+# rejects anything they contain outside that one exception.
+_SNAPSHOT_SKIP_DIR_NAMES = frozenset({
+    ".codex", ".git", "__pycache__", "node_modules", "venv", ".venv",
+    "cache", ".cache",
+})
+
+# Bridge-private top-level files inside a per-user session dir that must never
+# be returned as artifacts even when they carry a whitelisted extension.
+_SNAPSHOT_EXCLUDE_TOP_LEVEL_NAMES = frozenset({
+    "prefs.json",
+    "dsh_memory.jsonl",
+})
+
+# Extension whitelist for session_dir snapshot-fallback artifacts: user
+# deliverables only (documents / images / archives / markup), no scripts or
+# configs. Hard-coded — do not make configurable.
+ARTIFACT_FALLBACK_EXTENSIONS = frozenset({
+    ".pdf", ".docx", ".xlsx", ".pptx", ".csv",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".zip", ".html",
+})
+
+
+def _snapshot_regular_files(roots: list) -> dict:
+    """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
+
+    Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
+    dict if any limit is exceeded (never partial results).
+
+    Snap keys are keyed by ``os.path.realpath`` so that a *session_dir* passed
+    through a symlinked parent produces the same keys as the post-run rescan
+    in ``collect_session_fallback_artifacts`` (which already walks the
+    realpath). ``os.walk(followlinks=False)`` naturally excludes symlink
+    traversal; ``_SNAPSHOT_SKIP_DIR_NAMES`` plus the dot-dir rule skip
+    hidden/internal metadata dirs; only regular files (not dirs/symlinks/
+    special) are collected.
+    """
+    snap = {}
+    t_start = time.monotonic()
+    file_count = 0
+    dir_count = 0
+    _MAX_FILES = 200
+    _MAX_DIRS = 50
+    _MAX_SCAN_TIME = 2.0
+    # Normalize each root to its realpath first so before/after snapshot keys
+    # agree even when the caller passed session_dir via a symlinked parent.
+    real_roots = []
+    for root in roots:
+        try:
+            real_root = os.path.realpath(root)
+        except OSError:
+            continue
+        if real_root and real_root not in real_roots:
+            real_roots.append(real_root)
+    for root in real_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dir_count += 1
+            if dir_count > _MAX_DIRS:
+                return {}
+            if time.monotonic() - t_start > _MAX_SCAN_TIME:
+                return {}
+            # Exclude internal metadata directories in-place
+            dirnames[:] = [
+                d for d in dirnames if d not in _SNAPSHOT_SKIP_DIR_NAMES
+            ]
+            for fn in filenames:
+                file_count += 1
+                if file_count > _MAX_FILES:
+                    return {}
+                fp = os.path.join(dirpath, fn)
+                try:
+                    if not os.path.isfile(fp) or os.path.islink(fp):
+                        continue
+                    # Verify candidate is under one of the allowed roots
+                    # (real_roots are already realpath-normalized)
+                    if not any(path_is_under(fp, r) for r in real_roots):
+                        continue
+                    snap[fp] = os.path.getmtime(fp)
+                except OSError:
+                    continue
+    return snap
+
+
+def collect_session_fallback_artifacts(
+    session_dir: str,
+    snapshot_before: dict,
+    t0: float,
+    ext_whitelist=None,
+) -> list:
+    """Scan *session_dir* for files created or overwritten during this turn.
+
+    ``snapshot_before`` must come from ``_snapshot_regular_files([session_dir])``
+    taken before the subprocess ran; ``t0`` is the turn's wall-clock start.
+    Returns ``(name, realpath)`` tuples for files that are new since the
+    snapshot or whose mtime advanced.
+
+    ``ext_whitelist`` is a frozenset of lowercase extensions (e.g.
+    ``ARTIFACT_FALLBACK_EXTENSIONS``); ``None`` accepts any extension (codex
+    legacy behaviour — send-side filtering still applies).
+
+    Callers must only invoke this after the subprocess exited successfully
+    (returncode 0, not timed out, not failed). Never scan on failure and never
+    pass any shared/global directory as *session_dir*.
+    """
+    try:
+        sess_real = os.path.realpath(session_dir)
+    except OSError:
+        return []
+    if not sess_real or not os.path.isdir(sess_real):
+        return []
+    fallback = []
+    for fp, fmtime in _snapshot_regular_files([sess_real]).items():
+        prev = snapshot_before.get(fp)
+        if prev is None:
+            # Mirror codex's freshness tolerance: only count as "new" when the
+            # mtime is not clearly older than the turn start (mtime granularity
+            # may lag ``time.time()`` slightly on some filesystems).
+            if fmtime < t0 - 2.0:
+                continue
+        elif fmtime <= prev:
+            continue
+        if ext_whitelist is not None:
+            if os.path.splitext(fp)[1].lower() not in ext_whitelist:
+                continue
+        name = os.path.basename(fp)
+        try:
+            real = os.path.realpath(fp)
+        except (OSError, ValueError):
+            continue
+        # realpath must stay inside session_dir (no symlink/hardlink escape)
+        if not path_is_under(real, sess_real) or real == sess_real:
+            continue
+        try:
+            st = os.stat(real)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            continue
+        if os.path.dirname(real) == sess_real and name in _SNAPSHOT_EXCLUDE_TOP_LEVEL_NAMES:
+            continue
+        if is_sensitive_artifact_path(real, sess_real):
+            continue
+        fallback.append((name, real))
+    return fallback
+
+
+def merge_artifact_groups(*groups) -> list:
+    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            name, path = item
+            try:
+                key = os.path.realpath(path)
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((name, path))
+    return merged
+
+
 _AT_TOKEN_RE = re.compile(r"@([^\s@。，！？；、：”’'\"）)\]\}>》」』〉…]+)")
 _AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
 
@@ -902,14 +1092,42 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
     if category == "command_not_found":
         return format_error(
             "助手不可用",
-            "助手程序未正确安装或配置，请联系管理员。",
+            "助手程序未正确安装或配置，请联系管理员或发送 `/backend` 切换其它助手引擎。",
         )
 
     if category == "not_found":
         return format_error("未找到", "请求的资源或文件不存在。")
 
-    # Unknown: fixed Chinese only — never echo English raw to WeChat users
-    return format_error("执行失败", "这次没处理好，请稍后再试。")
+    # Unknown: fixed Chinese only — never echo English raw to WeChat users.
+    # Log the cleaned detail server-side for diagnosis (already ANSI/HTML-stripped).
+    if raw != "未知错误":
+        logger.warning(
+            "format_cli_error unknown detail backend=%s: %s",
+            backend or "?",
+            raw[:300],
+        )
+    return format_error(
+        "执行失败",
+        "这次没处理好，请稍后再试。若连续失败，可发送 `/new` 开启新对话或 `/backend` 切换引擎。",
+    )
+
+
+def format_timeout_error(timeout: int, backend: str = "") -> str:
+    """User-facing timeout bubble for run_* TimeoutError branches.
+
+    dsh does not support ``/fast`` so its hint omits the fast-mode switch.
+    """
+    if (backend or "").strip().lower() == "dsh":
+        detail = (
+            f"超过 {timeout} 秒未完成，已终止本次任务。"
+            "建议将问题拆小后重试，或发送 /new 开启新对话。"
+        )
+    else:
+        detail = (
+            f"超过 {timeout} 秒未完成，已终止本次任务。"
+            "建议将问题拆小后重试，或发送 /fast 切换快速模式、/new 开启新对话。"
+        )
+    return format_error("处理超时", detail)
 
 
 def is_upstream_throttle_reply(text: str) -> bool:
@@ -2015,3 +2233,86 @@ async def terminate_process(process, graceful: bool = True) -> None:
         await process.wait()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# File-reference stripping for user-visible display text
+#
+# Shared by dsh / agy runners: CLI stdout may embed ``[name](file:///abs)``,
+# ``[name](/abs | ./rel | ../rel)`` links or bare ``file:///abs`` mentions.
+# None of those path targets may reach WeChat users — the link display text
+# is kept (``[name]``), targets and bare URIs are removed.
+# ---------------------------------------------------------------------------
+
+# Bare ``file:///`` mentions inside CLI stdout.
+_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
+
+# Markdown ``[name](file:///abs | /abs | ./rel | ../rel)`` — allows one level
+# of balanced brackets in the display name and one level of balanced
+# parentheses in the path (e.g. "report (1).pdf") without greedily spanning
+# multiple links on a line.
+_FILE_LINK_TARGET_RE = re.compile(
+    r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\](?:\((?:file:///|/|\.\.?/)(?:[^()\s]|\([^()\s]*\))+\))"
+)
+# Looser fallback for the same link shapes (unbalanced leftovers).
+_FILE_LINK_TARGET_FALLBACK_RE = re.compile(
+    r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)"
+)
+
+# Trailing CJK commentary / punctuation that may be glued to a bare URI match.
+_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
+
+
+def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
+    """Parse bare file:/// URI and separate trailing CJK commentary / punctuation.
+
+    Returns:
+        tuple[str, str]: (clean_file_uri, trailing_kept_text)
+    """
+    cleaned = raw.rstrip(_TRAILING_PUNCT_CHARS)
+    punct = raw[len(cleaned):]
+    if cleaned.startswith("file://"):
+        full_path = unquote(cleaned[len("file://"):])
+        if full_path.startswith("/") and os.path.exists(full_path):
+            return cleaned, punct
+    last_slash = cleaned.rfind("/")
+    cjk_kept = ""
+    if last_slash != -1:
+        basename = cleaned[last_slash + 1:]
+        if re.search(r"[a-zA-Z0-9._~%+=:-][\u4e00-\u9fff]+$", basename):
+            cjk_m = re.search(r"[\u4e00-\u9fff]+$", basename)
+            if cjk_m:
+                cjk_kept = cjk_m.group(0)
+                cleaned = cleaned[:-len(cjk_kept)]
+    return cleaned, cjk_kept + punct
+
+
+def _strip_file_links(display: str) -> str:
+    """Remove file:/// and absolute/relative link targets from display text
+    so server paths never leak to WeChat users."""
+    out = _FILE_LINK_TARGET_RE.sub(r"[\1]", display)
+    out = _FILE_LINK_TARGET_FALLBACK_RE.sub(r"[\1]", out)
+
+    def _replace_bare(m: re.Match) -> str:
+        _, kept = _parse_bare_file_uri(m.group(0))
+        return kept
+
+    return _BARE_FILE_URI_RE.sub(_replace_bare, out)
+
+
+def _is_cli_binary_missing(exc: BaseException, cmd0: str) -> bool:
+    """True when *exc* is the ENOENT raised because the CLI binary itself is
+    missing — as opposed to cwd/session_dir or any other path inside the try.
+
+    ``asyncio.create_subprocess_exec`` sets ``FileNotFoundError.filename`` to
+    the offending path; anything that does not resolve to ``cmd0`` must fall
+    through to the generic error branch instead of telling the user the
+    assistant is not installed.
+    """
+    fname = getattr(exc, "filename", None)
+    if not fname or not cmd0:
+        return False
+    try:
+        return os.path.abspath(os.fspath(fname)) == os.path.abspath(cmd0)
+    except (TypeError, ValueError, OSError):
+        return False
