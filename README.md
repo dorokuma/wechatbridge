@@ -164,6 +164,9 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply (on small RAM hosts, lower this to avoid concurrent CLI memory spikes; see [Memory limits](#memory-limits)) |
+| `WECHATBRIDGE_QUEUE_NOTICE` | `true` | one-shot "queued" notice when the user's previous message is still running; set `0`/`false`/`no` to disable |
+| `WECHATBRIDGE_PROGRESS_NOTICE` | `true` | one-shot "still working" notice after a message runs past `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`; set `0`/`false`/`no` to disable |
+| `WECHATBRIDGE_PROGRESS_NOTICE_DELAY` | `30` | seconds before the progress notice fires |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | reply this token to approve a gated dangerous prompt |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | enable the `/mcp` help text command |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | enable the `/agent` prompt-rewrite command |

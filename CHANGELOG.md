@@ -5,6 +5,22 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-03
+
+### Added
+
+- **同用户排队提示（默认开）**：同一用户上一条消息仍在处理时，后续消息在等锁前先发一次 `⏳ 上一条消息仍在处理中，本条已加入排队，请稍候…`。锁被占用即提示一次，进入锁后不再重复；发送失败吞掉只记 debug，绝不影响排队与锁释放。`WECHATBRIDGE_QUEUE_NOTICE=0`/`false`/`no` 关闭。
+- **长任务进度提示（默认开）**：单条消息处理超过 30 秒未结束，向用户发一次 `⏳ 任务较复杂，仍在处理中，请稍候…`（每条任务只发一次）。watcher 绑在该消息自身的 task 生命周期上，完成/失败/取消均在 finally 中取消，不残留后台 task；发送失败吞掉只记 debug。`WECHATBRIDGE_PROGRESS_NOTICE=0`/`false`/`no` 关闭，阈值可用 `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`（秒）调整。
+- 两个开关均在 `config.py` 解析为 `config.queue_notice` / `config.progress_notice`，默认 `true`。
+
+### Documentation
+
+- `README.md` / `README.zh-CN.md` 环境变量表补充 `WECHATBRIDGE_QUEUE_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE_DELAY`；`deploy/wechatbridge.env.example` 同步。
+
+### Tests
+
+- `tests/test_hardening.py` 新增 `TestQueueAndProgressNotice`（7 条）：排队提示触发/置关不发/发送异常不破队、进度提示按时只发一次/置关不发/快任务不发/发送异常吞掉。锁顺序与 `_prune_user_locks`/`_user_lock_refs` 未动。
+
 ## [1.8.0] - 2026-11-03
 
 ### Changed
