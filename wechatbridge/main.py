@@ -706,6 +706,12 @@ async def login_flow(client: ILinkClient) -> bool:
         client.state.bound_at = int(time.time())
         client.state.save()
         logger.info("绑定成功！bot_token 已持久化")
+        # 登录成功后清理二维码临时文件，避免遗留可复用的登录 URL / 图片
+        for stale_path in (config.qrcode_png_path, config.qrcode_url_path):
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
         return True
     except TimeoutError:
         logger.error("扫码超时，退出")
@@ -1327,15 +1333,23 @@ async def main_loop() -> None:
             # Inner loop: long-poll for messages
             get_updates_buf = ""
             fail_delay = 0.5  # 网络异常指数退避，封顶 30s
+            consecutive_errors = 0
             while True:
                 try:
                     msgs, new_buf = await client.get_updates(
                         get_updates_buf, baseurl, bot_token
                     )
                     fail_delay = 0.5  # 成功一次即重置退避
+                    if consecutive_errors > 0:
+                        logger.info(
+                            "Poll loop recovered after %d consecutive error(s)",
+                            consecutive_errors,
+                        )
+                        consecutive_errors = 0
                 except Exception as e:
                     # Token invalidated (401/403) → break for re-login
                     logger.exception("长轮询异常: %s", e)
+                    consecutive_errors += 1
                     if not client.state.bot_token:
                         logger.warning("Bot token 已失效，准备重新登录")
                         break

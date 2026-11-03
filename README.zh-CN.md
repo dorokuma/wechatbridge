@@ -285,11 +285,12 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | `/clear` 或 `/new` | 开启新对话（agy/grok：丢弃续聊标记；codex：清空 thread_id；dsh：清空窗口记忆或常驻会话 ID） |
 | `/model <名称>` | 设模型（各后端均对照实时列表校验：agy/grok 走 CLI `models`；codex 走 `codex debug models`，失败或空再试 `--bundled`；未知名或列表拉取失败则拒绝且不写 prefs；见 `/models`） |
 | `/models` | 列出可用模型——agy/grok/codex 均向 CLI 实时查询（codex：`debug models`；仅在实时列表拉不到时才回退内置参考说明） |
-| `/fast` | 设为低推理开销（**只开不关**，不是来回切换） |
-| `/planning` | 设为 planning 模式（**只开不关**） |
-| `/add-dir <路径>` | **agy：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI |
+| `/fast` | 快速模式开关：低推理开销（可带 `on`/`off`，无参再按一次关闭） |
+| `/planning` | planning 模式开关（可带 `on`/`off`，无参再按一次关闭） |
+| `/add-dir <路径>` | **agy/codex：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI。无参查看当前列表，`/add-dir clear` 清空（dsh 暂不支持） |
 | `/agents` | 列出可用助手 |
 | `/persona <内容>` | 设人格（`show` / `clear` / `reset`） |
+| `/price <链接/口令/词>` | 京东/淘宝查券比价（需配置 `JDUNION_*` 或 `DATAOKE_*`） |
 | `/version` | 显示当前版本、实例名和后端；若有新版本则显示升级提示 |
 | `/mcp` | 短 **使用说明** 文案（可用 `WECHATBRIDGE_ENABLE_MCP` 关掉） |
 | `/agent <名称> <任务>` | 拼成「调用子助手…」提示再跑当前引擎（可用 `WECHATBRIDGE_ENABLE_SUBAGENT` 关掉） |

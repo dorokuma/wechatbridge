@@ -902,14 +902,42 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
     if category == "command_not_found":
         return format_error(
             "助手不可用",
-            "助手程序未正确安装或配置，请联系管理员。",
+            "助手程序未正确安装或配置，请联系管理员或发送 `/backend` 切换其它助手引擎。",
         )
 
     if category == "not_found":
         return format_error("未找到", "请求的资源或文件不存在。")
 
-    # Unknown: fixed Chinese only — never echo English raw to WeChat users
-    return format_error("执行失败", "这次没处理好，请稍后再试。")
+    # Unknown: fixed Chinese only — never echo English raw to WeChat users.
+    # Log the cleaned detail server-side for diagnosis (already ANSI/HTML-stripped).
+    if raw != "未知错误":
+        logger.warning(
+            "format_cli_error unknown detail backend=%s: %s",
+            backend or "?",
+            raw[:300],
+        )
+    return format_error(
+        "执行失败",
+        "这次没处理好，请稍后再试。若连续失败，可发送 `/new` 开启新对话或 `/backend` 切换引擎。",
+    )
+
+
+def format_timeout_error(timeout: int, backend: str = "") -> str:
+    """User-facing timeout bubble for run_* TimeoutError branches.
+
+    dsh does not support ``/fast`` so its hint omits the fast-mode switch.
+    """
+    if (backend or "").strip().lower() == "dsh":
+        detail = (
+            f"超过 {timeout} 秒未完成，已终止本次任务。"
+            "建议将问题拆小后重试，或发送 /new 开启新对话。"
+        )
+    else:
+        detail = (
+            f"超过 {timeout} 秒未完成，已终止本次任务。"
+            "建议将问题拆小后重试，或发送 /fast 切换快速模式、/new 开启新对话。"
+        )
+    return format_error("处理超时", detail)
 
 
 def is_upstream_throttle_reply(text: str) -> bool:
