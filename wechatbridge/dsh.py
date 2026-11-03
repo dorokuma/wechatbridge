@@ -59,6 +59,10 @@ from .runner_common import (
     sanitize_user_id,
     terminate_process,
     _sanitize_prompt_at_paths,
+    _snapshot_regular_files,
+    collect_session_fallback_artifacts,
+    merge_artifact_groups,
+    ARTIFACT_FALLBACK_EXTENSIONS,
     EMPTY_REPLY,
 )
 
@@ -834,6 +838,10 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     if is_dangerous(safe_prompt) and not is_dangerous(prompt):
         logger.warning("[AUDIT] dangerous keyword in safe_prompt from user=%s", user_id)
 
+    # 执行前快照本用户 session_dir（绝不碰共享 scratch），用于成功退出后
+    # 的产物回退扫描。
+    snapshot_before = _snapshot_regular_files([session_dir])
+
     process = None
     try:
         env = sanitize_env(session_dir)
@@ -891,6 +899,19 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         # Success path only — never mark on ❌/🔔 error/throttle bubbles
         if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             mark_initialized(session_dir, backend="dsh")
+
+        # Fallback: 成功退出后补扫本用户 session_dir（绝不扫共享 scratch），
+        # 把本轮新增/mtime 变新且扩展名在白名单的文件按 realpath 去重合并。
+        extra = collect_session_fallback_artifacts(
+            session_dir, snapshot_before, t0,
+            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+        )
+        if extra:
+            before = len(artifacts)
+            artifacts = merge_artifact_groups(artifacts, extra)
+            added = len(artifacts) - before
+            if added:
+                logger.info("Fallback scan collected %d additional dsh artifacts", added)
 
         # Persist the turn into long-term memory for continuity on next message.
         # (常驻模式下会话本身持有上下文，无需窗口记忆)

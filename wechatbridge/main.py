@@ -69,6 +69,22 @@ _DRAIN_TIMEOUT_S = 90.0
 # 后台任务强引用集合（事件循环只持弱引用，防止任务被 GC 提前回收）
 _background_tasks: set = set()
 
+# 每轮回传给用户的产物上限：超出只发前 N 个并合并提示（防单轮刷屏/滥用）。
+MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10
+
+
+def _sanitize_display_filename(raw_name: str) -> str:
+    """Strip control characters / newlines / '@' from a user-supplied filename
+    for safe inclusion in a prompt, capped at 80 chars."""
+    if not raw_name:
+        return ""
+    out = []
+    for ch in str(raw_name):
+        if ch == "@" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+            continue
+        out.append(ch)
+    return "".join(out).strip()[:80]
+
 
 def _spawn_bg(coro) -> asyncio.Task:
     """create_task + 强引用跟踪，任务结束自动移除。"""
@@ -802,7 +818,23 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
             bot_token=client.state.bot_token,
         )
 
-    for art_name, art_path in artifacts:
+    for idx, (art_name, art_path) in enumerate(artifacts):
+        if idx >= MAX_OUTBOUND_ARTIFACTS_PER_TURN:
+            try:
+                await client.send_message(
+                    to_user_id=from_user,
+                    text=(
+                        f"🔔 本次共生成 {len(artifacts)} 个文件，"
+                        f"已发送前 {MAX_OUTBOUND_ARTIFACTS_PER_TURN} 个；"
+                        f"其余文件请让助手打包压缩后再发送。"
+                    ),
+                    context_token=context_token,
+                    baseurl=client.state.baseurl,
+                    bot_token=client.state.bot_token,
+                )
+            except Exception as e:
+                logger.warning("Failed to send artifact-cap notice: %s", e)
+            break
         try:
             # realpath check blocks symlink escape outside allowed root
             if not path_is_under(art_path, allowed_root):
@@ -837,6 +869,9 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                 continue
             art_path = real_path
             file_size = st.st_size
+            if file_size == 0:
+                logger.warning("Artifact is empty (0 bytes), skipping: %s", art_path)
+                continue
             if file_size > config.max_outbound_file_bytes:
                 size_mb = file_size / (1024 * 1024)
                 # Never echo server absolute paths to WeChat users
@@ -960,28 +995,36 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     file_name = ""
     voice_text = ""
     has_voice = False
+    unsupported_types: list = []
+    media_count = 0
     for item in item_list:
         item_type = item.get("type")
         if item_type == 1 and not text:
             text_item = item.get("text_item", {})
             text = text_item.get("text", "")
-        elif item_type == 2 and image_media is None:
-            image_item = item.get("image_item", {})
-            media = image_item.get("media", {})
-            if media.get("encrypt_query_param") or media.get("full_url"):
-                image_media = media
+        elif item_type == 2:
+            media_count += 1
+            if image_media is None:
+                image_item = item.get("image_item", {})
+                media = image_item.get("media", {})
+                if media.get("encrypt_query_param") or media.get("full_url"):
+                    image_media = media
         elif item_type == 3 and not has_voice:
             # Voice: WeChat transcribes to text server-side (voice_item.text).
             # Only passthrough the text — no silk decode / no ASR (dmit 1c965Mi).
             voice_item = item.get("voice_item", {})
             voice_text = voice_item.get("text", "") or ""
             has_voice = True
-        elif item_type == 4 and file_media is None:
-            fi = item.get("file_item", {})
-            media = fi.get("media", {})
-            if media.get("encrypt_query_param") or media.get("full_url"):
-                file_media = media
-                file_name = fi.get("file_name", "")
+        elif item_type == 4:
+            media_count += 1
+            if file_media is None:
+                fi = item.get("file_item", {})
+                media = fi.get("media", {})
+                if media.get("encrypt_query_param") or media.get("full_url"):
+                    file_media = media
+                    file_name = fi.get("file_name", "")
+        elif item_type not in (1, 2, 3, 4):
+            unsupported_types.append(item_type)
 
     if not context_token:
         logger.warning(
@@ -1155,8 +1198,21 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
                     if raw_caption
                     else "请分析这个文件"
                 )
+                safe_orig_name = _sanitize_display_filename(file_name)
+                if safe_orig_name:
+                    if raw_caption:
+                        full_prompt = (
+                            f"{prompt}\n\n"
+                            f"[附件（原文件名：{safe_orig_name}）: @{save_path}]"
+                        )
+                    else:
+                        full_prompt = (
+                            f"{prompt} @{save_path} （原文件名：{safe_orig_name}）"
+                        )
+                else:
+                    full_prompt = f"{prompt} @{save_path}"
                 logger.info("文件分析 from=%s: %s @%s", from_user, prompt, save_path)
-                result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
+                result = await gate_and_run(client, from_user, context_token, full_prompt)
                 if result is None:
                     return
                 reply, artifacts = result
@@ -1189,7 +1245,26 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     # ---- Case 2: Text-only message (original logic) ----
     else:
         if not text:
-            logger.debug("Skipping non-text message from %s", from_user)
+            # 不支持的消息类型（视频 type=5、表情包、卡片等）：item_list 非空
+            # 但没有可处理的文字/图片/语音/文件时给用户一条提示；
+            # 空 item_list 仍静默 return。
+            if unsupported_types and not has_voice:
+                logger.info(
+                    "不支持的消息类型 from=%s types=%s", from_user, unsupported_types
+                )
+                await client.send_message(
+                    to_user_id=from_user,
+                    text=(
+                        "🔔 **暂不支持该消息类型** 🔔\n\n"
+                        "目前支持发送文字、图片、语音（需开启微信语音转文字）和文档文件，"
+                        "暂不支持视频、表情包或卡片消息。"
+                    ),
+                    context_token=context_token,
+                    baseurl=client.state.baseurl,
+                    bot_token=client.state.bot_token,
+                )
+            else:
+                logger.debug("Skipping non-text message from %s", from_user)
             return
 
         logger.info("收到消息 from=%s: %.100s", from_user, text)
@@ -1225,9 +1300,17 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             reply, artifacts = result
 
     # ---- Send reply via iLink ----
+    # 多附件提示：单条消息只处理首个媒体项，其余忽略。
+    multi_media_notice = ""
+    if media_count > 1:
+        multi_media_notice = (
+            "💡 单次消息仅处理首个附件，其余附件已忽略，请分条发送。"
+        )
+        logger.info("多附件消息 from=%s count=%d", from_user, media_count)
+
     success = await client.send_message(
         to_user_id=from_user,
-        text=cancelled_notice + reply,
+        text=cancelled_notice + multi_media_notice + reply,
         context_token=context_token,
         baseurl=client.state.baseurl,
         bot_token=client.state.bot_token,

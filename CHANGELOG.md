@@ -5,6 +5,22 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-03
+
+### Added
+
+- **产物识别/回传扩展（批次二）**：
+  - `agy` 的 `extract_artifacts` 对齐 `dsh`，支持 4 种产物引用形式：`[name](file:///abs)`、`[name](/abs)`、`[name](./rel)` / `../rel`（相对路径基于 `session_dir` 解析）与裸 `file:///abs`；仅当路径解析后位于允许根（`session_dir` / `config.agy_scratch_dir` / 已验证 `--add-dir`）且文件存在时才收录，显示文本重写不变。
+  - **session_dir 快照回退扫描**：把 `codex` 的有界快照工具（200 文件 / 50 子目录 / 2 秒上限）抽为 `runner_common._snapshot_regular_files`，并新增 `collect_session_fallback_artifacts` / `merge_artifact_groups` 共用工具；`run_agy` 与 `run_dsh` 在进程成功退出后对**单用户 `session_dir`**（绝不扫共享 `config.agy_scratch_dir`）做前后快照对比，把本轮新增/mtime 变新且扩展名在白名单（`.pdf .docx .xlsx .pptx .csv .png .jpg .jpeg .gif .webp .svg .zip .html`）内的文件作为链接提取的去重补充（按 realpath 去重）。每个候选经 `is_sensitive_artifact_path` + `st_nlink == 1` + `realpath` 在 `session_dir` 内三重校验；非零退出/超时/失败不扫描。
+  - `send_artifacts_back` 跳过 0 字节产物（仅日志不通知）。
+  - **出站数量上限**：`MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10`，超出只发前 10 个并合并提示。
+- **入站原文件名透传**：文件消息落盘文件名仍为 `uuid.hex[:12]+ext`（安全不变），prompt 附带清洗后的原始文件名（去控制字符/换行/`@`，截前 80 字符）；无附加文本为 `请分析这个文件 @<path> （原文件名：X）`，有附加文本为 `<text>\n\n[附件（原文件名：X）: @<path>]`。
+- **消息类型/多附件提示**：消息仅含不支持类型（视频 type=5、表情包、卡片等）时回复“暂不支持该消息类型”气泡；单条消息多于 1 个媒体项时处理首个并在回复前追加“仅处理首个附件”提示。
+
+### Changed
+
+- `codex._snapshot_regular_files` / `_collect_fallback_artifacts` / `_merge_codex_artifacts` 改为 `runner_common` 共用实现的兼容封装（扫描目录排除集保持原 codex 语义）。
+
 ## [1.8.0] - 2026-11-03
 
 ### Changed

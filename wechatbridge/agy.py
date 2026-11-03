@@ -22,7 +22,9 @@ from .runner_common import (
     clean_output, load_prefs, save_prefs, is_dangerous, is_sensitive_artifact_path, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
-    ANSI_RE, HTML_TAG_RE, validate_add_dir,
+    ANSI_RE, HTML_TAG_RE, validate_add_dir, path_is_under,
+    _snapshot_regular_files, collect_session_fallback_artifacts, merge_artifact_groups,
+    ARTIFACT_FALLBACK_EXTENSIONS,
 )
 
 logger = logging.getLogger("agy_runner")
@@ -30,33 +32,90 @@ logger = logging.getLogger("agy_runner")
 # execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
 _MAX_ARG_BYTES = 120 * 1024
 
-# Matches markdown [name](file:///path) while supporting one level of balanced
-# brackets in display name and one level of balanced parentheses in path (e.g.
-# "report (1).pdf"), without greedily spanning across multiple links on a line.
+# Bare ``file:///`` mentions inside agy stdout (same as dsh).
+_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
+
+# Matches markdown ``[name](file:///abs | /abs | ./rel | ../rel)`` while
+# supporting one level of balanced brackets in display name and one level of
+# balanced parentheses in path (e.g. "report (1).pdf"), without greedily
+# spanning across multiple links on a line.
 _FILE_LINK_RE = re.compile(
-    r"\[((?:[^\[\]]+|\[[^\[\]]*\])+)\]\(file:///((?:[^()\s]+|\([^()\s]*\))+)\)"
+    r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((file:///(?:[^()\s]|\([^()\s]*\))+|/(?:[^()\s]|\([^()\s]*\))*|\.\.?/(?:[^()\s]|\([^()\s]*\))+)\)"
 )
 
+# Reuse dsh's trailing-CJK/punctuation splitter for bare file:/// mentions.
+from .dsh import _parse_bare_file_uri  # noqa: E402  (dsh does not import agy)
 
-def extract_artifacts(text: str) -> list[tuple[str, str]]:
-    """Extract (name, absolute_path) tuples from markdown file:/// links.
 
-    Supports balanced parentheses in filenames (e.g. ``report (1).pdf``) and
-    URL-decodes (``urllib.parse.unquote``) percent-encoded spaces / CJK.
-    Returns a deduplicated, order-preserved list.
+def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | None = None) -> list[tuple[str, str]]:
+    """Extract (name, absolute_path) tuples of file references from agy output.
+
+    Recognizes (deduplicated, order-preserved):
+      - markdown links ``[name](file:///abs/path)``
+      - markdown links ``[name](/abs/path)`` and ``[name](./rel/path)`` /
+        ``[name](../rel/path)`` — relative paths resolve against *session_dir*
+      - bare ``file:///abs/path`` mentions
+
+    Paths are only kept when they resolve inside an allowed root
+    (``session_dir``, ``config.agy_scratch_dir``, or any user-approved
+    ``--add-dir`` root) AND ``os.path.exists``. URL-decodes
+    (``urllib.parse.unquote``) percent-encoded spaces / CJK.
     """
     if not text:
         return []
-    seen = set()
-    result = []
-    for match in _FILE_LINK_RE.finditer(text):
-        name = unquote(match.group(1).split("#")[0])
-        path_part = unquote(match.group(2).split("#")[0])
-        abs_path = path_part if path_part.startswith("/") else "/" + path_part
-        key = (name, abs_path)
-        if key not in seen:
-            seen.add(key)
-            result.append(key)
+
+    roots: list[str] = []
+    for r in ([session_dir] if session_dir else []) + list(allowed_roots or []):
+        if r and r not in roots:
+            roots.append(r)
+
+    seen: set = set()
+    result: list[tuple[str, str]] = []
+
+    def _allowed(abs_path: str) -> bool:
+        return any(path_is_under(abs_path, r) for r in roots)
+
+    def _add(name: str, path: str) -> None:
+        if path.startswith("file://"):
+            # 只剥 "file://"（7 字符），保留 file:///abs 的第三个 "/"。
+            path = path[len("file://"):]
+        if not path.startswith("/"):
+            if session_dir and (path.startswith("./") or path.startswith("../")):
+                path = os.path.normpath(os.path.join(session_dir, path))
+            elif not roots:
+                return  # 无允许根上下文时不解析裸相对名
+            else:
+                return  # https://, mailto:, bare names, etc.
+        name = unquote(name.split("#")[0])
+        path = unquote(path.split("#")[0])
+        # Collapse any leading "//" produced by file:// + /abs joins.
+        abs_path = os.path.normpath(path)
+        while abs_path.startswith("//"):
+            abs_path = abs_path[1:]
+        # 允许根校验只在提供 session_dir/allowed_roots 时启用——无上下文
+        # 调用（纯解析/测试）保持原有放行行为。
+        if roots:
+            if not _allowed(abs_path):
+                return
+            if not os.path.exists(abs_path):
+                return
+        if path not in seen:
+            seen.add(path)
+            result.append((name, abs_path))
+
+    for m in _FILE_LINK_RE.finditer(text):
+        _add(m.group(1), m.group(2))
+    # bare file:///path with trailing CJK/punctuation separation.
+    # Skip matches still inside a markdown link ``](...file:///...)`` — those
+    # were already captured with their display name above.
+    for m in _BARE_FILE_URI_RE.finditer(text):
+        if m.start() > 0 and text[m.start() - 1] == "(":
+            continue
+        clean_uri, _ = _parse_bare_file_uri(m.group(0))
+        path_part = clean_uri[len("file://"):]
+        if path_part.startswith("/"):
+            _add(os.path.basename(path_part), clean_uri)
+
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
     return result
@@ -237,6 +296,10 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     cmd += ["-p", safe_prompt]
 
+    # 执行前快照 session_dir（仅限单用户会话目录，绝不碰共享 scratch），
+    # 用于成功退出后的产物回退扫描。
+    snapshot_before = _snapshot_regular_files([session_dir])
+
     process = None
     try:
         env = sanitize_env(session_dir)
@@ -263,17 +326,17 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-        # A: Extract artifacts from raw stdout (before clean_output!)
+        # A: Extract artifacts from raw stdout (before clean_output!).
+        # Allowed roots: per-user session_dir + shared agy scratch +
+        # validated --add-dir roots. Never scan the shared scratch dir.
+        _art_roots = [config.agy_scratch_dir] + valid_add_dirs
         artifacts = [
             (n, p)
-            for n, p in extract_artifacts(stdout_text)
+            for n, p in extract_artifacts(
+                stdout_text, session_dir=session_dir, allowed_roots=_art_roots
+            )
             if not is_sensitive_artifact_path(p, session_dir)
         ]
-
-        # B: (disabled) Scratch diff via before/after snapshots is removed because
-        #   multi-user shared scratch causes cross-user artifact leakage.
-        #   agy-generated files always produce file:/// links in stdout, so
-        #   extract_artifacts (A) above is sufficient.
 
         # Clean display text
         display = clean_output(stdout_text) or EMPTY_REPLY
@@ -339,9 +402,19 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                     if r_stdout_text:
                         r_artifacts = [
                             (n, p)
-                            for n, p in extract_artifacts(r_stdout_text)
+                            for n, p in extract_artifacts(
+                                r_stdout_text, session_dir=session_dir,
+                                allowed_roots=_art_roots,
+                            )
                             if not is_sensitive_artifact_path(p, session_dir)
                         ]
+                        # 重试进程成功回话：也补扫 session_dir 本轮新增产物。
+                        r_extra = collect_session_fallback_artifacts(
+                            session_dir, snapshot_before, t0,
+                            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+                        )
+                        if r_extra:
+                            r_artifacts = merge_artifact_groups(r_artifacts, r_extra)
                         r_display = clean_output(r_stdout_text) or EMPTY_REPLY
                         r_display = _FILE_LINK_RE.sub(r"[\1]", r_display)
                         r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
@@ -367,6 +440,20 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         # Success path only — never mark on ❌/🔔 error/throttle bubbles
         if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             mark_initialized(session_dir, backend="agy")
+
+        # B: 成功退出后回退扫描——只扫本用户 session_dir（绝不扫共享
+        # config.agy_scratch_dir），把本轮新增/mtime 变新且扩展名在白名单
+        # 的文件按 realpath 去重合并进 artifacts。
+        extra = collect_session_fallback_artifacts(
+            session_dir, snapshot_before, t0,
+            ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS,
+        )
+        if extra:
+            before = len(artifacts)
+            artifacts = merge_artifact_groups(artifacts, extra)
+            added = len(artifacts) - before
+            if added:
+                logger.info("Fallback scan collected %d additional agy artifacts", added)
 
         elapsed = time.time() - t0
         logger.info(

@@ -24,9 +24,11 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs, is_bridge_formatted_reply,
-    format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
+    format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir,
     MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
+    collect_session_fallback_artifacts, merge_artifact_groups,
 )
+from .runner_common import _snapshot_regular_files as _rc_snapshot_regular_files
 
 logger = logging.getLogger("codex_runner")
 
@@ -558,52 +560,9 @@ def _resolve_add_dirs(raw_dirs: list, session_dir: str, user_id: str = "") -> li
     return validated
 
 
-_EXCLUDED_SCAN_NAMES = frozenset({".codex", ".git", "__pycache__", "node_modules", "venv", ".venv", "cache", ".cache"})
-
-
 def _snapshot_regular_files(roots: list) -> dict:
-    """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
-
-    Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
-    dict if any limit is exceeded (never partial results).
-
-    ``os.walk(followlinks=False)`` naturally excludes symlink traversal;
-    ``_EXCLUDED_SCAN_NAMES`` skips internal metadata dirs; only regular files
-    (not dirs/symlinks/special) are collected.
-    """
-    snap = {}
-    t_start = time.monotonic()
-    file_count = 0
-    dir_count = 0
-    _MAX_FILES = 200
-    _MAX_DIRS = 50
-    _MAX_SCAN_TIME = 2.0
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dir_count += 1
-            if dir_count > _MAX_DIRS:
-                return {}
-            if time.monotonic() - t_start > _MAX_SCAN_TIME:
-                return {}
-            # Exclude internal metadata directories in-place
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_SCAN_NAMES]
-            for fn in filenames:
-                file_count += 1
-                if file_count > _MAX_FILES:
-                    return {}
-                fp = os.path.join(dirpath, fn)
-                try:
-                    if not os.path.isfile(fp) or os.path.islink(fp):
-                        continue
-                    # Verify candidate is under one of the allowed roots
-                    if not any(path_is_under(fp, r) for r in roots):
-                        continue
-                    snap[fp] = os.path.getmtime(fp)
-                except OSError:
-                    continue
-    return snap
+    """Thin wrapper kept for backwards compatibility; shared impl in runner_common."""
+    return _rc_snapshot_regular_files(roots)
 
 
 def _parse_codex_output(stdout_text: str, session_dir: str, since: float = 0.0) -> tuple:
@@ -748,49 +707,16 @@ def _extract_codex_error_messages(stdout_text: str) -> list:
 def _collect_fallback_artifacts(session_dir: str, snapshot_before: dict, t0: float) -> list:
     """Scan session_dir for files created or overwritten during this turn.
 
-    Codex often emits a ``file_change`` for a helper script and then writes
-    the real pdf/docx via the shell. Always merge this list with structured
-    artifacts (dedupe by realpath). Scans only session_dir (never add_dirs).
-    Excludes internal metadata dirs. Each candidate is verified under session_dir.
+    Thin wrapper over ``runner_common.collect_session_fallback_artifacts``
+    (no extension whitelist — codex collects all new/modified files; every
+    send-side filter still applies). Scans only session_dir (never add_dirs).
     """
-    _internal_names = {".codex_thread_id"}
-    fallback = []
-    fallback_seen = set()
-    for fp, fmtime in _snapshot_regular_files([session_dir]).items():
-        prev = snapshot_before.get(fp)
-        if prev is None:
-            if fmtime < t0:
-                continue
-        elif fmtime <= prev:
-            continue
-        name = os.path.basename(fp)
-        if name in _internal_names or name.startswith(".initialized.") or is_sensitive_artifact_path(fp, session_dir):
-            continue
-        key = (name, fp)
-        if key not in fallback_seen:
-            fallback_seen.add(key)
-            fallback.append(key)
-    return fallback
+    return collect_session_fallback_artifacts(session_dir, snapshot_before, t0)
 
 
 def _merge_codex_artifacts(*groups) -> list:
-    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
-    merged = []
-    seen = set()
-    for group in groups:
-        for item in group or []:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                continue
-            name, path = item
-            try:
-                key = os.path.realpath(path)
-            except OSError:
-                key = path
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append((name, path))
-    return merged
+    """Thin wrapper kept for backwards compatibility; shared impl in runner_common."""
+    return merge_artifact_groups(*groups)
 
 async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     """Execute codex CLI for a given user message.
