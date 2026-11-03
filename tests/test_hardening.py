@@ -3716,9 +3716,11 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
 
     # ---- FileNotFoundError → command not found 归类 ---------------------------
 
-    async def _assert_fnf_maps_to_command_not_found(self, run_coro):
+    async def _assert_fnf_maps_to_command_not_found(self, run_coro, missing_name):
+        """ENOENT must name the spawned binary (e.filename == cmd[0]) to map
+        to 「助手不可用」— mocking the real asyncio failure semantics."""
         async def spawn(*_a, **_k):
-            raise FileNotFoundError(2, "No such file or directory", "missing-cli")
+            raise FileNotFoundError(2, "No such file or directory", missing_name)
 
         with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
             display, artifacts = await run_coro()
@@ -3733,7 +3735,7 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"):
             await self._assert_fnf_maps_to_command_not_found(
-                lambda: agy_mod.run_agy("hi", "u-fnf-agy")
+                lambda: agy_mod.run_agy("hi", "u-fnf-agy"), "/nonexistent/agy"
             )
 
     async def test_run_grok_binary_missing(self):
@@ -3744,7 +3746,7 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
              mock.patch("wechatbridge.grok._sync_grok_auth", return_value=True), \
              mock.patch("wechatbridge.grok._grok_has_credentials", return_value=True):
             await self._assert_fnf_maps_to_command_not_found(
-                lambda: grok_mod.run_grok("hi", "u-fnf-grok")
+                lambda: grok_mod.run_grok("hi", "u-fnf-grok"), "/nonexistent/grok"
             )
 
     async def test_run_codex_binary_missing(self):
@@ -3753,7 +3755,7 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(config, "codex_binary_path", "/nonexistent/codex"):
             await self._assert_fnf_maps_to_command_not_found(
-                lambda: codex_mod.run_codex("hi", "u-fnf-codex")
+                lambda: codex_mod.run_codex("hi", "u-fnf-codex"), "/nonexistent/codex"
             )
 
     async def test_run_dsh_binary_missing(self):
@@ -3764,8 +3766,13 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
         os.makedirs(host_home, exist_ok=True)
         with open(os.path.join(host_home, ".credentials.yaml"), "w") as f:
             f.write("provider: deepseek\n")
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", "/nonexistent/dsh")
+
         with mock.patch.object(config, "dsh_binary_path", "/nonexistent/dsh"), \
-             mock.patch.object(config, "dsh_home", host_home):
+             mock.patch.object(config, "dsh_home", host_home), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
             display, artifacts = await dsh_mod.run_dsh("hi", "u-fnf-dsh")
         self.assertEqual(artifacts, [])
         self.assertIn("助手不可用", display)
@@ -3776,12 +3783,46 @@ class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
         from wechatbridge.config import config
 
         async def spawn(*_a, **_k):
-            raise FileNotFoundError(2, "No such file or directory", "agy")
+            raise FileNotFoundError(2, "No such file or directory", "/nonexistent/agy")
 
         with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"), \
              mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
             out = await agy_mod._run_agy_subcommand(["models"], "u-fnf-sub")
         self.assertIn("助手不可用", out)
+
+    # ---- FileNotFoundError 指向 session_dir/其它路径 → 不得报「未安装」 -------
+
+    async def test_run_agy_fnf_other_path_not_binary_missing(self):
+        """session_dir / 其它 ENOENT 走通用错误，不误报「助手不可用」。"""
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", self.session_base)
+
+        with mock.patch.object(config, "agy_binary_path", "/nonexistent/agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await agy_mod.run_agy("hi", "u-fnf-cwd")
+        self.assertEqual(artifacts, [])
+        self.assertIn("执行出错", display)
+        self.assertNotIn("助手不可用", display)
+        self.assertNotIn(self.session_base, display)
+
+    async def test_run_grok_fnf_other_path_not_binary_missing(self):
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            raise FileNotFoundError(2, "No such file or directory", self.session_base)
+
+        with mock.patch.object(config, "grok_binary_path", "/nonexistent/grok"), \
+             mock.patch("wechatbridge.grok._sync_grok_auth", return_value=True), \
+             mock.patch("wechatbridge.grok._grok_has_credentials", return_value=True), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, artifacts = await grok_mod.run_grok("hi", "u-fnf-cwd-g")
+        self.assertEqual(artifacts, [])
+        self.assertIn("执行出错", display)
+        self.assertNotIn("助手不可用", display)
 
     # ---- format_timeout_error / format_cli_error unknown 日志 ------------------
 
@@ -4204,6 +4245,155 @@ class TestDisplayFilenameAndNotices(unittest.TestCase):
         self.assertEqual(_sanitize_display_filename("normal.pdf"), "normal.pdf")
 
 
+class TestAgyDisplayStripsFilePaths(unittest.IsolatedAsyncioTestCase):
+    """S1: agy 显示文本不得泄露服务器路径——裸 file:///、[x](file:///abs)、
+    [x](/abs)、[x](./rel) 与 dsh 同规则剥除，仅保留链接文字。"""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        from wechatbridge.runner_common import get_session_dir
+        self._cfg = config
+        self.td = tempfile.mkdtemp(prefix="wb-agy-disp-")
+        self.scratch = os.path.join(self.td, "scratch")
+        os.makedirs(self.scratch)
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            mock.patch.object(config, "agy_scratch_dir", self.scratch),
+        ]
+        for p in self._patchers:
+            p.start()
+        # 真实 per-user session_dir（ensure_user_gemini 会按需创建）
+        self.session = get_session_dir("u-agydisp")
+        os.makedirs(self.session)
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _mkfile(self, root, name):
+        path = os.path.join(root, name)
+        with open(path, "w") as f:
+            f.write("x")
+        return path
+
+    async def _run_with_stdout(self, stdout_text):
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.config import config
+
+        async def spawn(*_a, **_k):
+            return _FakeAgyProc(stdout_text, "", rc=0)
+
+        with mock.patch.object(config, "agy_binary_path", "agy"), \
+             mock.patch("asyncio.create_subprocess_exec", side_effect=spawn), \
+             mock.patch.object(agy_mod, "terminate_process", new=AsyncMock()):
+            return await agy_mod.run_agy("hi", "u-agydisp")
+
+    async def test_bare_file_uri_stripped_from_display(self):
+        f = self._mkfile(self.session, "x.pdf")
+        display, arts = await self._run_with_stdout(
+            f"已生成 file://{f} 请查收"
+        )
+        self.assertNotIn(self.td, display)
+        self.assertNotIn("file://", display)
+        self.assertNotIn(f, display)
+        # 产物仍正常提取
+        self.assertEqual([n for n, _ in arts], ["x.pdf"])
+
+    async def test_markdown_file_uri_link_keeps_name_only(self):
+        f = self._mkfile(self.session, "report.pdf")
+        display, _ = await self._run_with_stdout(
+            f"see [report.pdf](file://{f}) done"
+        )
+        self.assertEqual(display, "see [report.pdf] done")
+        self.assertNotIn(self.td, display)
+
+    async def test_markdown_abs_link_keeps_name_only(self):
+        f = self._mkfile(self.session, "b.docx")
+        display, _ = await self._run_with_stdout(f"see [doc]({f}) here")
+        self.assertEqual(display, "see [doc] here")
+        self.assertNotIn(self.td, display)
+
+    async def test_markdown_rel_link_keeps_name_only(self):
+        os.makedirs(os.path.join(self.session, "sub"), exist_ok=True)
+        f = self._mkfile(os.path.join(self.session, "sub"), "c.csv")
+        display, _ = await self._run_with_stdout("see [csv](./sub/c.csv) here")
+        self.assertEqual(display, "see [csv] here")
+        self.assertNotIn(self.td, display)
+
+
+class TestAgyImportWithoutYaml(unittest.TestCase):
+    """S2: 默认 agy 后端不得因 import dsh 而依赖顶层 yaml。"""
+
+    def test_agy_imports_without_yaml(self):
+        import importlib
+        import sys
+
+        orig_yaml = sys.modules.get("yaml")
+        orig_dsh = sys.modules.get("wechatbridge.dsh")
+        orig_agy = sys.modules.get("wechatbridge.agy")
+        sys.modules["yaml"] = None
+        sys.modules.pop("wechatbridge.dsh", None)
+        sys.modules.pop("wechatbridge.agy", None)
+        try:
+            mod = importlib.import_module("wechatbridge.agy")
+            self.assertTrue(hasattr(mod, "run_agy"))
+            self.assertNotIn("wechatbridge.dsh", sys.modules)
+        finally:
+            if orig_yaml is not None:
+                sys.modules["yaml"] = orig_yaml
+            else:
+                sys.modules.pop("yaml", None)
+            if orig_dsh is not None:
+                sys.modules["wechatbridge.dsh"] = orig_dsh
+            else:
+                sys.modules.pop("wechatbridge.dsh", None)
+            sys.modules["wechatbridge.agy"] = mod
+            if orig_agy is not None:
+                sys.modules["wechatbridge.agy"] = orig_agy
+
+
+class TestSnapshotRealpathKeys(unittest.TestCase):
+    """S3: session_dir 经软链接父目录访问时，快照前后键一致（realpath）。"""
+
+    def test_symlinked_session_dir_keys_match(self):
+        from wechatbridge.runner_common import (
+            ARTIFACT_FALLBACK_EXTENSIONS,
+            _snapshot_regular_files,
+            collect_session_fallback_artifacts,
+        )
+
+        td = tempfile.mkdtemp(prefix="wb-snap-")
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        real_dir = os.path.join(td, "real_session")
+        os.makedirs(real_dir)
+        link_path = os.path.join(td, "link_session")
+        os.symlink(real_dir, link_path)
+
+        # 预先存在、mtime 在 t0-2s 内的文件：不得当作新产物
+        old_file = os.path.join(real_dir, "old.pdf")
+        with open(old_file, "wb") as f:
+            f.write(b"x")
+        os.utime(old_file, (1000000.0, 1000000.0))
+
+        t0 = time.time()
+        before = _snapshot_regular_files([link_path])
+        # 快照键必须是 realpath 形式
+        self.assertEqual(set(before), {os.path.realpath(old_file)})
+
+        # 本轮新建文件仍被回收
+        new_file = os.path.join(real_dir, "new.pdf")
+        with open(new_file, "wb") as f:
+            f.write(b"x")
+        arts = collect_session_fallback_artifacts(
+            link_path, before, t0, ext_whitelist=ARTIFACT_FALLBACK_EXTENSIONS
+        )
+        paths = {p for _, p in arts}
+        self.assertIn(os.path.realpath(new_file), paths)
+        self.assertNotIn(os.path.realpath(old_file), paths)
+
+
+
 class TestProcessMessageMediaNotices(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         from wechatbridge import main as main_mod
@@ -4267,7 +4457,10 @@ class TestProcessMessageMediaNotices(unittest.IsolatedAsyncioTestCase):
         ):
             await self.main.process_message(client, msg)
         texts = [c.kwargs["text"] for c in client.send_message.await_args_list]
-        self.assertTrue(any("仅处理首个附件" in t for t in texts))
+        hit = [t for t in texts if "仅处理首个附件" in t]
+        self.assertTrue(hit)
+        # 提示与正文之间须有空行（与 cancelled_notice 一致）
+        self.assertIn("请分条发送。\n\nok", hit[0])
 
     async def test_file_message_carries_orig_filename(self):
         client = self._client()

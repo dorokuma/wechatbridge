@@ -22,6 +22,7 @@ from .runner_common import (
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, format_timeout_error, format_model_label, is_bridge_formatted_reply, EMPTY_REPLY, validate_add_dir,
     path_is_under, MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
+    _is_cli_binary_missing,
 )
 
 logger = logging.getLogger("grok_runner")
@@ -830,9 +831,15 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
         raise
 
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "grok", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="grok"), []
+        if _is_cli_binary_missing(e, config.grok_binary_path):
+            logger.error("CLI binary not found for %s: %s", "grok", e)
+            return format_cli_error("command not found", backend="grok"), []
+        logger.exception("Unexpected error running grok: %s", e)
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        ), []
 
     except Exception as e:
         logger.exception("Unexpected error running grok: %s", e)
@@ -896,9 +903,15 @@ async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
         await terminate_process(process, graceful=False)
         raise
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "grok", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="grok")
+        if _is_cli_binary_missing(e, config.grok_binary_path):
+            logger.error("CLI binary not found for %s: %s", "grok", e)
+            return format_cli_error("command not found", backend="grok")
+        logger.exception("Subcommand error: %s", e)
+        return format_error(
+            "执行出错",
+            "命令执行失败，请稍后重试。",
+        )
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
         await terminate_process(process, graceful=False)

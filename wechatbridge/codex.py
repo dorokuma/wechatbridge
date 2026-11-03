@@ -27,6 +27,7 @@ from .runner_common import (
     format_error, format_cli_error, format_timeout_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
     MAX_ADD_DIRS, is_sensitive_artifact_path, _sanitize_prompt_at_paths,
     collect_session_fallback_artifacts, merge_artifact_groups,
+    _is_cli_binary_missing,
 )
 from .runner_common import _snapshot_regular_files as _rc_snapshot_regular_files
 
@@ -962,9 +963,15 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
         raise
 
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "codex", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="codex"), []
+        if _is_cli_binary_missing(e, config.codex_binary_path):
+            logger.error("CLI binary not found for %s: %s", "codex", e)
+            return format_cli_error("command not found", backend="codex"), []
+        logger.exception("Unexpected error running codex: %s", e)
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        ), []
 
     except Exception as e:
         logger.exception("Unexpected error running codex: %s", e)
@@ -1041,9 +1048,15 @@ async def _run_codex_subcommand(subcmd_args: list, user_id: str) -> str:
         await terminate_process(process, graceful=False)
         raise
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "codex", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="codex")
+        if _is_cli_binary_missing(e, config.codex_binary_path):
+            logger.error("CLI binary not found for %s: %s", "codex", e)
+            return format_cli_error("command not found", backend="codex")
+        logger.exception("codex subcommand error: %s", e)
+        return format_error(
+            "执行出错",
+            "命令执行失败，请稍后重试。",
+        )
     except Exception as e:
         logger.exception("codex subcommand error: %s", e)
         await terminate_process(process, graceful=False)

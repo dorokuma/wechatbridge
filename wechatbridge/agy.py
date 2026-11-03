@@ -24,6 +24,8 @@ from .runner_common import (
     format_error, format_cli_error, format_timeout_error, format_model_label, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir, path_is_under,
     _snapshot_regular_files, collect_session_fallback_artifacts, merge_artifact_groups,
+    _is_cli_binary_missing, _parse_bare_file_uri, _strip_file_links,
+    _BARE_FILE_URI_RE,
     ARTIFACT_FALLBACK_EXTENSIONS,
 )
 
@@ -32,8 +34,8 @@ logger = logging.getLogger("agy_runner")
 # execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
 _MAX_ARG_BYTES = 120 * 1024
 
-# Bare ``file:///`` mentions inside agy stdout (same as dsh).
-_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
+# Bare ``file:///`` mentions inside agy stdout (shared with dsh via
+# runner_common._BARE_FILE_URI_RE).
 
 # Matches markdown ``[name](file:///abs | /abs | ./rel | ../rel)`` while
 # supporting one level of balanced brackets in display name and one level of
@@ -42,9 +44,6 @@ _BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
 _FILE_LINK_RE = re.compile(
     r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((file:///(?:[^()\s]|\([^()\s]*\))+|/(?:[^()\s]|\([^()\s]*\))*|\.\.?/(?:[^()\s]|\([^()\s]*\))+)\)"
 )
-
-# Reuse dsh's trailing-CJK/punctuation splitter for bare file:/// mentions.
-from .dsh import _parse_bare_file_uri  # noqa: E402  (dsh does not import agy)
 
 
 def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | None = None) -> list[tuple[str, str]]:
@@ -341,13 +340,9 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         # Clean display text
         display = clean_output(stdout_text) or EMPTY_REPLY
 
-        # Strip file:/// links from display to avoid leaking server paths
-        display = _FILE_LINK_RE.sub(r"[\1]", display)
-        display = re.sub(
-            r"\[([^\]]+)\]\(file:///[^)]+\)",
-            r"[\1]",
-            display,
-        )
+        # Strip file link targets / bare file:/// URIs from display so
+        # server paths never leak to WeChat users (shared with dsh).
+        display = _strip_file_links(display)
 
         if process.returncode != 0:
             logger.warning(
@@ -416,8 +411,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         if r_extra:
                             r_artifacts = merge_artifact_groups(r_artifacts, r_extra)
                         r_display = clean_output(r_stdout_text) or EMPTY_REPLY
-                        r_display = _FILE_LINK_RE.sub(r"[\1]", r_display)
-                        r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
+                        r_display = _strip_file_links(r_display)
                         if (
                             first
                             and r_display != EMPTY_REPLY
@@ -477,9 +471,15 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         raise
 
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "agy", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="agy"), []
+        if _is_cli_binary_missing(e, config.agy_binary_path):
+            logger.error("CLI binary not found for %s: %s", "agy", e)
+            return format_cli_error("command not found", backend="agy"), []
+        logger.exception("Unexpected error running agy: %s", e)
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        ), []
 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
@@ -542,9 +542,15 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
         await terminate_process(process, graceful=False)
         raise
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "agy", e)
         await terminate_process(process, graceful=False)
-        return format_cli_error("command not found", backend="agy")
+        if _is_cli_binary_missing(e, config.agy_binary_path):
+            logger.error("CLI binary not found for %s: %s", "agy", e)
+            return format_cli_error("command not found", backend="agy")
+        logger.exception("Subcommand error: %s", e)
+        return format_error(
+            "执行出错",
+            "命令执行失败，请稍后重试。",
+        )
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
         await terminate_process(process, graceful=False)

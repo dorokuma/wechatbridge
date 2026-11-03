@@ -1384,7 +1384,7 @@ async def _process_message_impl(client: ILinkClient, msg: dict) -> None:
     multi_media_notice = ""
     if media_count > 1:
         multi_media_notice = (
-            "💡 单次消息仅处理首个附件，其余附件已忽略，请分条发送。"
+            "💡 单次消息仅处理首个附件，其余附件已忽略，请分条发送。\n\n"
         )
         logger.info("多附件消息 from=%s count=%d", from_user, media_count)
 

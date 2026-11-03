@@ -30,13 +30,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **长任务进度提示（默认开）**：单条消息处理超过 30 秒未结束，向用户发一次 `⏳ 任务较复杂，仍在处理中，请稍候…`（每条任务只发一次）。watcher 绑在该消息自身的 task 生命周期上，完成/失败/取消均在 finally 中取消，不残留后台 task；发送失败吞掉只记 debug。`WECHATBRIDGE_PROGRESS_NOTICE=0`/`false`/`no` 关闭，阈值可用 `WECHATBRIDGE_PROGRESS_NOTICE_DELAY`（秒）调整。
 - 两个开关均在 `config.py` 解析为 `config.queue_notice` / `config.progress_notice`，默认 `true`。
 
-### Documentation
+### Fixed
 
-- `README.md` / `README.zh-CN.md` 环境变量表补充 `WECHATBRIDGE_QUEUE_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE`、`WECHATBRIDGE_PROGRESS_NOTICE_DELAY`；`deploy/wechatbridge.env.example` 同步。
+- agy 显示文本泄露服务器路径：裸 `file:///abs` URI 与 `[x](/abs)` / `[x](./rel)` 链接形式此前只剥 `[x](file:///...)`，现与 dsh 同规则只保留链接文字。
+- `FileNotFoundError` 误报：session_dir/cwd 不存在或 try 内其它 ENOENT 不再被误报为「助手不可用/未安装」。
+- 快照键不一致：`_snapshot_regular_files` 以 realpath 归一化 root，修复 `collect_session_fallback_artifacts` 前后键不匹配。
+- `multi_media_notice` 末尾补 `\n\n`，与 `cancelled_notice` 一致。
 
 ### Tests
 
 - `tests/test_hardening.py` 新增 `TestQueueAndProgressNotice`（7 条）：排队提示触发/置关不发/发送异常不破队、进度提示按时只发一次/置关不发/快任务不发/发送异常吞掉。锁顺序与 `_prune_user_locks`/`_user_lock_refs` 未动。
+- 批次一（UX error & help）：`TestUxErrorAndHelp`——FileNotFoundError → `command not found` 归类（四后端 run_* + agy subcommand）、`format_timeout_error` 各后端文案、`format_cli_error` unknown 日志与 `command not found` 提示、`/model` `/add-dir` 无参行为、登录二维码清理、price 防御解析、poll 恢复日志。
+- 批次二（artifacts & media）：`TestAgyExtractArtifactsFourModes`（agy 4 种产物引用 + 允许根/存在性门禁）、`TestSessionFallbackArtifacts`（快照回退新增/mtime/敏感排除/扩展名白名单/硬链接/软链接逃逸/共享 scratch 不扫）、`TestSendArtifactsBackZeroAndCap`（0 字节跳过 + 出站上限 10）、`TestProcessMessageMediaNotices`（不支持类型提示/空列表静默/多附件提示/原文件名透传）。
+- 本轮返修：`TestAgyDisplayStripsFilePaths`（agy 显示文本剥裸 `file:///`、`[x](file:///abs)`、`[x](/abs)`、`[x](./rel)`）、`TestAgyImportWithoutYaml`（屏蔽 yaml 后 import wechatbridge.agy 成功）、`TestSnapshotRealpathKeys`（软链接父目录下快照前后键一致）、`TestUxErrorAndHelp` 增补 FNF `e.filename` 指向 session_dir 时不误报「助手不可用」（agy + grok）、`test_fallback_scan_timeout` 改为 patch `runner_common._snapshot_regular_files`、`test_multi_media_notice` 断言提示与正文间有空行。
 
 ### Changed
 

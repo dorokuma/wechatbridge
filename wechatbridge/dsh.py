@@ -63,6 +63,10 @@ from .runner_common import (
     _snapshot_regular_files,
     collect_session_fallback_artifacts,
     merge_artifact_groups,
+    _is_cli_binary_missing,
+    _parse_bare_file_uri,
+    _strip_file_links,
+    _BARE_FILE_URI_RE,
     ARTIFACT_FALLBACK_EXTENSIONS,
     EMPTY_REPLY,
 )
@@ -331,10 +335,6 @@ _DSH_SKIP_DIR_NAMES = frozenset({
 })
 
 
-_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
-_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
-
-
 # ---------------------------------------------------------------------------
 # Persistent-session id management (codex-style resume)
 #
@@ -411,30 +411,6 @@ def clear_session_id(user_id: str) -> bool:
     return removed
 
 
-def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
-    """Parse bare file:/// URI and separate trailing CJK commentary / punctuation.
-
-    Returns:
-        tuple[str, str]: (clean_file_uri, trailing_kept_text)
-    """
-    cleaned = raw.rstrip(_TRAILING_PUNCT_CHARS)
-    punct = raw[len(cleaned):]
-    if cleaned.startswith("file://"):
-        full_path = unquote(cleaned[len("file://"):])
-        if full_path.startswith("/") and os.path.exists(full_path):
-            return cleaned, punct
-    last_slash = cleaned.rfind("/")
-    cjk_kept = ""
-    if last_slash != -1:
-        basename = cleaned[last_slash + 1:]
-        if re.search(r"[a-zA-Z0-9._~%+=:-][\u4e00-\u9fff]+$", basename):
-            cjk_m = re.search(r"[\u4e00-\u9fff]+$", basename)
-            if cjk_m:
-                cjk_kept = cjk_m.group(0)
-                cleaned = cleaned[:-len(cjk_kept)]
-    return cleaned, cjk_kept + punct
-
-
 def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
     """Extract (name, absolute_path) tuples of file references from dsh output.
 
@@ -490,26 +466,6 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
     return result
-
-
-def _strip_file_links(display: str) -> str:
-    """Remove file:/// and absolute/relative link targets from display text
-    so server paths never leak to WeChat users."""
-    out = re.sub(
-        r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((?:file:///|/|\.\.?/)(?:[^()\s]|\([^()\s]*\))+\)",
-        r"[\1]",
-        display,
-    )
-    out = re.sub(
-        r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)",
-        r"[\1]",
-        out,
-    )
-    def _replace_bare(m: re.Match) -> str:
-        _, kept = _parse_bare_file_uri(m.group(0))
-        return kept
-
-    return _BARE_FILE_URI_RE.sub(_replace_bare, out)
 
 
 def _build_dsh_command(prompt: str, task_as_env: bool = False) -> list:
@@ -947,9 +903,18 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         raise
 
     except FileNotFoundError as e:
-        logger.error("CLI binary not found for %s: %s", "dsh", e)
         await terminate_process(process, graceful=False)
-        err = format_cli_error("command not found", backend="dsh")
+        if _is_cli_binary_missing(e, config.dsh_binary_path):
+            logger.error("CLI binary not found for %s: %s", "dsh", e)
+            err = format_cli_error("command not found", backend="dsh")
+            if not resume_mode and notice_bubble:
+                return f"{notice_bubble}\n\n{err}", []
+            return err, []
+        logger.exception("Unexpected error running dsh: %s", e)
+        err = format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        )
         if not resume_mode and notice_bubble:
             return f"{notice_bubble}\n\n{err}", []
         return err, []
