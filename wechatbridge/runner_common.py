@@ -156,12 +156,36 @@ _SENSITIVE_ARTIFACT_DIR_NAMES = frozenset({
 })
 
 
+def _host_home() -> str:
+    """Bridge process home (machine-wide), not a per-user session HOME.
+
+    Same resolution as ``grok._host_grok_dir`` / ``codex._host_codex_dir`` —
+    kept here (no import) to avoid a module cycle.
+    """
+    return os.environ.get("WECHATBRIDGE_HOST_HOME") or os.path.expanduser("~")
+
+
 def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool:
     """Return True if *candidate_real* contains the raw bytes of any session
     credential / state file (defending against copy/rename to an innocent filename
-    such as ``token.copy`` or ``scratch/out.txt``)."""
-    if not sess_real:
-        return False
+    such as ``token.copy`` or ``scratch/out.txt``).
+
+    The host dsh ``.credentials.yaml`` and host grok/codex ``auth.json`` are
+    checked even when *sess_real* is empty/missing: those child processes run
+    with the machine-wide host home (``WECHATBRIDGE_HOST_HOME`` or ``~``),
+    same UID as the bridge, and can copy those files under innocent names.
+
+    Per-session files are only consulted when *sess_real* is non-empty:
+    joining onto an empty base yields relative paths (``AGENTS.md``,
+    ``prefs.json``, …) that ``os.path.exists`` resolves against the bridge
+    process CWD, which could match unrelated files.
+
+    Inherent boundary: this check only blocks whole-file verbatim copies,
+    renames, or splices. It does not stop exfiltration of a single extracted
+    field, an encoded/transformed variant, or a credential that is truncated
+    before matching — secrets are read up to 64KiB and candidates up to
+    256KiB, so anything beyond those caps is never compared.
+    """
     try:
         st = os.lstat(candidate_real)
         if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 256 * 1024:
@@ -169,19 +193,36 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
     except OSError:
         return False
 
-    secret_files = (
-        os.path.join(sess_real, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
-        os.path.join(sess_real, ".gemini", "antigravity-oauth-token"),
-        os.path.join(sess_real, ".grok", "auth.json"),
-        os.path.join(sess_real, ".codex", "auth.json"),
-        os.path.join(sess_real, "prefs.json"),
-        os.path.join(sess_real, ".codex_thread_id"),
-        os.path.join(sess_real, "grok_persona.txt"),
-        os.path.join(sess_real, ".gemini", "GEMINI.md"),
-        os.path.join(sess_real, "GEMINI.md"),
-        os.path.join(sess_real, "AGENTS.md"),
-        os.path.join(sess_real, ".dsh", "dsh_session_id"),
-    )
+    secret_files = []
+    if sess_real:
+        secret_files += [
+            os.path.join(sess_real, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+            os.path.join(sess_real, ".gemini", "antigravity-oauth-token"),
+            os.path.join(sess_real, ".grok", "auth.json"),
+            os.path.join(sess_real, ".codex", "auth.json"),
+            os.path.join(sess_real, "prefs.json"),
+            os.path.join(sess_real, ".codex_thread_id"),
+            os.path.join(sess_real, "grok_persona.txt"),
+            os.path.join(sess_real, ".gemini", "GEMINI.md"),
+            os.path.join(sess_real, "GEMINI.md"),
+            os.path.join(sess_real, "AGENTS.md"),
+        ]
+        # Real dsh per-user session id lives under dsh_state_dir
+        # (<dsh_state>/<sanitize_user_id(uid)>/dsh_session_id), not under
+        # session_dir — sess_real's basename IS sanitize_user_id(uid) since
+        # session_dir = session_base_dir/<sanitize_user_id(uid)>.
+        secret_files.append(
+            os.path.join(
+                get_dsh_state_dir(), os.path.basename(sess_real), "dsh_session_id"
+            )
+        )
+    # Machine-wide host credentials — independent of session dir: the dsh
+    # child reads the host DSH_HOME, and grok/codex children read the host
+    # ~/.grok / ~/.codex (same UID as the bridge).
+    host_home = _host_home()
+    secret_files.append(os.path.join(host_dsh_home(), ".credentials.yaml"))
+    secret_files.append(os.path.join(host_home, ".grok", "auth.json"))
+    secret_files.append(os.path.join(host_home, ".codex", "auth.json"))
     cand_bytes: bytes | None = None
     for sf in secret_files:
         try:
@@ -252,7 +293,7 @@ def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
         if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in norm_parts[:-1] if p == ".gemini"):
             return True
 
-    if sess_real and _matches_session_secret_content(real, sess_real):
+    if _matches_session_secret_content(real, sess_real):
         return True
     return False
 

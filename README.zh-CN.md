@@ -22,7 +22,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 - 运行时切换后端：`/backend agy`、`/backend grok`、`/backend codex` 或 `/backend dsh`（真正切换时清除该后端续聊状态——agy/grok 的续聊标记与 codex 的 `thread_id`/resume 状态——下次 CLI 起新会话；磁盘上的历史文件不会立刻抹掉）
 - slash 指令：模型、清会话、人格等（见下表）
 - 危险提示闸门：对**明确破坏性关键词/模式**先确认再跑（不是全语义理解）
-- 白名单 `WECHATBRIDGE_ALLOWED_SENDERS`（空 = 全开）
+- 白名单 `WECHATBRIDGE_ALLOWED_SENDERS`（非空 = 仅列表内用户，`*` = 全开；空 = 仅管理员，管理员也为空 = 拒绝所有人）
 - `/mcp` 只回使用说明；`/agent` 改写成自然语言子助手提示再交给当前引擎（**不是**桥内原生扩展协议）
 - 媒体走微信 CDN，AES-128-ECB 加解密
 - 多实例：一套代码，用 `WECHATBRIDGE_INSTANCE` 区分进程（state / 会话 / 二维码路径由实例名派生）
@@ -159,7 +159,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `WECHATBRIDGE_DSH_STATE_DIR` | _派生_ | 桥私有 dsh 状态目录（记忆 JSONL 与持久会话 ID；默认 `~/.local/share/wechatbridge/<实例名>/dsh_state`） |
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
-| `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔（空 = 全开） |
+| `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔；`*` = 全开；空 = 仅 `WECHATBRIDGE_ADMINS` 成员（管理员也为空则拒绝所有人） |
 | `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（agy / grok / codex 后端） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信文件大小上限（100 MB） |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | 入站图片/文件下载后上限（20 MB） |
@@ -201,6 +201,8 @@ curl -fsSL https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/u
 数据存放在 `~/.local/share/wechatbridge/<实例名>/`（会话、SQLite 历史、二维码、登录态），升级**不会**影响——你的 bot 保持登录，对话不丢失。
 
 升级 **major** 或 **minor** 版本（例如 1.2 → 1.3）前，请先查阅 [`CHANGELOG.md`](CHANGELOG.md) 中对应版本的破坏性变更和迁移步骤。
+
+> **升级到 1.8.0 前**：请在 `.env` 中配置 `WECHATBRIDGE_ADMINS` 或 `WECHATBRIDGE_ALLOWED_SENDERS`——1.8.0 起两者都为空时会拒绝所有用户（如需保持全开，请设置 `WECHATBRIDGE_ALLOWED_SENDERS=*`）。
 
 ## 部署
 
@@ -298,7 +300,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 
 ## 运维与安全（桥实际管到的）
 
-- **白名单优先。** `WECHATBRIDGE_ALLOWED_SENDERS` 为空 = 能私聊机器人的人都能用。
+- **白名单优先。** `WECHATBRIDGE_ALLOWED_SENDERS` 为空 = 仅 `WECHATBRIDGE_ADMINS` 成员可用；设为 `*` 才是全开，两者都空则拒绝所有人。
 - **CLI 自动批准。** agy 带 `--dangerously-skip-permissions`；grok 带 `--always-approve`（planning 模式除外）；dsh 的模型工具无宿主路径约束。只适合可信用户，不是多租户沙箱。
 - **危险闸门是关键词匹配**，不是完整意图识别。默认针对具体模式（如 `rm -rf /`、管道进 shell、`mkfs`、`format c:`、少量重型中文句式等）。日常里单独一个「删除」**不会**拦。可用 `WECHATBRIDGE_CONFIRM_KEYWORDS` 自定义；确认口令 `WECHATBRIDGE_CONFIRM_TOKEN`（默认 `y`），等待 `WECHATBRIDGE_PENDING_TTL`。
 - **入站媒体**有大小上限（默认 20 MB）、流式下载、CDN 域名白名单；缺 `aes_key` 会明确报错。

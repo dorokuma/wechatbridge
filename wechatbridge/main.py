@@ -874,6 +874,65 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
 
 
 # ---------------------------------------------------------------------------
+# Access control (fail-closed whitelist)
+# ---------------------------------------------------------------------------
+def _sender_allowed(from_user: str) -> bool:
+    """Whitelist decision.
+
+    - Non-empty ``WECHATBRIDGE_ALLOWED_SENDERS`` → only listed users
+      (single item ``*`` = explicit allow-all).
+    - Empty whitelist → only ``WECHATBRIDGE_ADMINS`` members.
+    - Both empty → deny everyone (fail-closed).
+    """
+    allowed = config.allowed_senders
+    if allowed:
+        if len(allowed) == 1 and allowed[0] == "*":
+            return True
+        return from_user in allowed
+    admins = config.admin_users
+    if admins:
+        return from_user in admins
+    return False
+
+
+def _log_access_control_state() -> None:
+    """One startup log line describing the active access-control mode.
+
+    Never prints raw wxid lists — counts only.
+    """
+    allowed = config.allowed_senders
+    admins = config.admin_users
+    if allowed and len(allowed) == 1 and allowed[0] == "*":
+        logger.warning(
+            "访问控制：WECHATBRIDGE_ALLOWED_SENDERS='*'，已显式放开给所有用户——"
+            "任何能私聊机器人的人都可使用，请确认这是预期配置"
+        )
+    elif allowed:
+        if "*" in allowed:
+            logger.warning(
+                "访问控制：WECHATBRIDGE_ALLOWED_SENDERS 中 '*' 与其它项混用——"
+                "'*' 仅在单独配置时表示放开所有人，混用时被当成一个字面 wxid "
+                "（永远匹配不到真实用户），请检查配置"
+            )
+        logger.info(
+            "访问控制：白名单已启用（%d 个用户），管理员 %d 个",
+            len(allowed), len(admins),
+        )
+    elif admins:
+        logger.info(
+            "访问控制：白名单为空，仅 %d 个管理员可用；"
+            "如需放开请配置 WECHATBRIDGE_ALLOWED_SENDERS 或显式设 '*'",
+            len(admins),
+        )
+    else:
+        logger.warning(
+            "访问控制：WECHATBRIDGE_ALLOWED_SENDERS 与 WECHATBRIDGE_ADMINS 均为空，"
+            "当前拒绝所有用户；请配置白名单/管理员，或显式设 "
+            "WECHATBRIDGE_ALLOWED_SENDERS=* 放开"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Message processing
 # ---------------------------------------------------------------------------
 async def process_message(client: ILinkClient, msg: dict) -> None:
@@ -931,7 +990,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         return
 
     # ---- Whitelist check (before any processing) ----
-    if config.allowed_senders and from_user not in config.allowed_senders:
+    if not _sender_allowed(from_user):
         await client.send_message(
             to_user_id=from_user,
             text="⛔ **未授权用户** ⛔\n联系管理员添加白名单。",
@@ -1209,7 +1268,9 @@ def clean_scratch():
     removed = clean_session_media()  # images/files + safe session temps (A+C)
     if removed:
         logger.info("Session temp cleanup: removed %d files", removed)
-    _prune_user_locks()
+    # NOTE: _prune_user_locks() must NOT run here — clean_scratch() executes in a
+    # worker thread (asyncio.to_thread) while user_locks is event-loop state.
+    # Callers run the prune synchronously after the to_thread await returns.
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1283,8 @@ async def periodic_clean_scratch():
             await asyncio.sleep(3600)
             # 同步文件遍历放到线程池，避免阻塞事件循环卡死长轮询心跳
             await asyncio.to_thread(clean_scratch)
+            # user_locks 是事件循环状态：prune 只能在协程里同步做
+            _prune_user_locks()
         except Exception as e:
             logger.exception("periodic_clean_scratch error: %s", e)
 
@@ -1229,8 +1292,11 @@ async def periodic_clean_scratch():
 async def main_loop() -> None:
     """Main daemon loop: manages state, QR login, and message receiving."""
     ensure_runtime_dirs()
+    _log_access_control_state()
     # 同步文件遍历放到线程池，避免阻塞事件循环
     await asyncio.to_thread(clean_scratch)
+    # user_locks 是事件循环状态：prune 只能在协程里同步做
+    _prune_user_locks()
     if config.update_check_enabled:
         _spawn_bg(update_check_loop())
     _spawn_bg(periodic_clean_scratch())
@@ -1334,6 +1400,9 @@ async def main_loop() -> None:
 # Per-user async execution lock, global concurrency gate, background spawner
 # ---------------------------------------------------------------------------
 user_locks: dict = {}
+# Per-user pending-task refcount: +1 before taking the lock, -1 in finally.
+# _prune_user_locks may only remove entries whose count is 0.
+_user_lock_refs: dict = {}
 _global_task_sem: asyncio.Semaphore | None = None
 
 
@@ -1346,8 +1415,19 @@ def _get_global_sem() -> asyncio.Semaphore:
 
 
 def _prune_user_locks() -> None:
-    """Drop idle per-user locks so the dict does not grow forever."""
-    idle = [uid for uid, lock in user_locks.items() if not lock.locked()]
+    """Drop idle per-user locks so the dict does not grow forever.
+
+    Event-loop thread only. A lock counts as busy when it is held OR when any
+    message task for that user is queued waiting for it — the refcount below
+    covers the gap where the previous holder already released but the waiter
+    has not been scheduled yet (``lock.locked()`` is False there, and deleting
+    the lock would let the next message for that user create a fresh lock and
+    break serialization).
+    """
+    idle = [
+        uid for uid, lock in user_locks.items()
+        if not lock.locked() and _user_lock_refs.get(uid, 0) == 0
+    ]
     for uid in idle:
         user_locks.pop(uid, None)
 
@@ -1376,40 +1456,46 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
     if from_user not in user_locks:
         user_locks[from_user] = asyncio.Lock()
 
-    async with user_locks[from_user]:
-        # C/B before global slot — do not sleep while holding a concurrent slot
-        await _await_upstream_preflight(client, from_user, context_token)
+    _user_lock_refs[from_user] = _user_lock_refs.get(from_user, 0) + 1
+    try:
+        async with user_locks[from_user]:
+            # C/B before global slot — do not sleep while holding a concurrent slot
+            await _await_upstream_preflight(client, from_user, context_token)
 
-        try:
-            await asyncio.wait_for(sem.acquire(), timeout=0.05)
-        except asyncio.TimeoutError:
-            logger.warning("并发已满，拒绝处理 from=%s", from_user)
-            if context_token and from_user:
-                try:
-                    await client.send_message(
-                        to_user_id=from_user,
-                        text=_BUSY_USER_TEXT,
-                        context_token=context_token,
-                        baseurl=client.state.baseurl,
-                        bot_token=client.state.bot_token,
-                    )
-                except Exception as e:
-                    logger.warning("发送繁忙提示失败: %s", e)
-            return
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=0.05)
+            except asyncio.TimeoutError:
+                logger.warning("并发已满，拒绝处理 from=%s", from_user)
+                if context_token and from_user:
+                    try:
+                        await client.send_message(
+                            to_user_id=from_user,
+                            text=_BUSY_USER_TEXT,
+                            context_token=context_token,
+                            baseurl=client.state.baseurl,
+                            bot_token=client.state.bot_token,
+                        )
+                    except Exception as e:
+                        logger.warning("发送繁忙提示失败: %s", e)
+                return
 
-        slot = _GlobalSlot(sem)
-        token = _global_slot_ctx.set(slot)
-        try:
-            await process_message(client, msg)
-        except Exception as e:
-            logger.exception("处理消息异常 (from=%s): %s", from_user, e)
-        finally:
-            _global_slot_ctx.reset(token)
-            # Only release if this task still owns the slot (A backoff may have
-            # temporarily released; sleep_released re-acquires before return).
-            if slot.held:
-                sem.release()
-                slot.held = False
+            slot = _GlobalSlot(sem)
+            token = _global_slot_ctx.set(slot)
+            try:
+                await process_message(client, msg)
+            except Exception as e:
+                logger.exception("处理消息异常 (from=%s): %s", from_user, e)
+            finally:
+                _global_slot_ctx.reset(token)
+                # Only release if this task still owns the slot (A backoff may have
+                # temporarily released; sleep_released re-acquires before return).
+                if slot.held:
+                    sem.release()
+                    slot.held = False
+    finally:
+        _user_lock_refs[from_user] = _user_lock_refs.get(from_user, 1) - 1
+        if _user_lock_refs.get(from_user, 0) <= 0:
+            _user_lock_refs.pop(from_user, None)
 
 
 # ---------------------------------------------------------------------------

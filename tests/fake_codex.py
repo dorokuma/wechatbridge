@@ -172,6 +172,13 @@ def main():
         bundled = "--bundled" in args
         return _emit_debug_models(bundled=bundled)
 
+    # "--" separates options from the positional prompt (bridge always sends
+    # it so '-…' prompts are not parsed as flags). Drop only the FIRST one —
+    # the prompt itself may be a literal "--" and must survive.
+    if "--" in args:
+        i = args.index("--")
+        args = args[:i] + args[i + 1:]
+
     if "exec" in args:
         args = args[args.index("exec") + 1:]
 

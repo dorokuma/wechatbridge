@@ -22,7 +22,7 @@ The bridge process stays up and long-polls iLink. For prompts that go to a CLI, 
 - Runtime backend switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh` (clears that backend's continuation state — the agy/grok continuation flag and the codex `thread_id`/resume state — so the next CLI turn starts a fresh session; history files on disk are not wiped immediately)
 - Slash commands for model, session reset, persona, and more (see below)
 - Dangerous-prompt gate: a **keyword list** of concrete destructive patterns asks for confirmation before run
-- Sender whitelist (`WECHATBRIDGE_ALLOWED_SENDERS`; empty = allow all)
+- Sender whitelist (`WECHATBRIDGE_ALLOWED_SENDERS`; non-empty = listed users only, `*` = allow all; empty = admins only, deny all when no admins)
 - `/mcp` returns short usage text; `/agent` rewrites into a natural-language subagent prompt for the CLI (not a native MCP bridge)
 - Media over WeChat CDN with AES-128-ECB encrypt/decrypt
 - Multi-instance: one codebase, set `WECHATBRIDGE_INSTANCE` per process (state / session / QR paths derive from it)
@@ -159,7 +159,7 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_DSH_STATE_DIR` | _derived_ | bridge-private dsh state directory (memory JSONL and persistent session IDs; defaults to `~/.local/share/wechatbridge/<instance>/dsh_state`) |
 | `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
-| `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs (empty = allow all) |
+| `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs; `*` = allow all; empty = only `WECHATBRIDGE_ADMINS` users (deny all if that is empty too) |
 | `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (agy / grok / codex backends) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
@@ -201,6 +201,8 @@ The script upgrades the pipx installation and restarts the service. If the servi
 Data lives under `~/.local/share/wechatbridge/<instance>/` (sessions, SQLite history, QR codes, login state) and is **not** touched during upgrade — your bots stay logged in and conversations are preserved.
 
 Before upgrading a **major** or **minor** version (e.g. 1.2 → 1.3), check the corresponding section in [`CHANGELOG.md`](CHANGELOG.md) for breaking changes and migration steps.
+
+> **Before upgrading to 1.8.0:** configure `WECHATBRIDGE_ADMINS` or `WECHATBRIDGE_ALLOWED_SENDERS` in your `.env` — since 1.8.0 the whitelist denies everyone when both are empty (set `WECHATBRIDGE_ALLOWED_SENDERS=*` to keep allowing all users).
 
 ## Deploy
 
@@ -298,7 +300,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 
 ## Ops & security (what the bridge actually enforces)
 
-- **Whitelist first.** Empty `WECHATBRIDGE_ALLOWED_SENDERS` means anyone who can message the bot can use it.
+- **Whitelist first.** Empty `WECHATBRIDGE_ALLOWED_SENDERS` means only `WECHATBRIDGE_ADMINS` members can use the bridge (everyone when the list is `*`, no one when both are empty).
 - **Auto-approve CLIs.** agy runs with `--dangerously-skip-permissions`; grok with `--always-approve` (unless planning mode); dsh tools run without host path restrictions. Treat this as trusted-user tooling, not a multi-tenant sandbox.
 - **Danger gate is keyword-based**, not full intent understanding. Defaults target concrete patterns (`rm -rf /`, pipe-to-shell, `mkfs`, `format c:`, a few heavy Chinese phrases, …). Everyday wording like bare “delete” is **not** gated. Override list via `WECHATBRIDGE_CONFIRM_KEYWORDS`; approve with `WECHATBRIDGE_CONFIRM_TOKEN` (default `y`), TTL `WECHATBRIDGE_PENDING_TTL`.
 - **Inbound media** is size-capped (default 20 MB), streamed, and CDN hosts are allowlisted. Missing `aes_key` returns a clear error.

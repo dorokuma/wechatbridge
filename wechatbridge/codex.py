@@ -497,11 +497,13 @@ def _build_codex_command(prompt: str, prefs: dict, first: bool, thread_id: str =
         if d:
             cmd += ["--add-dir", d]
 
-    # Session continuation: resume is a subcommand, options must precede it
+    # Session continuation: resume is a subcommand, options must precede it.
+    # "--" before the prompt keeps messages that start with '-' (e.g. "--help")
+    # from being parsed as CLI options.
     if not first:
-        cmd += ["resume", thread_id, prompt]
+        cmd += ["resume", thread_id, "--", prompt]
     else:
-        cmd += [prompt]
+        cmd += ["--", prompt]
     return cmd
 
 

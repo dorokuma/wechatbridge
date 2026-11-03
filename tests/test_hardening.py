@@ -1347,6 +1347,52 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
             rel_b.set()
             await asyncio.gather(t_a, t_b, return_exceptions=True)
 
+    async def test_prune_keeps_lock_for_queued_user(self):
+        """同 user：一条处理中、一条等锁时，prune 不得删除该用户的锁。
+
+        回归：锁刚释放、等待者还没被唤醒时 lock.locked() 为 False，此时删锁
+        会让后来者拿到新锁、打破串行。用 Lock 子类在 release() 里同步调
+        prune——release() 在事件循环内同步执行，正好落在「已释放、等待者
+        尚未被唤醒」的空隙，无需手动 release。
+        """
+        release = asyncio.Event()
+        started, observed, entered = [], [], []
+        main = self.main
+
+        class _ProbingLock(asyncio.Lock):
+            async def acquire(self):
+                entered.append(1)  # t2 已抵达锁等待点（t1 仍持有锁）
+                return await super().acquire()
+
+            def release(self):
+                super().release()
+                # 同步调用：此刻等待者必然还没被唤醒
+                main._prune_user_locks()
+                observed.append("alice" in main.user_locks)
+
+        async def _pm(client, msg):
+            started.append(msg.get("from_user_id"))
+            await release.wait()
+
+        main.user_locks["alice"] = _ProbingLock()
+        client = self._client()
+        with mock.patch.object(main, "process_message", new=_pm):
+            t1 = asyncio.create_task(main._safe_process_message(client, self._msg("alice")))
+            t2 = asyncio.create_task(main._safe_process_message(client, self._msg("alice")))
+            try:
+                await self._pump_until(lambda: len(started) >= 1)
+                # 确定性等待：t1、t2 都已进入 acquire——t1 持锁，t2 在等锁
+                await self._pump_until(lambda: len(entered) >= 2)
+            finally:
+                release.set()
+                await asyncio.gather(t1, t2)
+        # 每次 release 后的空隙里，alice 的锁都必须存活
+        self.assertTrue(observed)
+        self.assertTrue(all(observed), "等待者未唤醒时 prune 不得删除该锁")
+        # 全部完成后 prune 可以清掉空闲锁
+        main._prune_user_locks()
+        self.assertNotIn("alice", main.user_locks)
+
 
 class TestFormatCliErrorRateQuota(unittest.TestCase):
     """Split eligibility/429/quota so users are not told they spam when
@@ -2174,11 +2220,6 @@ class TestPreflightBeforeSlot(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("🔔" in t for t in sent))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class TestClassifyCliError(unittest.TestCase):
     """_classify_cli_error returns correct category for each error pattern."""
 
@@ -2849,6 +2890,54 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_access_control_env_warning(self):
+        """Extract check_access_control_env from update.sh and run it against
+        temp env files: warn when no active whitelist/admin line, stay quiet
+        when ADMINS is configured."""
+        import re
+        import subprocess
+        m = re.search(
+            r"(?ms)^(check_access_control_env\(\)\s*\{.*?^\})",
+            self.script_content,
+        )
+        self.assertIsNotNone(
+            m, "Could not extract check_access_control_env from update.sh"
+        )
+        func_src = m.group(1)
+        with tempfile.TemporaryDirectory() as td:
+            home = os.path.join(td, "home")
+            cfg = os.path.join(home, ".config", "wechatbridge")
+            os.makedirs(cfg)
+            env_file = os.path.join(cfg, ".env")
+            # Stub `eval` so `eval echo "~user"` returns our temp home
+            # (the real expansion would point at the caller's home).
+            wrapper = (
+                func_src
+                + '\nTARGET_USER="t_wb_user"'
+                + f"\neval() {{ echo {home!r}; }}"
+                + "\ncheck_access_control_env"
+            )
+
+            def _run():
+                return subprocess.run(
+                    ["bash", "-c", wrapper],
+                    capture_output=True, text=True,
+                ).stdout
+
+            # 两项都未有效配置 → 打印警告
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write(
+                    "# WECHATBRIDGE_ALLOWED_SENDERS=wxid_a\n"
+                    "WECHATBRIDGE_ALLOWED_SENDERS=\n"
+                    "WECHATBRIDGE_ADMINS=\n"
+                )
+            self.assertIn("WARNING", _run())
+
+            # 已配 ADMINS → 不警告
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write("WECHATBRIDGE_ADMINS=wxid_admin\n")
+            self.assertNotIn("WARNING", _run())
+
 
 class _FakeAgyProc:
     def __init__(self, stdout: str, stderr: str, rc: int = 0, pid: int = 4242):
@@ -3256,6 +3345,153 @@ class TestAuditHardeningFixes(unittest.IsolatedAsyncioTestCase):
             p_out,
             "read [blocked-path] [blocked-path] [blocked-path] [blocked-path]",
         )
+
+
+class TestAccessControlFailClosed(unittest.IsolatedAsyncioTestCase):
+    """Fail-closed whitelist regression (v1.8.0 breaking change).
+
+    Empty WECHATBRIDGE_ALLOWED_SENDERS no longer means allow-all:
+    only WECHATBRIDGE_ADMINS members pass; both empty = deny everyone.
+    "*" remains the explicit opt-in for open access.
+    """
+
+    def setUp(self):
+        from wechatbridge import main as main_mod
+        self.main = main_mod
+        self._orig_allowed = main_mod.config.allowed_senders
+        self._orig_admins = main_mod.config.admin_users
+
+    def tearDown(self):
+        self.main.config.allowed_senders = self._orig_allowed
+        self.main.config.admin_users = self._orig_admins
+
+    def _client(self):
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://example.test"
+        client.state.bot_token = "tok"
+        client.send_message = AsyncMock(return_value=True)
+        return client
+
+    def _msg(self, uid):
+        return {
+            "from_user_id": uid,
+            "context_token": "ctx-" + uid,
+            "item_list": [{"type": 1, "text_item": {"text": "hello"}}],
+        }
+
+    async def test_empty_whitelist_fail_closed(self):
+        """空白名单 + 空管理员 → 非管理员被拒；顺带断言管理员放行与 '*' 放行。"""
+        from wechatbridge import main as main_mod
+
+        sent_texts = []
+
+        async def _cap(**kwargs):
+            sent_texts.append(kwargs.get("text") or "")
+            return True
+
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=_cap)
+
+        # 空白名单 + 空管理员：拒绝所有人
+        self.main.config.allowed_senders = []
+        self.main.config.admin_users = []
+        await main_mod.process_message(client, self._msg("random-user"))
+        self.assertTrue(any("未授权用户" in t for t in sent_texts))
+
+        # 空白名单 + 有管理员：管理员放行、非管理员被拒
+        sent_texts.clear()
+        self.main.config.admin_users = ["admin-1"]
+        with mock.patch.object(
+            main_mod, "gate_and_run", new=AsyncMock(return_value=("ok", []))
+        ) as gr:
+            await main_mod.process_message(client, self._msg("admin-1"))
+            gr.assert_awaited()
+        await main_mod.process_message(client, self._msg("random-user"))
+        self.assertTrue(any("未授权用户" in t for t in sent_texts))
+
+        # "*" 显式放开：任何人放行
+        sent_texts.clear()
+        self.main.config.allowed_senders = ["*"]
+        self.main.config.admin_users = []
+        with mock.patch.object(
+            main_mod, "gate_and_run", new=AsyncMock(return_value=("ok", []))
+        ) as gr:
+            await main_mod.process_message(client, self._msg("random-user"))
+            gr.assert_awaited()
+        self.assertFalse(any("未授权用户" in t for t in sent_texts))
+
+
+class TestDshHostCredentialContentMatch(unittest.TestCase):
+    """Regression: host credential content blocks renamed artifacts.
+
+    The dsh child process reads the machine-wide DSH_HOME, and grok/codex
+    children read the host ~/.grok / ~/.codex — all under the same UID as
+    the bridge. A file copied out of any of them under an innocent name
+    must still be rejected, even when the session dir contributes no
+    secret files.
+    """
+
+    def test_host_credentials_content_blocks_renamed_artifact(self):
+        from wechatbridge import runner_common as rc
+
+        with tempfile.TemporaryDirectory() as td:
+            host_home = os.path.join(td, "dsh_home")
+            sess_dir = os.path.join(td, "session")
+            os.makedirs(host_home)
+            os.makedirs(sess_dir)
+            fake_dsh_cred = b"\n".join([
+                b"provider: deepseek",
+                b"model: fake-dsh-model",
+                b"base_url: https://api.example.invalid/v1",
+                b"token: t-" + b"x" * 20,
+            ]) + b"\n"
+            with open(os.path.join(host_home, ".credentials.yaml"), "wb") as f:
+                f.write(fake_dsh_cred)
+            # dsh 子进程复制/改名后的文件，落在会话目录内
+            out_txt = os.path.join(sess_dir, "out.txt")
+            with open(out_txt, "wb") as f:
+                f.write(b"prefix\n" + fake_dsh_cred + b"suffix\n")
+
+            with mock.patch.object(rc, "host_dsh_home", return_value=host_home):
+                self.assertTrue(rc.is_sensitive_artifact_path(out_txt, sess_dir))
+                # 会话目录为空串时宿主凭据内容匹配仍生效
+                self.assertTrue(rc.is_sensitive_artifact_path(out_txt, ""))
+
+    def test_host_grok_codex_credentials_block_renamed_artifact(self):
+        """Host ~/.grok/auth.json and ~/.codex/auth.json content must also
+        block renamed artifacts (children share the bridge UID and can copy
+        host files into the session dir)."""
+        from wechatbridge import runner_common as rc
+
+        with tempfile.TemporaryDirectory() as td:
+            host_home = os.path.join(td, "host")
+            sess_dir = os.path.join(td, "session")
+            os.makedirs(os.path.join(host_home, ".grok"))
+            os.makedirs(os.path.join(host_home, ".codex"))
+            os.makedirs(sess_dir)
+            grok_secret = b"{" + b"grok" * 40 + b"}"
+            codex_secret = b"{" + b"codex" * 40 + b"}"
+            with open(os.path.join(host_home, ".grok", "auth.json"), "wb") as f:
+                f.write(grok_secret)
+            with open(os.path.join(host_home, ".codex", "auth.json"), "wb") as f:
+                f.write(codex_secret)
+            # grok/codex 子进程改名复制后的文件
+            g_out = os.path.join(sess_dir, "notes.txt")
+            c_out = os.path.join(sess_dir, "result.md")
+            with open(g_out, "wb") as f:
+                f.write(b"x\n" + grok_secret + b"\n")
+            with open(c_out, "wb") as f:
+                f.write(codex_secret + b"\nend")
+
+            with mock.patch.dict(
+                os.environ, {"WECHATBRIDGE_HOST_HOME": host_home}, clear=False
+            ):
+                self.assertTrue(rc.is_sensitive_artifact_path(g_out, sess_dir))
+                self.assertTrue(rc.is_sensitive_artifact_path(c_out, sess_dir))
+                # 会话目录为空串时宿主凭据内容匹配仍生效
+                self.assertTrue(rc.is_sensitive_artifact_path(g_out, ""))
+                self.assertTrue(rc.is_sensitive_artifact_path(c_out, ""))
 
 
 if __name__ == "__main__":

@@ -49,6 +49,39 @@ else
     run_pipx install wechatbridge-cli
 fi
 
+# --- Helper: warn when the target user's env has no access control ---
+# Since 1.8.0 the whitelist is fail-closed: an env file without an active
+# WECHATBRIDGE_ALLOWED_SENDERS or WECHATBRIDGE_ADMINS denies everyone.
+# Prints a warning only — never blocks the upgrade, never reads other values.
+check_access_control_env() {
+    # Resolve the target user's home the same way pipx does for them
+    # (~ expansion by the target user's passwd entry).
+    local target_home env_file
+    target_home="$(eval echo "~${TARGET_USER}" 2>/dev/null || true)"
+    if [ -z "$target_home" ]; then
+        echo "(cannot resolve home for '$TARGET_USER'; skipping access-control check)"
+        return 0
+    fi
+    env_file="$target_home/.config/wechatbridge/.env"
+    if [ ! -f "$env_file" ]; then
+        echo "(no $env_file found; skipping access-control check)"
+        return 0
+    fi
+    # Active line = not commented out and value non-empty.
+    if ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ALLOWED_SENDERS[[:space:]]*=[[:space:]]*[^[:space:]#]' "$env_file" \
+        && ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ADMINS[[:space:]]*=[[:space:]]*[^[:space:]#]' "$env_file"; then
+        echo ""
+        echo "==============================================================="
+        echo "  WARNING: no active WECHATBRIDGE_ALLOWED_SENDERS or"
+        echo "  WECHATBRIDGE_ADMINS found in $env_file"
+        echo "  Since 1.8.0 the whitelist denies everyone by default —"
+        echo "  this config rejects ALL users. Set WECHATBRIDGE_ADMINS or"
+        echo "  WECHATBRIDGE_ALLOWED_SENDERS (use '*' to allow everyone)."
+        echo "==============================================================="
+        echo ""
+    fi
+}
+
 # --- Print new version ---
 echo "---"
 if [ "$CURRENT_USER" != "$TARGET_USER" ]; then
@@ -90,6 +123,8 @@ else
 fi
 
 # --- Done ---
+check_access_control_env
+
 echo ""
 echo "=== WeChatBridge upgrade complete ==="
 echo "To watch logs:"
