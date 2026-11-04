@@ -2955,74 +2955,65 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
         self.assertFalse(self._test_full_match("   package wechatbridge-foo 1.6.0, installed using Python 3.13.5\n"))
         self.assertFalse(self._test_full_match("   package wechatbridge 1.6.0, installed using Python 3.13.5\n"))
 
+    @staticmethod
+    def _read_log(p):
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def _update_sh_mocks(self, td):
+        """Isolated mocks in td; returns (pipx_log, git_log, systemctl_log)."""
+        log_file = os.path.join(td, "pipx.log")
+        git_log = os.path.join(td, "git.log")
+        systemctl_log = os.path.join(td, "systemctl.log")
+
+        def _write(name, body):
+            with open(os.path.join(td, name), "w", encoding="utf-8") as f:
+                f.write(body)
+            os.chmod(os.path.join(td, name), 0o755)
+
+        _write("pipx", (
+            "#!/usr/bin/env bash\n"
+            'echo "$*" >> "$PIPX_LOG"\n'
+            'if [ "$1" = "list" ]; then\n'
+            '  [ "${2:-}" = "--short" ] && echo "$MOCK_PIPX_SHORT"\n'
+            '  if [ "${2:-}" = "--json" ]; then echo "$MOCK_PIPX_JSON"; [ "$MOCK_PIPX_JSON_OK" = "1" ] && exit 0; exit 1; fi\n'
+            '  echo "$MOCK_PIPX_FULL"; exit 0\n'
+            "fi\n"
+            "exit 0\n"
+        ))
+        _write("git", (
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-C" ] && [ "$3" = "pull" ]; then echo "$*" >> "$GIT_LOG"; [ "$MOCK_GIT_FAIL" = "1" ] && exit 1; exit 0; fi\n'
+            'exec /usr/bin/git "$@"\n'
+        ))
+        _write("wechatbridge", "#!/usr/bin/env bash\necho 'wechatbridge 1.6.0'\n")
+        _write("systemctl", (
+            "#!/usr/bin/env bash\n"
+            'echo "$*" >> "$SYSTEMCTL_LOG"\n'
+            '[ "$1" = "list-units" ] && echo "wechatbridge.service loaded active running"\n'
+            "exit 0\n"
+        ))
+        _write("sudo", (
+            "#!/usr/bin/env bash\n"
+            'while [ $# -gt 0 ]; do case "$1" in -u) shift 2 ;; -H) shift ;; *) break ;; esac; done\n'
+            'exec "$@"\n'
+        ))
+        return log_file, git_log, systemctl_log
+
     def test_update_script_execution_branches(self):
         """Execute deploy/update.sh in isolated mock environment to verify upgrade vs install decision."""
         import subprocess, tempfile, shutil
         td = tempfile.mkdtemp()
         try:
-            log_file = os.path.join(td, "pipx.log")
-            mock_pipx = os.path.join(td, "pipx")
-            with open(mock_pipx, "w", encoding="utf-8") as f:
-                f.write(
-                    f"#!/usr/bin/env bash\n"
-                    f"if [ \"$1\" = \"list\" ] && [ \"${{2:-}}\" = \"--short\" ]; then\n"
-                    f"  echo \"${{MOCK_PIPX_SHORT:-}}\"\n"
-                    f"elif [ \"$1\" = \"list\" ]; then\n"
-                    f"  echo \"${{MOCK_PIPX_FULL:-}}\"\n"
-                    f"elif [ \"$1\" = \"upgrade\" ] || [ \"$1\" = \"install\" ]; then\n"
-                    f"  echo \"$*\" >> {log_file!r}\n"
-                    f"fi\n"
-                    f"exit 0\n"
-                )
-            os.chmod(mock_pipx, 0o755)
-
-            mock_wechatbridge = os.path.join(td, "wechatbridge")
-            with open(mock_wechatbridge, "w", encoding="utf-8") as f:
-                f.write("#!/usr/bin/env bash\necho 'wechatbridge 1.6.0'\nexit 0\n")
-            os.chmod(mock_wechatbridge, 0o755)
-
-            systemctl_log = os.path.join(td, "systemctl.log")
-            mock_systemctl = os.path.join(td, "systemctl")
-            with open(mock_systemctl, "w", encoding="utf-8") as f:
-                f.write(
-                    f"#!/usr/bin/env bash\n"
-                    f"echo \"$*\" >> {systemctl_log!r}\n"
-                    f"if [ \"$1\" = \"list-units\" ]; then\n"
-                    f"  echo \"wechatbridge.service loaded active running\"\n"
-                    f"fi\n"
-                    f"exit 0\n"
-                )
-            os.chmod(mock_systemctl, 0o755)
-
-            mock_sudo = os.path.join(td, "sudo")
-            with open(mock_sudo, "w", encoding="utf-8") as f:
-                f.write(
-                    "#!/usr/bin/env bash\n"
-                    "while [ $# -gt 0 ]; do\n"
-                    "  case \"$1\" in\n"
-                    "    -u)\n"
-                    "      shift 2\n"
-                    "      ;;\n"
-                    "    -H)\n"
-                    "      shift 1\n"
-                    "      ;;\n"
-                    "    --)\n"
-                    "      shift\n"
-                    "      break\n"
-                    "      ;;\n"
-                    "    *)\n"
-                    "      break\n"
-                    "      ;;\n"
-                    "  esac\n"
-                    "done\n"
-                    "exec \"$@\"\n"
-                )
-            os.chmod(mock_sudo, 0o755)
-
+            log_file, git_log, systemctl_log = self._update_sh_mocks(td)
             env = os.environ.copy()
             env["PATH"] = f"{td}:{env.get('PATH', '')}"
-            # Test with WECHATBRIDGE_USER differing from whoami to verify sudo option consumption
-            env["WECHATBRIDGE_USER"] = "different_user_for_test"
+            # WECHATBRIDGE_USER differs from whoami to verify sudo option consumption
+            env.update({"WECHATBRIDGE_USER": "different_user_for_test", "PIPX_LOG": log_file,
+                        "GIT_LOG": git_log, "SYSTEMCTL_LOG": systemctl_log,
+                        "MOCK_PIPX_JSON_OK": "0", "MOCK_GIT_FAIL": "0"})
 
             # 1. Exact match in short output -> triggers upgrade
             if os.path.exists(log_file):
@@ -3091,6 +3082,50 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
                 slog = f.read()
                 self.assertIn("list-units", slog)
                 self.assertIn("restart", slog)
+            # 5. Install source: local path -> git pull --ff-only + pipx upgrade (never reinstall); PyPI name -> plain upgrade; broken source -> non-zero exit.
+            repo = os.path.join(td, "repo")
+            subprocess.run(["/usr/bin/git", "init", "-q", repo], check=True)
+            src = '{"venvs": {"wechatbridge-cli": {"metadata": {"main_package": {"package_or_url": "%s"}}}}}'
+            env.update({"MOCK_PIPX_SHORT": "wechatbridge-cli", "MOCK_PIPX_FULL": "", "MOCK_PIPX_JSON_OK": "1"})
+            for s in (repo, f"file://{repo}"):
+                [os.remove(f) for f in (log_file, git_log, systemctl_log) if os.path.exists(f)]
+                env["MOCK_PIPX_JSON"] = src % s
+                p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("pull --ff-only", self._read_log(git_log))
+                self.assertIn("upgrade wechatbridge-cli", self._read_log(log_file))
+                self.assertNotIn("reinstall", self._read_log(log_file))
+                self.assertIn("restart", self._read_log(systemctl_log))
+            [os.remove(f) for f in (log_file, git_log, systemctl_log) if os.path.exists(f)]
+            env["MOCK_PIPX_JSON"] = src % "wechatbridge-cli"
+            p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse(os.path.exists(git_log))
+            self.assertIn("upgrade wechatbridge-cli", self._read_log(log_file))
+            for s, pulled in ((os.path.join(td, "nope"), False), (td, False), (repo, True)):
+                [os.remove(f) for f in (log_file, git_log, systemctl_log) if os.path.exists(f)]
+                env["MOCK_PIPX_JSON"] = src % s
+                env["MOCK_GIT_FAIL"] = "1" if pulled else "0"
+                p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("ERROR", p.stderr)
+                self.assertEqual("pull --ff-only" in self._read_log(git_log), pulled)
+                self.assertNotIn("upgrade", self._read_log(log_file))
+                self.assertFalse(os.path.exists(systemctl_log))
+            # `pipx list --json` broken (empty / exit 1) -> pipx_metadata.json
+            venv_dir = os.path.join(td, "pipxhome", "venvs", "wechatbridge-cli")
+            os.makedirs(venv_dir)
+            with open(os.path.join(venv_dir, "pipx_metadata.json"), "w", encoding="utf-8") as f:
+                f.write('{"main_package": {"package_or_url": "%s"}}' % repo)
+            env.update({"PIPX_HOME": os.path.join(td, "pipxhome"), "MOCK_GIT_FAIL": "0"})
+            for js in ("", src % repo):
+                [os.remove(f) for f in (log_file, git_log, systemctl_log) if os.path.exists(f)]
+                env["MOCK_PIPX_JSON"] = js
+                env["MOCK_PIPX_JSON_OK"] = "0"
+                p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("pull --ff-only", self._read_log(git_log))
+                self.assertIn("upgrade wechatbridge-cli", self._read_log(log_file))
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
