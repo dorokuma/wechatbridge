@@ -76,9 +76,9 @@ except Exception:
     local target_home
     target_home="$(eval echo "~${TARGET_USER}" 2>/dev/null || true)"
     for meta_file in \
-        ${PIPX_HOME:+$PIPX_HOME/venvs/wechatbridge-cli/pipx_metadata.json} \
-        ${target_home:+$target_home/.local/share/pipx/venvs/wechatbridge-cli/pipx_metadata.json} \
-        ${target_home:+$target_home/.local/pipx/venvs/wechatbridge-cli/pipx_metadata.json}
+        "${PIPX_HOME:+$PIPX_HOME/venvs/wechatbridge-cli/pipx_metadata.json}" \
+        "${target_home:+$target_home/.local/share/pipx/venvs/wechatbridge-cli/pipx_metadata.json}" \
+        "${target_home:+$target_home/.local/pipx/venvs/wechatbridge-cli/pipx_metadata.json}"
     do
         [ -n "$meta_file" ] || continue
         src="$(run_as_target python3 - "$meta_file" <<'PY' 2>/dev/null || true
@@ -111,7 +111,7 @@ if run_pipx list --short 2>/dev/null | awk '{print $1}' | grep -x "wechatbridge-
         LOCAL_DIR="${PKG_SRC#file://}"
         # Strip a trailing pip extras spec like /path[extra] — only when the
         # original path does not exist but the stripped dir does.
-        if [ ! -d "$LOCAL_DIR" ] && [[ "$LOCAL_DIR" == *"["*"]" ]] && [ -d "${LOCAL_DIR%%\[*}" ]; then
+        if ! run_as_target test -d "$LOCAL_DIR" && [[ "$LOCAL_DIR" == *"["*"]" ]] && run_as_target test -d "${LOCAL_DIR%%\[*}"; then
             LOCAL_DIR="${LOCAL_DIR%%\[*}"
         fi
         if ! run_as_target test -d "$LOCAL_DIR"; then

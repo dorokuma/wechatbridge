@@ -3113,15 +3113,15 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
                 self.assertNotIn("upgrade", self._read_log(log_file))
                 self.assertFalse(os.path.exists(systemctl_log))
             # `pipx list --json` broken (empty / exit 1) -> pipx_metadata.json
-            venv_dir = os.path.join(td, "pipxhome", "venvs", "wechatbridge-cli")
+            venv_dir = os.path.join(td, "pipx home", "venvs", "wechatbridge-cli")
             os.makedirs(venv_dir)
             with open(os.path.join(venv_dir, "pipx_metadata.json"), "w", encoding="utf-8") as f:
                 f.write('{"main_package": {"package_or_url": "%s"}}' % repo)
-            env.update({"PIPX_HOME": os.path.join(td, "pipxhome"), "MOCK_GIT_FAIL": "0"})
+            env.update({"PIPX_HOME": os.path.join(td, "pipx home"), "MOCK_GIT_FAIL": "0"})
             for js in ("", src % repo):
                 [os.remove(f) for f in (log_file, git_log, systemctl_log) if os.path.exists(f)]
-                env["MOCK_PIPX_JSON"] = js
-                env["MOCK_PIPX_JSON_OK"] = "0"
+                if js: os.remove(os.path.join(venv_dir, "pipx_metadata.json"))
+                env.update({"MOCK_PIPX_JSON": js, "MOCK_PIPX_JSON_OK": "0"})
                 p = subprocess.run(["bash", self.script_path], env=env, capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertIn("pull --ff-only", self._read_log(git_log))
