@@ -5,13 +5,18 @@
 #        WECHATBRIDGE_SERVICE=wechatbridge    # service name to restart (default: auto-detect)
 set -euo pipefail
 
+# --- Helper: run a command as the target user ---
+run_as_target() {
+    if [ "$CURRENT_USER" != "$TARGET_USER" ]; then
+        sudo -u "$TARGET_USER" -H "$@"
+    else
+        "$@"
+    fi
+}
+
 # --- Helper: run pipx as target user ---
 run_pipx() {
-    if [ "$CURRENT_USER" != "$TARGET_USER" ]; then
-        sudo -u "$TARGET_USER" -H pipx "$@"
-    else
-        pipx "$@"
-    fi
+    run_as_target pipx "$@"
 }
 
 # --- Preflight: check pipx ---
@@ -40,10 +45,96 @@ if [ "$CURRENT_USER" != "$TARGET_USER" ]; then
     echo "(pipx will run as '$TARGET_USER'; override with WECHATBRIDGE_USER=<user>)"
 fi
 
+# --- Helper: report the recorded install source of wechatbridge-cli ---
+# wechatbridge-cli may have been installed from a local path
+# (e.g. `pipx install /root/wechatbridge`); pipx then records that path as
+# package_or_url and `pipx upgrade` is a no-op for it — local-path installs
+# must be refreshed by `git pull` in the source dir followed by
+# `pipx upgrade` (NOT `reinstall`, which would wipe runpip deps like PyYAML).
+# Prefers `pipx list --json` (pipx >= 1.0); falls back to reading
+# pipx_metadata.json directly. Never parses `pipx list` text output.
+pipx_package_or_url() {
+    local json src meta_file
+    json="$(run_pipx list --json 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+        src="$(printf '%s' "$json" | python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+    if not isinstance(data, dict):
+        sys.exit(0)
+    meta = ((data.get("venvs") or {}).get("wechatbridge-cli") or {}).get("metadata") or {}
+    print((meta.get("main_package") or {}).get("package_or_url") or "")
+except Exception:
+    sys.exit(0)
+' 2>/dev/null || true)"
+        if [ -n "$src" ]; then
+            printf '%s\n' "$src"
+            return 0
+        fi
+    fi
+    # Fallback: read pipx_metadata.json directly as the target user.
+    local target_home
+    target_home="$(eval echo "~${TARGET_USER}" 2>/dev/null || true)"
+    for meta_file in \
+        "${PIPX_HOME:+$PIPX_HOME/venvs/wechatbridge-cli/pipx_metadata.json}" \
+        "${target_home:+$target_home/.local/share/pipx/venvs/wechatbridge-cli/pipx_metadata.json}" \
+        "${target_home:+$target_home/.local/pipx/venvs/wechatbridge-cli/pipx_metadata.json}"
+    do
+        [ -n "$meta_file" ] || continue
+        src="$(run_as_target python3 - "$meta_file" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print((data.get("main_package") or {}).get("package_or_url") or "")
+except Exception:
+    pass
+PY
+)"
+        if [ -n "$src" ]; then
+            printf '%s\n' "$src"
+            return 0
+        fi
+    done
+    return 0
+}
+
 # --- Upgrade (or install if not present) ---
 echo "Upgrading WeChatBridge..."
 if run_pipx list --short 2>/dev/null | awk '{print $1}' | grep -x "wechatbridge-cli" >/dev/null || run_pipx list 2>/dev/null | grep -E "(^|[[:space:]])package[[:space:]]+wechatbridge-cli([[:space:]]|,|$)|(^|[[:space:]])wechatbridge-cli([[:space:]]|$)" >/dev/null; then
-    run_pipx upgrade wechatbridge-cli
+    PKG_SRC="$(pipx_package_or_url || true)"
+    if [[ "$PKG_SRC" == /* ]] || [[ "$PKG_SRC" == file://* ]]; then
+        # Local-path install: pipx upgrade is a no-op for these. Refresh the
+        # source checkout as the target user, then let pipx upgrade reinstall
+        # from it — never silently skip and never use `pipx reinstall`
+        # (which would wipe runpip-installed deps like PyYAML).
+        LOCAL_DIR="${PKG_SRC#file://}"
+        # Strip a trailing pip extras spec like /path[extra] — only when the
+        # original path does not exist but the stripped dir does.
+        if ! run_as_target test -d "$LOCAL_DIR" && [[ "$LOCAL_DIR" == *"["*"]" ]] && run_as_target test -d "${LOCAL_DIR%%\[*}"; then
+            LOCAL_DIR="${LOCAL_DIR%%\[*}"
+        fi
+        if ! run_as_target test -d "$LOCAL_DIR"; then
+            echo "ERROR: install source '$LOCAL_DIR' does not exist for user '$TARGET_USER'." >&2
+            echo "       wechatbridge-cli was installed from a local path; cannot refresh it." >&2
+            exit 1
+        fi
+        if ! run_as_target git -C "$LOCAL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "ERROR: install source '$LOCAL_DIR' is not a git repository." >&2
+            echo "       wechatbridge-cli was installed from a local path; cannot refresh it." >&2
+            exit 1
+        fi
+        echo "wechatbridge-cli was installed from local source: $LOCAL_DIR"
+        echo "Refreshing local source with git pull --ff-only..."
+        if ! run_as_target git -C "$LOCAL_DIR" pull --ff-only; then
+            echo "ERROR: 'git pull --ff-only' failed in '$LOCAL_DIR'." >&2
+            echo "       Refusing to run 'pipx upgrade' against a stale source." >&2
+            exit 1
+        fi
+        run_pipx upgrade wechatbridge-cli
+    else
+        run_pipx upgrade wechatbridge-cli
+    fi
 else
     echo "WeChatBridge not yet installed under '$TARGET_USER'. Installing..."
     run_pipx install wechatbridge-cli
