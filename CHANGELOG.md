@@ -5,6 +5,20 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-11-11
+
+### Fixed
+
+- **存量的非法 effort 后缀模型名不再透传给 agy**：此前 `canonical_agy_model` 对已带 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 后缀的模型名一律原样返回（"model wins"），用户若存了 `gemini-3.8-flash-xhigh` 这类 `agy models` 清单里不存在的 id 会被原样下发，agy 侧硬失败（`Print mode: invalid model selection`）。现在按形态处理并均记 WARNING：
+  - 已知家族 + 该家族不发货的档位后缀 → 钳到该家族最高已发货档（如 `gemini-3.8-flash-xhigh` → `gemini-3.8-flash-high`、`gpt-oss-120b-high` → `gpt-oss-120b-medium`）；清单内合法后缀的完整 id 仍原样透传。
+  - 未知家族 + 档位后缀（`other-model-xhigh`）→ 剥掉尾部档位后按未知模型处理（原样传 `other-model`；若同时设了 effort 则按既有规则 warn 丢弃），不再把无法核实的带后缀 id 发出去。
+  - 已知家族 + 无法识别的尾随词（如手滑存的 `gemini-4-argon-ultra`）→ 回退裸家族别名 `gemini-4-argon`，由 agy 自行解析默认档，绝不编造 `...-ultra` 之类的 id。
+
+### Tests
+
+- `TestCanonicalAgyModel.test_cases`：改 `gemini-3.8-flash-xhigh` 旧期望为钳位结果，并新增 `gpt-oss-120b-high`、`gemini-4-argon-ultra`、`other-model-xhigh`（含与 effort 并存）用例。
+- 新增 `test_illegal_suffix_shapes_warn`：三类非法后缀形态各自断言返回值与 WARNING 日志。
+
 ## [1.9.1] - 2026-11-11
 
 ### Fixed

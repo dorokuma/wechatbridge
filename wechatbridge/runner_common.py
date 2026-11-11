@@ -1544,7 +1544,17 @@ def canonical_agy_model(model: str, effort: str | None) -> str:
     alias agy can resolve); never fabricate an id.
 
     Rules:
-      - model already carries an effort suffix -> keep it (model wins).
+      - model carries a recognized level suffix (`-low`/`-medium`/`-high`/
+        `-xhigh`/`-max`):
+          * known family + level it ships -> keep the id verbatim (model
+            wins over any separate effort value).
+          * known family + level it does not ship -> clamp to the family's
+            highest shipped level with a warning.
+          * unknown family -> strip the suffix with a warning and treat
+            the base as an unknown model (never forward a suffixed id we
+            cannot verify).
+      - known family + any other trailing word (e.g. a typo'd level like
+        `-ultra`) -> warn and fall back to the bare family alias.
       - known suffix family + valid effort -> append '-' + effort; levels
         not shipped for that family clamp to the family's highest shipped
         level (default: ``high``) with a warning.
@@ -1557,10 +1567,51 @@ def canonical_agy_model(model: str, effort: str | None) -> str:
     m = (model or "").strip()
     if not m:
         return ""
-    for s in _AGY_SUFFIXES:
-        if m.endswith(s):
-            return m
     e = (effort or "").strip().lower()
+    # Strip/resolve trailing level-looking suffixes first. Loop so chained
+    # suffixes (e.g. "foo-xhigh-xhigh") fully unwind.
+    while True:
+        stripped = False
+        for s in _AGY_SUFFIXES:
+            if m.endswith(s) and len(m) > len(s):
+                base, level = m[: -len(s)], s[1:]
+                if base in _AGY_SUFFIX_FAMILIES:
+                    allowed = _AGY_FAMILY_SUFFIXES.get(base, _AGY_DEFAULT_SUFFIXES)
+                    if level in allowed:
+                        return m  # real shipped id; model wins over effort
+                    ceiling = max(
+                        allowed, key=lambda v: ("low", "medium", "high").index(v)
+                    )
+                    logger.warning(
+                        "agy model id %r carries level %r that family %s does "
+                        "not ship; clamping to %r (highest available: %s)",
+                        m, level, base, f"{base}-{ceiling}",
+                        ", ".join(sorted(allowed)),
+                    )
+                    return f"{base}-{ceiling}"
+                logger.warning(
+                    "agy model %r carries level suffix %r but %r is not a "
+                    "verified suffix family; stripping the suffix instead of "
+                    "forwarding an unverifiable id",
+                    m, level, base,
+                )
+                m = base
+                stripped = True
+                break
+        if not stripped:
+            break
+    # No recognized level suffix: a known family followed by any other
+    # trailing word (typo'd level, e.g. "gemini-4-argon-ultra") still must
+    # not go out verbatim — fall back to the bare family alias.
+    for fam in _AGY_SUFFIX_FAMILIES:
+        if m.startswith(fam + "-"):
+            logger.warning(
+                "agy model %r looks like family %s plus unrecognized level "
+                "%r; falling back to bare family alias %r",
+                m, fam, m[len(fam) + 1 :], fam,
+            )
+            m = fam
+            break
     if m in _AGY_SUFFIX_FAMILIES:
         if e in ("low", "medium", "high", "xhigh", "max"):
             allowed = _AGY_FAMILY_SUFFIXES.get(m, _AGY_DEFAULT_SUFFIXES)

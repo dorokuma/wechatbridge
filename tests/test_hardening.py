@@ -3337,11 +3337,15 @@ class TestCanonicalAgyModel(unittest.TestCase):
         from wechatbridge.runner_common import canonical_agy_model
 
         cases = [
-            # already-suffixed model wins over any effort (verbatim, even
-            # levels agy doesn't list — the user typed a concrete id)
+            # shipped suffixed id wins over any effort (verbatim — the user
+            # typed a concrete, existing id)
             ("gemini-3.8-flash-high", None, "gemini-3.8-flash-high"),
             ("gemini-3.8-flash-low", "high", "gemini-3.8-flash-low"),
-            ("gemini-3.8-flash-xhigh", "low", "gemini-3.8-flash-xhigh"),
+            # known family + level it does not ship -> clamp to the
+            # family's highest shipped level (never pass the id through)
+            ("gemini-3.8-flash-xhigh", "low", "gemini-3.8-flash-high"),
+            ("gemini-3.8-flash-xhigh", None, "gemini-3.8-flash-high"),
+            ("gpt-oss-120b-high", None, "gpt-oss-120b-medium"),
             # bare known family + valid effort -> shipped suffixed id
             ("gemini-3.8-flash", "low", "gemini-3.8-flash-low"),
             ("gemini-4-argon", "  HIGH ", "gemini-4-argon-high"),
@@ -3355,6 +3359,14 @@ class TestCanonicalAgyModel(unittest.TestCase):
             ("gemini-4-argon", "xhigh", "gemini-4-argon-high"),
             ("claude-opus-5-5", "max", "claude-opus-5-5-high"),
             ("gpt-oss-120b", "high", "gpt-oss-120b-medium"),
+            # known family + unrecognized trailing word (typo'd level) ->
+            # bare family alias, never the made-up id
+            ("gemini-4-argon-ultra", None, "gemini-4-argon"),
+            # unknown family + level suffix -> strip the suffix, pass the
+            # base through the unknown-model path (never forward an
+            # unverifiable suffixed id)
+            ("other-model-xhigh", None, "other-model"),
+            ("other-model-xhigh", "high", "other-model"),
             # bare unknown model -> verbatim pass-through; effort is NOT
             # folded (would fabricate an id)
             ("some-future-model", None, "some-future-model"),
@@ -3387,6 +3399,44 @@ class TestCanonicalAgyModel(unittest.TestCase):
                 "gemini-4-argon-high",
             )
         self.assertTrue(any("xhigh" in m for m in cm.output))
+
+    def test_illegal_suffix_shapes_warn(self):
+        """A stored model carrying a suffix agy doesn't ship must never go
+        out verbatim; each shape warns."""
+        from wechatbridge.runner_common import canonical_agy_model
+
+        # known family + unshipped level suffix -> clamped id + warning
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("gemini-3.8-flash-xhigh", None),
+                "gemini-3.8-flash-high",
+            )
+        self.assertTrue(
+            any("xhigh" in m and "gemini-3.8-flash-high" in m for m in cm.output)
+        )
+
+        # unknown family + level suffix -> stripped, base passed through,
+        # separate effort dropped — all with warnings
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("other-model-xhigh", "high"),
+                "other-model",
+            )
+        self.assertTrue(
+            any("other-model" in m and "xhigh" in m for m in cm.output)
+        )
+        # ...and the separate effort is dropped with its own warning
+        self.assertTrue(any("'high'" in m and "ignored" in m for m in cm.output))
+
+        # known family + unrecognized trailing word -> bare family alias
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("gemini-4-argon-ultra", None),
+                "gemini-4-argon",
+            )
+        self.assertTrue(
+            any("ultra" in m and "gemini-4-argon" in m for m in cm.output)
+        )
 
 
 class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
