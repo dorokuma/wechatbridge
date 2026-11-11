@@ -5,7 +5,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-## [1.9.3] - 2026-11-11
+## [1.9.4] - 2026-11-11
 
 ### Fixed
 
@@ -22,7 +22,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - `test_suffix_families_do_not_drift_from_agy_models`：静态清单（`_AGY_SUFFIX_FAMILIES`/`_AGY_FAMILY_SUFFIXES`）派生的每个 id 必须存在于运行时 `agy models` 清单；agy 不可用（如 CI）时回退到仓内显式快照清单，缺失即列出并失败。
 - `test_illegal_suffix_shapes_warn` 的 effort 丢弃断言改为按语义匹配（effort 值 + ignored/dropped 语义），不再绑定英文措辞与引号样式。
 
-## [1.9.2] - 2026-11-11
+## [1.9.3] - 2026-11-11
 
 ### Fixed
 
@@ -36,7 +36,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - `TestCanonicalAgyModel.test_cases`：改 `gemini-3.8-flash-xhigh` 旧期望为钳位结果，并新增 `gpt-oss-120b-high`、`gemini-4-argon-ultra`、`other-model-xhigh`（含与 effort 并存）用例。
 - 新增 `test_illegal_suffix_shapes_warn`：三类非法后缀形态各自断言返回值与 WARNING 日志。
 
-## [1.9.1] - 2026-11-11
+## [1.9.2] - 2026-11-11
 
 ### Fixed
 
@@ -48,6 +48,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 - `TestCanonicalAgyModel` 覆盖：已知家族正常档/不可用档钳位、未知模型透传+effort 不落、已带后缀 model wins、空 model。
 - `TestAgyModelFlag` 覆盖 argv：已知家族+正常/不可用档、裸已知家族 alias 透传、未知模型+effort 不折叠、effort-only 传 `--effort`、非法 effort-only 不落 flag。
+## [1.9.1] - 2026-11-04
+
+### Fixed
+
+- **`deploy/update.sh` 本地路径安装的刷新方式**：安装来源为本地路径（`/*` 或 `file://*`）时，改为以目标用户身份在源目录执行 `git pull --ff-only` 后再 `pipx upgrade wechatbridge-cli`，不再走旧的 `pipx reinstall --python python3` 路径（该路径会清掉 runpip 额外安装的依赖如 PyYAML，并重置 venv 解释器）。源目录缺失、非 git 仓库或 pull 失败时向 stderr 打印 ERROR 并以非零码退出，不再静默假装升级成功；PyPI 名、远程 VCS/归档 URL 等非本地来源仍走普通 `pipx upgrade`。
+- `update.sh` 读取已装包来源改走结构化数据：`pipx_package_or_url` 优先 `pipx list --json`（加 `|| true`，无关 venv 损坏不会在 `set -e` 下中断），失败时回退直接读 `pipx_metadata.json`（依次查 `PIPX_HOME`、目标用户的 `~/.local/share/pipx` 与 `~/.local/pipx`）；移除原 `pipx list | awk` 文本解析回退（消除 pipefail/SIGPIPE 与文本误解析风险）。元数据路径候选现均加引号，`PIPX_HOME` 或目标 home 含空格/通配符时不再出错；`[extra]` 后缀剥离后的目录存在性检查改为以目标用户身份（`run_as_target`）执行。
+
+### Tests
+
+- `tests/test_update_sh.py` 并入 `tests/test_hardening.py` 的 `TestUpdateScriptPackageMatch`：pipx/systemctl/sudo/wechatbridge 的 mock 抽为共用 `_update_sh_mocks` 助手，并新增 `mock_git`（mock pull，不走网络）；安装来源场景并入 `test_update_script_execution_branches`——本地路径/`file://` URL → pull --ff-only + upgrade + 重启；PyPI 名 → 普通 upgrade、不调 git；目录缺失/非 git 仓库/pull 失败 → 非零退出且不 upgrade 不重启；`pipx list --json` 损坏（空输出或退出码 1）→ 回退 `pipx_metadata.json`。另覆盖 `PIPX_HOME` 含空格路径，以及第二轮回退迭代删除 `pipx_metadata.json` 以走 JSON 为主的路径。
 
 ## [1.9.0] - 2026-11-03
 
