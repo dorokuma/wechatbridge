@@ -55,13 +55,15 @@ def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | No
         ``[name](../rel/path)`` — relative paths resolve against *session_dir*
       - bare ``file:///abs/path`` mentions
 
-    Paths are only kept when their ``os.path.realpath`` resolves inside an
-    allowed root (``session_dir``, ``config.agy_scratch_dir``, or any
-    user-approved ``--add-dir`` root) AND ``os.path.exists`` — symlinks
-    pointing outside are silently filtered at this stage, so they never
-    reach the send layer's realpath rejection. Emitted paths are the
-    canonical realpaths. URL-decodes (``urllib.parse.unquote``)
-    percent-encoded spaces / CJK.
+    Paths are only kept when they resolve inside an allowed root
+    (``session_dir``, ``config.agy_scratch_dir``, or any user-approved
+    ``--add-dir`` root; ``path_is_under`` realpaths both sides) AND
+    ``os.path.exists`` on the resolved target. Emitted paths are the
+    canonical ``os.path.realpath`` — the exact same form
+    ``send_artifacts_back`` validates — and deduplication happens on that
+    canonical path, so several symlink aliases of one file are extracted
+    only once. URL-decodes (``urllib.parse.unquote``) percent-encoded
+    spaces / CJK.
     """
     if not text:
         return []
@@ -97,10 +99,13 @@ def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | No
         # 允许根校验只在提供 session_dir/allowed_roots 时启用——无上下文
         # 调用（纯解析/测试）保持原有放行行为。
         if roots:
-            # Realpath comparison (aligned with send_artifacts_back): a
-            # symlink inside an allowed root that resolves outside is
-            # dropped silently HERE, and the emitted path is the canonical
-            # form the send layer validates — extract/send never diverge.
+            # Emit the canonical realpath — the exact same form
+            # send_artifacts_back validates — so extract/send never
+            # diverge, and dedupe keys on the real target (two symlink
+            # aliases of one file are extracted only once). The allow-root
+            # check was already realpath-based via path_is_under; this
+            # makes the canonical form explicit and checks exists() on
+            # the resolved path.
             try:
                 real_path = os.path.realpath(abs_path)
             except OSError:

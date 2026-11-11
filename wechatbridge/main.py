@@ -75,10 +75,10 @@ MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10
 
 # Invisible / direction-overriding chars plus every "@"-equivalent stripped
 # from display filenames: zero-width U+200B–U+200F, bidi controls
-# U+202A–U+202E / U+2066–U+2069, BOM U+FEFF, and fullwidth ＠ U+FF20
+# U+202A–U+202E / U+2066–U+2069 / U+061C ALM, BOM U+FEFF, fullwidth ＠ U+FF20
 # (visual deception only — the on-disk name uses uuid+ext).
 _DISPLAY_FILENAME_STRIP_CHARS = frozenset(
-    "@＠\ufeff"
+    "@＠\ufeff\u061c"
     + "".join(chr(c) for c in range(0x200B, 0x2010))
     + "".join(chr(c) for c in range(0x202A, 0x202F))
     + "".join(chr(c) for c in range(0x2066, 0x206A))

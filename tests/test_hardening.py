@@ -4205,6 +4205,21 @@ class TestAgyExtractArtifactsFourModes(unittest.TestCase):
         arts = self._extract(f"[a](file:///{link}) [b](file:///{link2})")
         self.assertEqual([p for _, p in arts], [os.path.realpath(real_file)])
 
+    def test_escape_symlink_filtered_at_extract(self):
+        """v1.9.0 O4 regression: a symlink inside an allowed root that
+        resolves OUTSIDE any allowed root is still filtered at extract —
+        path_is_under realpaths both sides, so this never reaches the
+        send layer. Safety must not regress."""
+        outside = os.path.join(self.td, "outside")
+        os.makedirs(outside)
+        outside_file = os.path.join(outside, "out.pdf")
+        with open(outside_file, "w") as f:
+            f.write("x")
+        link = os.path.join(self.session, "escape.pdf")
+        os.symlink(outside_file, link)
+        arts = self._extract(f"[a](file:///{link})")
+        self.assertEqual(arts, [])
+
     def test_nonexistent_file_skipped(self):
         arts = self._extract(f"[gone](file:///{self.session}/gone.pdf)")
         self.assertEqual(arts, [])
@@ -4418,6 +4433,7 @@ class TestDisplayFilenameAndNotices(unittest.TestCase):
             "a\u200b\u200c\u200d\u200e\u200f"
             "\u202a\u202b\u202c\u202d\u202e"
             "\u2066\u2067\u2068\u2069"
+            "\u061c"
             "\ufeffb\uff20c.pdf"
         )
         self.assertEqual(_sanitize_display_filename(bad), "abc.pdf")
