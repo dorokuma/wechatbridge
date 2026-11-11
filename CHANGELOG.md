@@ -5,6 +5,50 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-11-11
+
+### Fixed
+
+- **model 自带后缀覆盖 effort 时不再静默**：`canonical_agy_model` 在模型名已带合法档位后缀（如 `gemini-3.8-flash-high`）且另存的 effort 与其不一致（如 `/fast` 存的 `low`）时，返回值不变（仍 model wins）但补一条 WARNING 说明该 effort 未生效；effort 与后缀一致时不告警，不制造噪音。
+
+### Docs
+
+- 首装访问控制提示：`deploy/wechatbridge.env.example` access-control 段与 `README.md`/`README.zh-CN.md` 安装步骤各补一句——白名单与 `WECHATBRIDGE_ADMINS` 都为空时拒绝所有用户（fail-closed），首装请至少填 `WECHATBRIDGE_ADMINS=<你的 wxid>` 或白名单。
+- 修正 `1.9.1` 小节里「`*` 比空值 INFO 更吵」的错误比较：白名单与 ADMINS 都空走的同样是 WARNING 分支。
+
+### Tests
+
+- `test_model_suffix_overrides_stored_effort_warns`：后缀与 effort 冲突时断言返回值与「effort 未生效」WARNING；一致时断言无告警。
+- `test_suffix_families_do_not_drift_from_agy_models`：静态清单（`_AGY_SUFFIX_FAMILIES`/`_AGY_FAMILY_SUFFIXES`）派生的每个 id 必须存在于运行时 `agy models` 清单；agy 不可用（如 CI）时回退到仓内显式快照清单，缺失即列出并失败。
+- `test_illegal_suffix_shapes_warn` 的 effort 丢弃断言改为按语义匹配（effort 值 + ignored/dropped 语义），不再绑定英文措辞与引号样式。
+
+## [1.9.2] - 2026-11-11
+
+### Fixed
+
+- **存量的非法 effort 后缀模型名不再透传给 agy**：此前 `canonical_agy_model` 对已带 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 后缀的模型名一律原样返回（"model wins"），用户若存了 `gemini-3.8-flash-xhigh` 这类 `agy models` 清单里不存在的 id 会被原样下发，agy 侧硬失败（`Print mode: invalid model selection`）。现在按形态处理并均记 WARNING：
+  - 已知家族 + 该家族不发货的档位后缀 → 钳到该家族最高已发货档（如 `gemini-3.8-flash-xhigh` → `gemini-3.8-flash-high`、`gpt-oss-120b-high` → `gpt-oss-120b-medium`）；清单内合法后缀的完整 id 仍原样透传。
+  - 未知家族 + 档位后缀（`other-model-xhigh`）→ 剥掉尾部档位后按未知模型处理（原样传 `other-model`；若同时设了 effort 则按既有规则 warn 丢弃），不再把无法核实的带后缀 id 发出去。
+  - 已知家族 + 无法识别的尾随词（如手滑存的 `gemini-4-argon-ultra`）→ 回退裸家族别名 `gemini-4-argon`，由 agy 自行解析默认档，绝不编造 `...-ultra` 之类的 id。
+
+### Tests
+
+- `TestCanonicalAgyModel.test_cases`：改 `gemini-3.8-flash-xhigh` 旧期望为钳位结果，并新增 `gpt-oss-120b-high`、`gemini-4-argon-ultra`、`other-model-xhigh`（含与 effort 并存）用例。
+- 新增 `test_illegal_suffix_shapes_warn`：三类非法后缀形态各自断言返回值与 WARNING 日志。
+
+## [1.9.1] - 2026-11-11
+
+### Fixed
+
+- **agy 模型 id 不再凭空拼接**：`canonical_agy_model` 只对实测存在 effort 后缀形态的已知家族（`gemini-4-carbon`/`gemini-4-argon`/`gemini-3.8-flash`/`claude-opus-5-5`/`claude-sonnet-5-5`/`gpt-oss-120b`）折叠 `low|medium|high` 后缀；未知模型名原样透传并记 warning 说明 effort 未生效。实测不存在的档位（`xhigh`/`max`）钳到该家族最高可用档并 WARNING。
+- **effort-only 恢复可达**：无 model 仅设 effort（如未设模型直接 `/fast`）时透传 `--effort`，不再静默什么都不传。
+- `deploy/wechatbridge.env.example` 访问控制回退为注释态 `# WECHATBRIDGE_ALLOWED_SENDERS=`：`*` 放行任何可私聊 bot 的账号，原默认注释理由不成立。
+
+### Tests
+
+- `TestCanonicalAgyModel` 覆盖：已知家族正常档/不可用档钳位、未知模型透传+effort 不落、已带后缀 model wins、空 model。
+- `TestAgyModelFlag` 覆盖 argv：已知家族+正常/不可用档、裸已知家族 alias 透传、未知模型+effort 不折叠、effort-only 传 `--effort`、非法 effort-only 不落 flag。
+
 ## [1.9.0] - 2026-11-03
 
 ### Added
