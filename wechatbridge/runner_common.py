@@ -223,6 +223,22 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
     secret_files.append(os.path.join(host_dsh_home(), ".credentials.yaml"))
     secret_files.append(os.path.join(host_home, ".grok", "auth.json"))
     secret_files.append(os.path.join(host_home, ".codex", "auth.json"))
+    # Host agy OAuth token (agy.py copies it from this exact path into each
+    # per-user session; a verbatim host copy under an innocent name must
+    # still be blocked even when the session copy never got created).
+    # agy.py resolves the source via os.path.expanduser("~") (HOME-based),
+    # which differs from host_home when WECHATBRIDGE_HOST_HOME is overridden
+    # — so cover BOTH roots, deduplicated, regardless of which env var is set.
+    token_roots = [host_home]
+    env_home = os.path.expanduser("~")
+    if env_home and env_home not in token_roots:
+        token_roots.append(env_home)
+    for token_root in token_roots:
+        secret_files.append(
+            os.path.join(
+                token_root, ".gemini", "antigravity-cli", "antigravity-oauth-token"
+            )
+        )
     cand_bytes: bytes | None = None
     for sf in secret_files:
         try:
@@ -347,7 +363,9 @@ def _snapshot_regular_files(roots: list) -> dict:
     """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
 
     Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
-    dict if any limit is exceeded (never partial results).
+    dict if any limit is exceeded (never partial results); the abort is logged
+    at WARNING level (limit kind + dir only, no file names / contents) so a
+    skipped turn of artifacts is never completely silent.
 
     Snap keys are keyed by ``os.path.realpath`` so that a *session_dir* passed
     through a symlinked parent produces the same keys as the post-run rescan
@@ -374,15 +392,34 @@ def _snapshot_regular_files(roots: list) -> dict:
             continue
         if real_root and real_root not in real_roots:
             real_roots.append(real_root)
+    def _log_safe(s: str) -> str:
+        # Strip control chars (<0x20, 0x7f) — a newline or ANSI control in a
+        # session-tree path must not inject extra lines / escape codes into
+        # the local warning log. Paths are UTF-8/undecodable-tolerant:
+        # surrogates (>=0x7f range except DEL) are left untouched.
+        return "".join(
+            ch if (ord(ch) >= 0x20 and ord(ch) != 0x7F) else "?" for ch in s
+        )
+
+    def _abort(kind: str, root: str, dirpath: str):
+        # Log the limit kind + the dir being walked only — never file names
+        # or contents, the session tree may contain sensitive paths.
+        logger.warning(
+            "Session fallback snapshot aborted: %s limit exceeded "
+            "(root=%s, dir=%s); artifacts this turn are not collected",
+            kind, _log_safe(root), _log_safe(dirpath),
+        )
+        return {}
+
     for root in real_roots:
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dir_count += 1
             if dir_count > _MAX_DIRS:
-                return {}
+                return _abort("directory-count", root, dirpath)
             if time.monotonic() - t_start > _MAX_SCAN_TIME:
-                return {}
+                return _abort("scan-time", root, dirpath)
             # Exclude internal metadata directories in-place
             dirnames[:] = [
                 d for d in dirnames if d not in _SNAPSHOT_SKIP_DIR_NAMES
@@ -390,7 +427,7 @@ def _snapshot_regular_files(roots: list) -> dict:
             for fn in filenames:
                 file_count += 1
                 if file_count > _MAX_FILES:
-                    return {}
+                    return _abort("file-count", root, dirpath)
                 fp = os.path.join(dirpath, fn)
                 try:
                     if not os.path.isfile(fp) or os.path.islink(fp):

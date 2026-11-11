@@ -158,9 +158,12 @@ check_access_control_env() {
         echo "(no $env_file found; skipping access-control check)"
         return 0
     fi
-    # Active line = not commented out and value non-empty.
-    if ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ALLOWED_SENDERS[[:space:]]*=[[:space:]]*[^[:space:]#]' "$env_file" \
-        && ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ADMINS[[:space:]]*=[[:space:]]*[^[:space:]#]' "$env_file"; then
+    # Active line = not commented out and value non-empty AFTER the parser's
+    # quote strip: `KEY=""` / `KEY=''` / `KEY= " "` resolve to an empty
+    # string in config._parse_env_file and fail-closed, so they must still
+    # trigger this warning (an unquoted non-space non-# first char is valid).
+    if ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ALLOWED_SENDERS[[:space:]]*=[[:space:]]*["'"'"']?[[:space:]]*[^[:space:]"'"'"'#]' "$env_file" \
+        && ! grep -Eq '^[[:space:]]*WECHATBRIDGE_ADMINS[[:space:]]*=[[:space:]]*["'"'"']?[[:space:]]*[^[:space:]"'"'"'#]' "$env_file"; then
         echo ""
         echo "==============================================================="
         echo "  WARNING: no active WECHATBRIDGE_ALLOWED_SENDERS or"
