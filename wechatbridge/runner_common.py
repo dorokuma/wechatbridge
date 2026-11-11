@@ -1573,7 +1573,6 @@ _AGY_FAMILY_SUFFIXES: dict[str, frozenset] = {
 }
 _AGY_DEFAULT_SUFFIXES = frozenset({"low", "medium", "high"})
 _AGY_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
-_AGY_MAX_SUFFIX = "high"  # highest level present in `agy models`
 
 
 def canonical_agy_model(model: str, effort: str | None) -> str:

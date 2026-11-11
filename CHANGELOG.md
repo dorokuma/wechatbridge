@@ -5,6 +5,23 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-11-11
+
+### Security
+
+- **agy 宿主 OAuth token 内容拦截覆盖双根**：`_matches_session_secret_content` 现把 `WECHATBRIDGE_HOST_HOME` 与 `os.path.expanduser("~")` 两个根下的 `.gemini/antigravity-cli/antigravity-oauth-token` 都纳入 `secret_files`（去重），与 `agy.py` 实际复制 token 的 `expanduser` 源对齐——`HOME` 与 `WECHATBRIDGE_HOST_HOME` 分离时，改名复制的宿主 token 产物仍被拦截。
+
+### Fixed
+
+- **快照/回退扫描超限不再静默丢弃**：`_snapshot_regular_files` 超过文件数/目录数/扫描时长三类限额时记 WARNING（限额类别 + 清洗控制字符后的 root/dir，不写文件名与内容），产物丢失有迹可查。
+- **`extract_artifacts` 发射规范 realpath 并按真实目标去重**：emit 路径为 `os.path.realpath`，与 `send_artifacts_back` 校验同形；同一目标的多个软链别名只提取一次；`os.path.exists` 显式针对解析后路径。（更正：基线经 `path_is_under` realpath 已拒越界软链，现增加不退化回归断言。）
+- **显示文件名剥离补全 U+061C 等**：`_sanitize_display_filename` 黑名单 `_DISPLAY_FILENAME_STRIP_CHARS` 剥离零宽字符、全部 Unicode Bidi 控制符（含此前遗漏的 U+061C Arabic Letter Mark）、BOM U+FEFF 与全角 `＠` U+FF20（仅显示名视觉欺骗面，落盘名仍走 uuid+ext）。
+- **`deploy/update.sh` 访问控制告警识别引号空值**：`WECHATBRIDGE_ALLOWED_SENDERS=""` / `WECHATBRIDGE_ADMINS=''` 经解析器引号剥离后为空串并 fail-closed，现同样触发「未配置访问控制」WARNING，不再被误判为有效配置。
+
+### Chore
+
+- 删除 `runner_common` 中无引用的死常量 `_AGY_MAX_SUFFIX`（canonical-agy-model follow-up O1）。
+
 ## [1.9.4] - 2026-11-11
 
 ### Fixed
