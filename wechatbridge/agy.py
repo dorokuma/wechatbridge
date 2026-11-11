@@ -20,7 +20,7 @@ from .runner_common import (
     _sanitize_prompt_at_paths,
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, is_sensitive_artifact_path, parse_model_effort,
-    sanitize_env, terminate_process, update_active_prefs,
+    sanitize_env, terminate_process, update_active_prefs, canonical_agy_model,
     format_error, format_cli_error, format_timeout_error, format_model_label, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir, path_is_under,
     _snapshot_regular_files, collect_session_fallback_artifacts, merge_artifact_groups,
@@ -265,26 +265,24 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     # Build command: agy [--model X] [--effort Y] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
     # --dangerously-skip-permissions 保留：可信小圈子用户需 agy 能自动调工具，风险由服务层(root)+输入来源(可信用户)承担
+    # NOTE: effort 归并进已知家族的模型名后缀（canonical_agy_model 白名单）；
+    #       未知模型不造后缀、effort 不落 flag（canonical_agy_model 已 warn）。
+    #       例外：无 model 只设 effort（如未设模型直接 /fast）时透传 --effort，
+    #       由 agy 作用于其会话默认模型——这是 effort-only 唯一的可达路径。
     cmd = [config.agy_binary_path, "--dangerously-skip-permissions"]
     prefs = load_prefs(user_id)
-    model = prefs.get("model")
-    effort = prefs.get("effort")
+    model = canonical_agy_model(prefs.get("model"), prefs.get("effort"))
     if model:
-        base_model, embedded_effort = parse_model_effort(model)
-        if embedded_effort and effort:
-            # model has effort suffix AND user wants a different effort
-            # -> use base model name + --effort from prefs (no conflict)
-            cmd += ["--model", base_model, "--effort", effort]
-        elif embedded_effort:
-            # model has effort suffix, no explicit effort -> model carries it
-            cmd += ["--model", model]
+        cmd += ["--model", model]
+    elif prefs.get("effort"):
+        e = prefs["effort"].strip().lower()
+        if e in ("low", "medium", "high", "xhigh", "max"):
+            cmd += ["--effort", e]
         else:
-            # plain model name -> pass effort if set
-            cmd += ["--model", model]
-            if effort:
-                cmd += ["--effort", effort]
-    elif effort:
-        cmd += ["--effort", effort]
+            logger.warning(
+                "Ignoring unrecognized agy effort %r for user %s (no model set)",
+                prefs["effort"], user_id,
+            )
     if prefs.get("mode"):
         cmd += ["--mode", prefs["mode"]]
     valid_add_dirs = []
