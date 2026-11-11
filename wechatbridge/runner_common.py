@@ -1509,25 +1509,49 @@ def parse_model_effort(model: str) -> tuple[str, str | None]:
 # agy model canonicalization
 # ---------------------------------------------------------------------------
 
-# agy CLI exposes thinking levels as suffixes on the model id itself
-# (e.g. gemini-3.8-flash-high). The --effort flag only works for a subset of
-# models; others either warn-and-ignore or hard-fail on conflict. To make
-# behavior uniform we always hand agy a fully-suffixed model id and never pass
-# --effort.
-_AGY_DEFAULT_EFFORT: dict[str, str] = {
-    "gemini-3.8-flash": "high",
-    "gemini-4-argon": "medium",
+# agy CLI ground truth (2026-11-11, `agy models` output + live resolver logs):
+#   - Model ids carry effort as a suffix: <family>-<low|medium|high>.
+#   - Families with suffixed ids: gemini-4-carbon, gemini-4-argon,
+#     gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5, and gpt-oss-120b
+#     (medium only). No -xhigh/-max ids exist.
+#   - `--model <family>-<eff>` + `--effort` is a hard error
+#     ("conflicts with --effort"); `--effort` alone is accepted and applied
+#     to the current/default model.
+#   - Bare family names are aliases agy resolves itself
+#     (e.g. claude-sonnet-5-5 -> claude-sonnet-5-5-high), so passing a bare
+#     known-family name never fabricates an id.
+# Invariant: NEVER emit a model id agy does not know — only fold effort into
+# a suffix for families that actually ship suffixed ids.
+_AGY_SUFFIX_FAMILIES = frozenset({
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-oss-120b",
+})
+# Suffix levels `agy models` actually lists. gpt-oss-120b ships only -medium.
+_AGY_FAMILY_SUFFIXES: dict[str, frozenset] = {
+    "gpt-oss-120b": frozenset({"medium"}),
 }
+_AGY_DEFAULT_SUFFIXES = frozenset({"low", "medium", "high"})
 _AGY_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
+_AGY_MAX_SUFFIX = "high"  # highest level present in `agy models`
 
 
 def canonical_agy_model(model: str, effort: str | None) -> str:
-    """Return a fully-suffixed agy model id; never emit --effort.
+    """Return an agy model id guaranteed to exist in `agy models` (or a bare
+    alias agy can resolve); never fabricate an id.
 
     Rules:
       - model already carries an effort suffix -> keep it (model wins).
-      - model is bare and effort is set -> append '-' + effort.
-      - model is bare and no effort -> append the per-family default suffix.
+      - known suffix family + valid effort -> append '-' + effort; levels
+        not shipped for that family clamp to the family's highest shipped
+        level (default: ``high``) with a warning.
+      - known suffix family + no effort -> pass the bare family alias
+        through; agy resolves its own default level.
+      - unknown model -> pass through verbatim; if effort is set, warn that
+        it is dropped (we never suffix unknown names).
       - empty model -> return ''.
     """
     m = (model or "").strip()
@@ -1537,10 +1561,28 @@ def canonical_agy_model(model: str, effort: str | None) -> str:
         if m.endswith(s):
             return m
     e = (effort or "").strip().lower()
+    if m in _AGY_SUFFIX_FAMILIES:
+        if e in ("low", "medium", "high", "xhigh", "max"):
+            allowed = _AGY_FAMILY_SUFFIXES.get(m, _AGY_DEFAULT_SUFFIXES)
+            if e not in allowed:
+                ceiling = max(allowed, key=lambda v: ("low", "medium", "high").index(v))
+                logger.warning(
+                    "agy model %s does not ship effort %r; clamping to %r "
+                    "(highest available: %s)",
+                    m, e, ceiling, ", ".join(sorted(allowed)),
+                )
+                e = ceiling
+            return f"{m}-{e}"
+        # No effort (or unrecognized value): bare alias is valid; agy
+        # resolves its default level server-side.
+        return m
     if e in ("low", "medium", "high", "xhigh", "max"):
-        return f"{m}-{e}"
-    default = _AGY_DEFAULT_EFFORT.get(m)
-    return f"{m}-{default}" if default else m
+        logger.warning(
+            "effort %r ignored for unknown agy model %r: suffix folding only "
+            "applies to known families %s; passing the model name verbatim",
+            e, m, sorted(_AGY_SUFFIX_FAMILIES),
+        )
+    return m
 
 
 # ---------------------------------------------------------------------------

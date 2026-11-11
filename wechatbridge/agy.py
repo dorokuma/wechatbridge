@@ -243,15 +243,26 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     first = is_first_message(session_dir, backend="agy")
 
-    # Build command: agy [--model X] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
+    # Build command: agy [--model X] [--effort Y] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
     # --dangerously-skip-permissions 保留：可信小圈子用户需 agy 能自动调工具，风险由服务层(root)+输入来源(可信用户)承担
-    # NOTE: agy 不接受 --effort（只有部分模型支持，其余 warn/报错），思考等级统一
-    #       归并进模型名后缀（gemini-3.8-flash -> -high，gemini-4-argon -> -medium）。
+    # NOTE: effort 归并进已知家族的模型名后缀（canonical_agy_model 白名单）；
+    #       未知模型不造后缀、effort 不落 flag（canonical_agy_model 已 warn）。
+    #       例外：无 model 只设 effort（如未设模型直接 /fast）时透传 --effort，
+    #       由 agy 作用于其会话默认模型——这是 effort-only 唯一的可达路径。
     cmd = [config.agy_binary_path, "--dangerously-skip-permissions"]
     prefs = load_prefs(user_id)
     model = canonical_agy_model(prefs.get("model"), prefs.get("effort"))
     if model:
         cmd += ["--model", model]
+    elif prefs.get("effort"):
+        e = prefs["effort"].strip().lower()
+        if e in ("low", "medium", "high", "xhigh", "max"):
+            cmd += ["--effort", e]
+        else:
+            logger.warning(
+                "Ignoring unrecognized agy effort %r for user %s (no model set)",
+                prefs["effort"], user_id,
+            )
     if prefs.get("mode"):
         cmd += ["--mode", prefs["mode"]]
     valid_add_dirs = []

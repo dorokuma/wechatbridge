@@ -3331,27 +3331,35 @@ class TestAgyStreamRetry(unittest.IsolatedAsyncioTestCase):
 
 
 class TestCanonicalAgyModel(unittest.TestCase):
-    """Table-driven coverage for canonical_agy_model suffix normalization."""
+    """canonical_agy_model never fabricates a model id agy doesn't ship."""
 
     def test_cases(self):
         from wechatbridge.runner_common import canonical_agy_model
 
         cases = [
-            # already-suffixed model wins over any effort
+            # already-suffixed model wins over any effort (verbatim, even
+            # levels agy doesn't list — the user typed a concrete id)
             ("gemini-3.8-flash-high", None, "gemini-3.8-flash-high"),
             ("gemini-3.8-flash-low", "high", "gemini-3.8-flash-low"),
             ("gemini-3.8-flash-xhigh", "low", "gemini-3.8-flash-xhigh"),
-            # bare known model + no effort -> per-family default suffix
-            ("gemini-3.8-flash", None, "gemini-3.8-flash-high"),
-            ("gemini-4-argon", None, "gemini-4-argon-medium"),
-            # bare model + valid effort -> f"{model}-{effort}" (normalized lower)
+            # bare known family + valid effort -> shipped suffixed id
             ("gemini-3.8-flash", "low", "gemini-3.8-flash-low"),
-            ("gemini-4-argon", "xhigh", "gemini-4-argon-xhigh"),
-            ("other-model", "max", "other-model-max"),
             ("gemini-4-argon", "  HIGH ", "gemini-4-argon-high"),
-            # bare unknown model + no effort -> unchanged
+            # bare known family + no effort -> bare alias, agy resolves the
+            # default level itself (no fabricated id)
+            ("gemini-3.8-flash", None, "gemini-3.8-flash"),
+            ("gemini-4-argon", None, "gemini-4-argon"),
+            ("claude-sonnet-5-5", None, "claude-sonnet-5-5"),
+            # bare known family + unshipped level -> clamp to highest
+            # shipped level (never emit a nonexistent id)
+            ("gemini-4-argon", "xhigh", "gemini-4-argon-high"),
+            ("claude-opus-5-5", "max", "claude-opus-5-5-high"),
+            ("gpt-oss-120b", "high", "gpt-oss-120b-medium"),
+            # bare unknown model -> verbatim pass-through; effort is NOT
+            # folded (would fabricate an id)
             ("some-future-model", None, "some-future-model"),
             ("some-future-model", "bogus", "some-future-model"),
+            ("other-model", "max", "other-model"),
             # empty / blank model -> ''
             ("", "high", ""),
             (None, "high", ""),
@@ -3361,9 +3369,29 @@ class TestCanonicalAgyModel(unittest.TestCase):
             with self.subTest(model=model, effort=effort):
                 self.assertEqual(canonical_agy_model(model, effort), expected)
 
+    def test_unknown_model_effort_drop_and_clamp_warn(self):
+        """Non-silent: dropping effort on an unknown model, and clamping an
+        unshipped level, must each emit a warning."""
+        from wechatbridge.runner_common import canonical_agy_model
+
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("some-future-model", "max"),
+                "some-future-model",
+            )
+        self.assertTrue(any("max" in m and "some-future-model" in m for m in cm.output))
+
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("gemini-4-argon", "xhigh"),
+                "gemini-4-argon-high",
+            )
+        self.assertTrue(any("xhigh" in m for m in cm.output))
+
 
 class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
-    """run_agy must fold effort into the model id and never pass --effort."""
+    """run_agy argv contract: --model never carries a fabricated id; --effort
+    is only emitted bare (no --model) for the effort-only (/fast) path."""
 
     def setUp(self):
         from wechatbridge.config import config
@@ -3408,15 +3436,23 @@ class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_effort_flag_and_canonical_model(self):
         cases = [
-            # bare known model -> default suffix folded into --model
-            ({"backend": "agy", "model": "gemini-3.8-flash", "effort": "", "mode": ""},
-             "gemini-3.8-flash-high"),
-            # bare model + explicit effort -> f"{model}-{effort}"
+            # bare known family + valid effort -> shipped suffixed id
+            ({"backend": "agy", "model": "gemini-3.8-flash", "effort": "low", "mode": ""},
+             "gemini-3.8-flash-low"),
             ({"backend": "agy", "model": "gemini-4-argon", "effort": "high", "mode": ""},
              "gemini-4-argon-high"),
+            # bare known family, unshipped level -> clamps to shipped ceiling
+            ({"backend": "agy", "model": "gemini-4-argon", "effort": "xhigh", "mode": ""},
+             "gemini-4-argon-high"),
+            # bare known family, no effort -> bare alias (agy resolves it)
+            ({"backend": "agy", "model": "gemini-3.8-flash", "effort": "", "mode": ""},
+             "gemini-3.8-flash"),
             # suffixed model + explicit effort -> model suffix wins
             ({"backend": "agy", "model": "gemini-3.8-flash-low", "effort": "high", "mode": ""},
              "gemini-3.8-flash-low"),
+            # unknown model + effort -> verbatim, effort NOT folded, no flag
+            ({"backend": "agy", "model": "some-future-model", "effort": "low", "mode": ""},
+             "some-future-model"),
             # bare unknown model + no effort -> model passed through
             ({"backend": "agy", "model": "some-future-model", "effort": "", "mode": ""},
              "some-future-model"),
@@ -3428,9 +3464,19 @@ class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("--model", argv)
                 self.assertEqual(argv[argv.index("--model") + 1], expected_model)
 
-    async def test_no_model_no_effort_flags(self):
+    async def test_effort_only_passes_effort_flag(self):
+        """/fast without a model must still reach agy as bare --effort."""
         argv = await self._argv_for(
             {"backend": "agy", "model": "", "effort": "low", "mode": ""},
+            "u-agy-effortonly",
+        )
+        self.assertNotIn("--model", argv)
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "low")
+
+    async def test_no_model_bogus_effort_no_flags(self):
+        argv = await self._argv_for(
+            {"backend": "agy", "model": "", "effort": "bogus", "mode": ""},
             "u-agy-nomodel",
         )
         self.assertNotIn("--effort", argv)

@@ -5,6 +5,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-11
+
+### Fixed
+
+- **agy 模型 id 不再凭空拼接**：`canonical_agy_model` 只对实测存在 effort 后缀形态的已知家族（`gemini-4-carbon`/`gemini-4-argon`/`gemini-3.8-flash`/`claude-opus-5-5`/`claude-sonnet-5-5`/`gpt-oss-120b`）折叠 `low|medium|high` 后缀；未知模型名原样透传并记 warning 说明 effort 未生效。实测不存在的档位（`xhigh`/`max`）钳到该家族最高可用档并 WARNING。
+- **effort-only 恢复可达**：无 model 仅设 effort（如未设模型直接 `/fast`）时透传 `--effort`，不再静默什么都不传。
+- `deploy/wechatbridge.env.example` 访问控制回退为注释态 `# WECHATBRIDGE_ALLOWED_SENDERS=`：`*` 在 `main.py` 走 WARNING 分支比空值 INFO 更吵，且 `*` 放行任何可私聊 bot 的账号，原默认注释理由不成立。
+
+### Tests
+
+- `TestCanonicalAgyModel` 覆盖：已知家族正常档/不可用档钳位、未知模型透传+effort 不落、已带后缀 model wins、空 model。
+- `TestAgyModelFlag` 覆盖 argv：已知家族+正常/不可用档、裸已知家族 alias 透传、未知模型+effort 不折叠、effort-only 传 `--effort`、非法 effort-only 不落 flag。
+
 ## [1.9.0] - 2026-11-03
 
 ### Added
