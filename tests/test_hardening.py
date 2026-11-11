@@ -3330,6 +3330,113 @@ class TestAgyStreamRetry(unittest.IsolatedAsyncioTestCase):
         mock_sleep.assert_not_awaited()
 
 
+class TestCanonicalAgyModel(unittest.TestCase):
+    """Table-driven coverage for canonical_agy_model suffix normalization."""
+
+    def test_cases(self):
+        from wechatbridge.runner_common import canonical_agy_model
+
+        cases = [
+            # already-suffixed model wins over any effort
+            ("gemini-3.8-flash-high", None, "gemini-3.8-flash-high"),
+            ("gemini-3.8-flash-low", "high", "gemini-3.8-flash-low"),
+            ("gemini-3.8-flash-xhigh", "low", "gemini-3.8-flash-xhigh"),
+            # bare known model + no effort -> per-family default suffix
+            ("gemini-3.8-flash", None, "gemini-3.8-flash-high"),
+            ("gemini-4-argon", None, "gemini-4-argon-medium"),
+            # bare model + valid effort -> f"{model}-{effort}" (normalized lower)
+            ("gemini-3.8-flash", "low", "gemini-3.8-flash-low"),
+            ("gemini-4-argon", "xhigh", "gemini-4-argon-xhigh"),
+            ("other-model", "max", "other-model-max"),
+            ("gemini-4-argon", "  HIGH ", "gemini-4-argon-high"),
+            # bare unknown model + no effort -> unchanged
+            ("some-future-model", None, "some-future-model"),
+            ("some-future-model", "bogus", "some-future-model"),
+            # empty / blank model -> ''
+            ("", "high", ""),
+            (None, "high", ""),
+            ("   ", None, ""),
+        ]
+        for model, effort, expected in cases:
+            with self.subTest(model=model, effort=effort):
+                self.assertEqual(canonical_agy_model(model, effort), expected)
+
+
+class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
+    """run_agy must fold effort into the model id and never pass --effort."""
+
+    def setUp(self):
+        from wechatbridge.config import config
+
+        self.td = tempfile.mkdtemp(prefix="wb-agy-model-")
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            # Isolate host credential paths: ensure_user_gemini reads
+            # ~/.gemini/... via expanduser/HOST_HOME and run_agy scans
+            # config.agy_scratch_dir — redirect all into the tmp dir.
+            mock.patch.dict(
+                os.environ,
+                {"HOME": self.td, "WECHATBRIDGE_HOST_HOME": self.td},
+                clear=False,
+            ),
+            mock.patch.object(
+                config, "agy_scratch_dir", os.path.join(self.td, "scratch")
+            ),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    async def _argv_for(self, prefs: dict, user_id: str) -> list:
+        from wechatbridge import agy as agy_mod
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs(user_id, prefs)
+        captured = []
+
+        async def spawn(*args, **_k):
+            captured.append(list(args))
+            return _FakeAgyProc("ok", "", rc=0)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            await agy_mod.run_agy("hi", user_id)
+        return captured[0]
+
+    async def test_no_effort_flag_and_canonical_model(self):
+        cases = [
+            # bare known model -> default suffix folded into --model
+            ({"backend": "agy", "model": "gemini-3.8-flash", "effort": "", "mode": ""},
+             "gemini-3.8-flash-high"),
+            # bare model + explicit effort -> f"{model}-{effort}"
+            ({"backend": "agy", "model": "gemini-4-argon", "effort": "high", "mode": ""},
+             "gemini-4-argon-high"),
+            # suffixed model + explicit effort -> model suffix wins
+            ({"backend": "agy", "model": "gemini-3.8-flash-low", "effort": "high", "mode": ""},
+             "gemini-3.8-flash-low"),
+            # bare unknown model + no effort -> model passed through
+            ({"backend": "agy", "model": "some-future-model", "effort": "", "mode": ""},
+             "some-future-model"),
+        ]
+        for i, (prefs, expected_model) in enumerate(cases):
+            with self.subTest(i=i, prefs=prefs):
+                argv = await self._argv_for(prefs, f"u-agy-model-{i}")
+                self.assertNotIn("--effort", argv)
+                self.assertIn("--model", argv)
+                self.assertEqual(argv[argv.index("--model") + 1], expected_model)
+
+    async def test_no_model_no_effort_flags(self):
+        argv = await self._argv_for(
+            {"backend": "agy", "model": "", "effort": "low", "mode": ""},
+            "u-agy-nomodel",
+        )
+        self.assertNotIn("--effort", argv)
+        self.assertNotIn("--model", argv)
+
+
 class TestAuditHardeningFixes(unittest.IsolatedAsyncioTestCase):
     """Regression tests for deep-audit security and correctness fixes."""
 

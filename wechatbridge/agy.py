@@ -20,7 +20,7 @@ from .runner_common import (
     _sanitize_prompt_at_paths,
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, is_sensitive_artifact_path, parse_model_effort,
-    sanitize_env, terminate_process, update_active_prefs,
+    sanitize_env, terminate_process, update_active_prefs, canonical_agy_model,
     format_error, format_cli_error, format_timeout_error, format_model_label, _classify_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir, path_is_under,
     _snapshot_regular_files, collect_session_fallback_artifacts, merge_artifact_groups,
@@ -243,28 +243,15 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     first = is_first_message(session_dir, backend="agy")
 
-    # Build command: agy [--model X] [--effort Y] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
+    # Build command: agy [--model X] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
     # --dangerously-skip-permissions 保留：可信小圈子用户需 agy 能自动调工具，风险由服务层(root)+输入来源(可信用户)承担
+    # NOTE: agy 不接受 --effort（只有部分模型支持，其余 warn/报错），思考等级统一
+    #       归并进模型名后缀（gemini-3.8-flash -> -high，gemini-4-argon -> -medium）。
     cmd = [config.agy_binary_path, "--dangerously-skip-permissions"]
     prefs = load_prefs(user_id)
-    model = prefs.get("model")
-    effort = prefs.get("effort")
+    model = canonical_agy_model(prefs.get("model"), prefs.get("effort"))
     if model:
-        base_model, embedded_effort = parse_model_effort(model)
-        if embedded_effort and effort:
-            # model has effort suffix AND user wants a different effort
-            # -> use base model name + --effort from prefs (no conflict)
-            cmd += ["--model", base_model, "--effort", effort]
-        elif embedded_effort:
-            # model has effort suffix, no explicit effort -> model carries it
-            cmd += ["--model", model]
-        else:
-            # plain model name -> pass effort if set
-            cmd += ["--model", model]
-            if effort:
-                cmd += ["--effort", effort]
-    elif effort:
-        cmd += ["--effort", effort]
+        cmd += ["--model", model]
     if prefs.get("mode"):
         cmd += ["--mode", prefs["mode"]]
     valid_add_dirs = []

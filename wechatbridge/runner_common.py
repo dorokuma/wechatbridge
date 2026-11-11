@@ -1506,6 +1506,44 @@ def parse_model_effort(model: str) -> tuple[str, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# agy model canonicalization
+# ---------------------------------------------------------------------------
+
+# agy CLI exposes thinking levels as suffixes on the model id itself
+# (e.g. gemini-3.8-flash-high). The --effort flag only works for a subset of
+# models; others either warn-and-ignore or hard-fail on conflict. To make
+# behavior uniform we always hand agy a fully-suffixed model id and never pass
+# --effort.
+_AGY_DEFAULT_EFFORT: dict[str, str] = {
+    "gemini-3.8-flash": "high",
+    "gemini-4-argon": "medium",
+}
+_AGY_SUFFIXES = ("-low", "-medium", "-high", "-xhigh", "-max")
+
+
+def canonical_agy_model(model: str, effort: str | None) -> str:
+    """Return a fully-suffixed agy model id; never emit --effort.
+
+    Rules:
+      - model already carries an effort suffix -> keep it (model wins).
+      - model is bare and effort is set -> append '-' + effort.
+      - model is bare and no effort -> append the per-family default suffix.
+      - empty model -> return ''.
+    """
+    m = (model or "").strip()
+    if not m:
+        return ""
+    for s in _AGY_SUFFIXES:
+        if m.endswith(s):
+            return m
+    e = (effort or "").strip().lower()
+    if e in ("low", "medium", "high", "xhigh", "max"):
+        return f"{m}-{e}"
+    default = _AGY_DEFAULT_EFFORT.get(m)
+    return f"{m}-{default}" if default else m
+
+
+# ---------------------------------------------------------------------------
 # Subprocess environment and process management
 # ---------------------------------------------------------------------------
 
