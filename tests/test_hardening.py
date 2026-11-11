@@ -3174,9 +3174,21 @@ class TestUpdateScriptPackageMatch(unittest.TestCase):
                 )
             self.assertIn("WARNING", _run())
 
-            # 已配 ADMINS → 不警告
+            # 引号包裹的空值同样视为未配置——config._parse_env_file 会
+            # strip 引号得到空串并 fail-closed，升级脚本不得当成有效配置
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write(
+                    'WECHATBRIDGE_ALLOWED_SENDERS=""\n'
+                    "WECHATBRIDGE_ADMINS=''\n"
+                )
+            self.assertIn("WARNING", _run())
+
+            # 已配 ADMINS → 不警告（含引号包裹的有效值）
             with open(env_file, "w", encoding="utf-8") as f:
                 f.write("WECHATBRIDGE_ADMINS=wxid_admin\n")
+            self.assertNotIn("WARNING", _run())
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write('WECHATBRIDGE_ALLOWED_SENDERS="wxid_a"\n')
             self.assertNotIn("WARNING", _run())
 
 
@@ -4050,6 +4062,69 @@ class TestDshHostCredentialContentMatch(unittest.TestCase):
                 self.assertTrue(rc.is_sensitive_artifact_path(g_out, ""))
                 self.assertTrue(rc.is_sensitive_artifact_path(c_out, ""))
 
+    def test_host_agy_oauth_token_blocks_renamed_artifact(self):
+        """v1.8.0 follow-up: host agy oauth token content must block renamed
+        artifacts under BOTH roots — ``os.path.expanduser("~")`` (HOME, what
+        agy.py actually copies from) and ``WECHATBRIDGE_HOST_HOME`` — even
+        when they diverge. Fully isolated: HOME, WECHATBRIDGE_HOST_HOME,
+        host_dsh_home and session dirs all live inside one TemporaryDirectory,
+        so no real host .credentials.yaml / .grok / .codex / .gemini file is
+        ever opened."""
+        from wechatbridge import runner_common as rc
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            # HOME=A — expanduser("~") root (agy's real token_src source)
+            env_home = os.path.join(td, "env_home")
+            # WECHATBRIDGE_HOST_HOME=B — runner_common._host_home() root
+            host_home = os.path.join(td, "host_home")
+            sess_dir = os.path.join(td, "session")
+            for root in (env_home, host_home):
+                os.makedirs(
+                    os.path.join(root, ".gemini", "antigravity-cli")
+                )
+            os.makedirs(sess_dir)
+            agy_secret_a = b"{" + b"agya" * 40 + b"}"
+            agy_secret_b = b"{" + b"agyb" * 40 + b"}"
+            with open(
+                os.path.join(
+                    env_home, ".gemini", "antigravity-cli",
+                    "antigravity-oauth-token",
+                ), "wb",
+            ) as f:
+                f.write(agy_secret_a)
+            with open(
+                os.path.join(
+                    host_home, ".gemini", "antigravity-cli",
+                    "antigravity-oauth-token",
+                ), "wb",
+            ) as f:
+                f.write(agy_secret_b)
+            # 改名复制后的产物分别落在会话目录内
+            out_a = os.path.join(sess_dir, "notes_a.txt")
+            out_b = os.path.join(sess_dir, "notes_b.txt")
+            with open(out_a, "wb") as f:
+                f.write(b"prefix\n" + agy_secret_a + b"\nsuffix\n")
+            with open(out_b, "wb") as f:
+                f.write(b"prefix\n" + agy_secret_b + b"\nsuffix\n")
+
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": env_home, "WECHATBRIDGE_HOST_HOME": host_home},
+                clear=False,
+            ), mock.patch.object(
+                rc, "host_dsh_home", return_value=host_home
+            ), mock.patch.object(
+                config, "dsh_state_dir", os.path.join(td, "dsh_state")
+            ):
+                # HOME == A 根下的 mock token 能拦截改名产物
+                self.assertTrue(rc.is_sensitive_artifact_path(out_a, sess_dir))
+                # WECHATBRIDGE_HOST_HOME == B 根下的 mock token 也能拦截
+                self.assertTrue(rc.is_sensitive_artifact_path(out_b, sess_dir))
+                # 会话目录为空串时宿主凭据内容匹配仍生效
+                self.assertTrue(rc.is_sensitive_artifact_path(out_a, ""))
+                self.assertTrue(rc.is_sensitive_artifact_path(out_b, ""))
+
 
 class TestUxErrorAndHelp(unittest.IsolatedAsyncioTestCase):
     """v1.9.0 UX batch: FileNotFoundError 归类、超时/unknown 文案、
@@ -4430,6 +4505,39 @@ class TestAgyExtractArtifactsFourModes(unittest.TestCase):
         arts = self._extract(f"[e](file:///{ext})")
         self.assertEqual(arts, [])
 
+    def test_extracted_path_is_canonical_realpath(self):
+        """v1.9.0 O4: extracted artifact paths are canonical realpaths — the
+        same form send_artifacts_back validates, so extract/send can never
+        diverge on a symlinked alias of an in-root file."""
+        real_file = os.path.join(self.session, "sub", "real.pdf")
+        os.makedirs(os.path.dirname(real_file), exist_ok=True)
+        with open(real_file, "w") as f:
+            f.write("x")
+        link = os.path.join(self.session, "alias.pdf")
+        os.symlink(real_file, link)
+        arts = self._extract(f"[a](file:///{link})")
+        self.assertEqual([p for _, p in arts], [os.path.realpath(link)])
+        # 指向同一文件的两个不同软链别名只提取一次（realpath 去重）
+        link2 = os.path.join(self.session, "alias2.pdf")
+        os.symlink(real_file, link2)
+        arts = self._extract(f"[a](file:///{link}) [b](file:///{link2})")
+        self.assertEqual([p for _, p in arts], [os.path.realpath(real_file)])
+
+    def test_escape_symlink_filtered_at_extract(self):
+        """v1.9.0 O4 regression: a symlink inside an allowed root that
+        resolves OUTSIDE any allowed root is still filtered at extract —
+        path_is_under realpaths both sides, so this never reaches the
+        send layer. Safety must not regress."""
+        outside = os.path.join(self.td, "outside")
+        os.makedirs(outside)
+        outside_file = os.path.join(outside, "out.pdf")
+        with open(outside_file, "w") as f:
+            f.write("x")
+        link = os.path.join(self.session, "escape.pdf")
+        os.symlink(outside_file, link)
+        arts = self._extract(f"[a](file:///{link})")
+        self.assertEqual(arts, [])
+
     def test_nonexistent_file_skipped(self):
         arts = self._extract(f"[gone](file:///{self.session}/gone.pdf)")
         self.assertEqual(arts, [])
@@ -4532,6 +4640,43 @@ class TestSessionFallbackArtifacts(unittest.TestCase):
         arts = self._collect(before, t0)
         self.assertEqual(arts, [])
 
+    def test_snapshot_limit_aborts_with_warning(self):
+        """v1.9.0 O2: hitting a scan bound returns empty but logs a warning
+        naming the limit hit — artifacts are no longer silently dropped."""
+        from wechatbridge import runner_common as rc
+
+        # file-count limit (>200 files)
+        for i in range(210):
+            with open(os.path.join(self.session, f"f{i}.txt"), "w"):
+                pass
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(self._snapshot(), {})
+        self.assertTrue(
+            any("file-count" in m for m in cm.output), msg=str(cm.output)
+        )
+
+        # dir-count limit (>50 dirs)
+        shutil.rmtree(self.session)
+        os.makedirs(self.session)
+        for i in range(60):
+            os.makedirs(os.path.join(self.session, f"d{i}"))
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(self._snapshot(), {})
+        self.assertTrue(
+            any("directory-count" in m for m in cm.output), msg=str(cm.output)
+        )
+
+        # scan-time limit (>2s)
+        ticks = iter([0.0, 2.5, 9.9, 9.9, 9.9, 9.9])
+        with mock.patch.object(
+            rc.time, "monotonic", side_effect=lambda: next(ticks)
+        ):
+            with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+                self.assertEqual(self._snapshot(), {})
+        self.assertTrue(
+            any("scan-time" in m for m in cm.output), msg=str(cm.output)
+        )
+
 
 class TestSendArtifactsBackZeroAndCap(unittest.IsolatedAsyncioTestCase):
     """P0-3c 0-byte skip + P1-3b outbound cap."""
@@ -4596,6 +4741,20 @@ class TestDisplayFilenameAndNotices(unittest.TestCase):
         self.assertEqual(_sanitize_display_filename("a@b\nc.pdf"), "abc.pdf")
         self.assertEqual(len(_sanitize_display_filename("x" * 200 + ".pdf")), 80)
         self.assertEqual(_sanitize_display_filename("normal.pdf"), "normal.pdf")
+
+    def test_sanitize_display_filename_strips_invisible_and_bidi(self):
+        """v1.9.0 O1: zero-width chars, bidi controls, U+FEFF and fullwidth ＠
+        are stripped from the display filename — visual-deception vectors
+        only; on-disk names still use the uuid+ext safe path."""
+        from wechatbridge.main import _sanitize_display_filename
+        bad = (
+            "a\u200b\u200c\u200d\u200e\u200f"
+            "\u202a\u202b\u202c\u202d\u202e"
+            "\u2066\u2067\u2068\u2069"
+            "\u061c"
+            "\ufeffb\uff20c.pdf"
+        )
+        self.assertEqual(_sanitize_display_filename(bad), "abc.pdf")
 
 
 class TestAgyDisplayStripsFilePaths(unittest.IsolatedAsyncioTestCase):

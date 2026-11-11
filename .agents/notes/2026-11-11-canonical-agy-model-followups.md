@@ -3,7 +3,7 @@
 来源：feat/canonical-agy-model 批次门禁审查（reviewer/verifier 观察项）与
 收口现场记录。本批已合并 main（merge commit `7617fd0`），版本 `1.9.4`。
 
-## O1（consider，未闭环）`_AGY_MAX_SUFFIX` 死代码
+## O1（已闭环 — `fix/followup-artifacts-and-secret` 顺手清理）`_AGY_MAX_SUFFIX` 死代码
 
 - **位置**：`wechatbridge/runner_common.py:1539`
 - **事实**：`_AGY_MAX_SUFFIX = "high"` 定义后无任何引用；钳位上限实际
@@ -12,7 +12,7 @@
 - **建议**：删除该常量，或改为被钳位逻辑引用（作为 ceiling 的单一事
   实来源）。无行为影响，不阻断。
 
-## O2（遗留，交下一轮）B 分支 `fix/followup-artifacts-and-secret` 未收口
+## O2（本分支正在收口）B 分支 `fix/followup-artifacts-and-secret` 未收口
 
 - **现状**：worktree 尖端 `4726145`，6 个未提交文件：
   `extract_artifacts` 软链 realpath 校验、oauth token 内容匹配、文件

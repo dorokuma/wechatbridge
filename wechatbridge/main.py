@@ -73,14 +73,32 @@ _background_tasks: set = set()
 MAX_OUTBOUND_ARTIFACTS_PER_TURN = 10
 
 
+# Invisible / direction-overriding chars plus every "@"-equivalent stripped
+# from display filenames: zero-width U+200B–U+200F, bidi controls
+# U+202A–U+202E / U+2066–U+2069 / U+061C ALM, BOM U+FEFF, fullwidth ＠ U+FF20
+# (visual deception only — the on-disk name uses uuid+ext).
+_DISPLAY_FILENAME_STRIP_CHARS = frozenset(
+    "@＠\ufeff\u061c"
+    + "".join(chr(c) for c in range(0x200B, 0x2010))
+    + "".join(chr(c) for c in range(0x202A, 0x202F))
+    + "".join(chr(c) for c in range(0x2066, 0x206A))
+)
+
+
 def _sanitize_display_filename(raw_name: str) -> str:
-    """Strip control characters / newlines / '@' from a user-supplied filename
-    for safe inclusion in a prompt, capped at 80 chars."""
+    """Strip control characters / newlines / '@' equivalents from a
+    user-supplied filename for safe inclusion in a prompt, capped at 80
+    chars. Contract: remove EVERY '@'-equivalent and every invisible /
+    direction-altering character (see _DISPLAY_FILENAME_STRIP_CHARS)."""
     if not raw_name:
         return ""
     out = []
     for ch in str(raw_name):
-        if ch == "@" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+        if (
+            ch in _DISPLAY_FILENAME_STRIP_CHARS
+            or ord(ch) < 0x20
+            or ord(ch) == 0x7F
+        ):
             continue
         out.append(ch)
     return "".join(out).strip()[:80]

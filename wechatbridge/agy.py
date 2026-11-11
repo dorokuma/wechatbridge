@@ -57,8 +57,13 @@ def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | No
 
     Paths are only kept when they resolve inside an allowed root
     (``session_dir``, ``config.agy_scratch_dir``, or any user-approved
-    ``--add-dir`` root) AND ``os.path.exists``. URL-decodes
-    (``urllib.parse.unquote``) percent-encoded spaces / CJK.
+    ``--add-dir`` root; ``path_is_under`` realpaths both sides) AND
+    ``os.path.exists`` on the resolved target. Emitted paths are the
+    canonical ``os.path.realpath`` — the exact same form
+    ``send_artifacts_back`` validates — and deduplication happens on that
+    canonical path, so several symlink aliases of one file are extracted
+    only once. URL-decodes (``urllib.parse.unquote``) percent-encoded
+    spaces / CJK.
     """
     if not text:
         return []
@@ -94,12 +99,27 @@ def extract_artifacts(text: str, session_dir: str = "", allowed_roots: list | No
         # 允许根校验只在提供 session_dir/allowed_roots 时启用——无上下文
         # 调用（纯解析/测试）保持原有放行行为。
         if roots:
-            if not _allowed(abs_path):
+            # Emit the canonical realpath — the exact same form
+            # send_artifacts_back validates — so extract/send never
+            # diverge, and dedupe keys on the real target (two symlink
+            # aliases of one file are extracted only once). The allow-root
+            # check was already realpath-based via path_is_under; this
+            # makes the canonical form explicit and checks exists() on
+            # the resolved path.
+            try:
+                real_path = os.path.realpath(abs_path)
+            except OSError:
                 return
-            if not os.path.exists(abs_path):
+            if not _allowed(real_path):
                 return
-        if path not in seen:
-            seen.add(path)
+            if not os.path.exists(real_path):
+                return
+            abs_path = real_path
+        # Dedupe on the normalized (realpath-resolved when roots apply)
+        # emitted path so two different symlink aliases of one file are
+        # only extracted once — the raw mention text may differ.
+        if abs_path not in seen:
+            seen.add(abs_path)
             result.append((name, abs_path))
 
     for m in _FILE_LINK_RE.finditer(text):
