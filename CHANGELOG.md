@@ -5,6 +5,23 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-11-11
+
+### Fixed
+
+- **model 自带后缀覆盖 effort 时不再静默**：`canonical_agy_model` 在模型名已带合法档位后缀（如 `gemini-3.8-flash-high`）且另存的 effort 与其不一致（如 `/fast` 存的 `low`）时，返回值不变（仍 model wins）但补一条 WARNING 说明该 effort 未生效；effort 与后缀一致时不告警，不制造噪音。
+
+### Docs
+
+- 首装访问控制提示：`deploy/wechatbridge.env.example` access-control 段与 `README.md`/`README.zh-CN.md` 安装步骤各补一句——白名单与 `WECHATBRIDGE_ADMINS` 都为空时拒绝所有用户（fail-closed），首装请至少填 `WECHATBRIDGE_ADMINS=<你的 wxid>` 或白名单。
+- 修正 `1.9.1` 小节里「`*` 比空值 INFO 更吵」的错误比较：白名单与 ADMINS 都空走的同样是 WARNING 分支。
+
+### Tests
+
+- `test_model_suffix_overrides_stored_effort_warns`：后缀与 effort 冲突时断言返回值与「effort 未生效」WARNING；一致时断言无告警。
+- `test_suffix_families_do_not_drift_from_agy_models`：静态清单（`_AGY_SUFFIX_FAMILIES`/`_AGY_FAMILY_SUFFIXES`）派生的每个 id 必须存在于运行时 `agy models` 清单；agy 不可用（如 CI）时回退到仓内显式快照清单，缺失即列出并失败。
+- `test_illegal_suffix_shapes_warn` 的 effort 丢弃断言改为按语义匹配（effort 值 + ignored/dropped 语义），不再绑定英文措辞与引号样式。
+
 ## [1.9.2] - 2026-11-11
 
 ### Fixed
@@ -25,7 +42,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 - **agy 模型 id 不再凭空拼接**：`canonical_agy_model` 只对实测存在 effort 后缀形态的已知家族（`gemini-4-carbon`/`gemini-4-argon`/`gemini-3.8-flash`/`claude-opus-5-5`/`claude-sonnet-5-5`/`gpt-oss-120b`）折叠 `low|medium|high` 后缀；未知模型名原样透传并记 warning 说明 effort 未生效。实测不存在的档位（`xhigh`/`max`）钳到该家族最高可用档并 WARNING。
 - **effort-only 恢复可达**：无 model 仅设 effort（如未设模型直接 `/fast`）时透传 `--effort`，不再静默什么都不传。
-- `deploy/wechatbridge.env.example` 访问控制回退为注释态 `# WECHATBRIDGE_ALLOWED_SENDERS=`：`*` 在 `main.py` 走 WARNING 分支比空值 INFO 更吵，且 `*` 放行任何可私聊 bot 的账号，原默认注释理由不成立。
+- `deploy/wechatbridge.env.example` 访问控制回退为注释态 `# WECHATBRIDGE_ALLOWED_SENDERS=`：`*` 放行任何可私聊 bot 的账号，原默认注释理由不成立。
 
 ### Tests
 

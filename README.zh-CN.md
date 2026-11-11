@@ -139,7 +139,7 @@ mkdir -p ~/.config/wechatbridge
 curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
 
-然后编辑 `~/.config/wechatbridge/.env` 修改你的配置。
+然后编辑 `~/.config/wechatbridge/.env` 修改你的配置。**首次安装注意**：`WECHATBRIDGE_ALLOWED_SENDERS` 与 `WECHATBRIDGE_ADMINS` 都为空时桥会拒绝所有用户（fail-closed）——请至少填写 `WECHATBRIDGE_ADMINS=<你的 wxid>` 或白名单之一。
 
 关键变量（都有默认值）：
 

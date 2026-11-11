@@ -139,7 +139,7 @@ mkdir -p ~/.config/wechatbridge
 curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
 
-Then edit `~/.config/wechatbridge/.env` with your settings.
+Then edit `~/.config/wechatbridge/.env` with your settings. **First install:** if both `WECHATBRIDGE_ALLOWED_SENDERS` and `WECHATBRIDGE_ADMINS` are left empty the bridge denies every user (fail-closed) — set at least `WECHATBRIDGE_ADMINS=<your wxid>` or the allowlist.
 
 Key variables (all have defaults):
 

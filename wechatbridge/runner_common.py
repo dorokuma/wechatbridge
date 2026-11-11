@@ -1547,7 +1547,8 @@ def canonical_agy_model(model: str, effort: str | None) -> str:
       - model carries a recognized level suffix (`-low`/`-medium`/`-high`/
         `-xhigh`/`-max`):
           * known family + level it ships -> keep the id verbatim (model
-            wins over any separate effort value).
+            wins over any separate effort value); warns when a stored
+            effort disagrees with the suffix.
           * known family + level it does not ship -> clamp to the family's
             highest shipped level with a warning.
           * unknown family -> strip the suffix with a warning and treat
@@ -1578,7 +1579,16 @@ def canonical_agy_model(model: str, effort: str | None) -> str:
                 if base in _AGY_SUFFIX_FAMILIES:
                     allowed = _AGY_FAMILY_SUFFIXES.get(base, _AGY_DEFAULT_SUFFIXES)
                     if level in allowed:
-                        return m  # real shipped id; model wins over effort
+                        # Real shipped id; the model's own suffix wins over
+                        # any separately stored effort (model wins).
+                        if e and e != level:
+                            logger.warning(
+                                "stored effort %r is not applied: model id %r "
+                                "already carries suffix %r and the model name "
+                                "takes precedence",
+                                e, m, level,
+                            )
+                        return m
                     ceiling = max(
                         allowed, key=lambda v: ("low", "medium", "high").index(v)
                     )

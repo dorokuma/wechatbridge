@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -3425,8 +3427,17 @@ class TestCanonicalAgyModel(unittest.TestCase):
         self.assertTrue(
             any("other-model" in m and "xhigh" in m for m in cm.output)
         )
-        # ...and the separate effort is dropped with its own warning
-        self.assertTrue(any("'high'" in m and "ignored" in m for m in cm.output))
+        # ...and the separate effort is dropped with its own warning.
+        # Assert the contract (a distinct warning naming the dropped effort
+        # value and drop/ignore semantics), not the English wording or the
+        # quote style around it.
+        self.assertTrue(
+            any(
+                re.search(r"high", m)
+                and re.search(r"ignor|drop|discard|not applied", m, re.I)
+                for m in cm.output
+            )
+        )
 
         # known family + unrecognized trailing word -> bare family alias
         with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
@@ -3437,6 +3448,110 @@ class TestCanonicalAgyModel(unittest.TestCase):
         self.assertTrue(
             any("ultra" in m and "gemini-4-argon" in m for m in cm.output)
         )
+
+    def test_model_suffix_overrides_stored_effort_warns(self):
+        """A stored effort disagreeing with the model's own suffix must not
+        be dropped silently: the verbatim id is kept and one WARNING names
+        the ignored effort. A matching effort stays quiet."""
+        from wechatbridge.runner_common import canonical_agy_model
+
+        with self.assertLogs("wechatbridge.runner", level="WARNING") as cm:
+            self.assertEqual(
+                canonical_agy_model("gemini-3.8-flash-high", "low"),
+                "gemini-3.8-flash-high",
+            )
+        self.assertTrue(
+            any(
+                re.search(r"low", m)
+                and re.search(r"high", m)
+                and re.search(r"not applied|ignor|drop|precedence", m, re.I)
+                for m in cm.output
+            )
+        )
+
+        # effort consistent with the suffix -> no warning noise
+        with self.assertNoLogs("wechatbridge.runner", level="WARNING"):
+            self.assertEqual(
+                canonical_agy_model("gemini-3.8-flash-high", "high"),
+                "gemini-3.8-flash-high",
+            )
+
+    # Expected `agy models` snapshot (ground truth 2026-11-11). Used when no
+    # live `agy` binary is runnable (CI installs Python deps only). Keep it
+    # in sync with `agy models` whenever the agy side changes.
+    _EXPECTED_AGY_MODEL_IDS = frozenset({
+        "claude-opus-5-5-high",
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-sonnet-5-5-high",
+        "claude-sonnet-5-5-low",
+        "claude-sonnet-5-5-medium",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-4-argon-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-carbon-high",
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-medium",
+        "gpt-oss-120b-medium",
+    })
+
+    def test_suffix_families_do_not_drift_from_agy_models(self):
+        """Every suffixed id canonical_agy_model may emit must exist in the
+        runtime `agy models` list (fallback: the checked-in snapshot above),
+        so an upstream removal of a family/level turns this test red."""
+        from wechatbridge.runner_common import (
+            _AGY_DEFAULT_SUFFIXES,
+            _AGY_FAMILY_SUFFIXES,
+            _AGY_SUFFIX_FAMILIES,
+        )
+
+        live_ids = self._agy_model_ids_from_live_cli()
+        if live_ids is not None:
+            reference, source = set(live_ids), "`agy models` (live CLI)"
+        else:
+            reference, source = self._EXPECTED_AGY_MODEL_IDS, "checked-in snapshot"
+
+        hardcoded_ids = set()
+        for fam in _AGY_SUFFIX_FAMILIES:
+            levels = _AGY_FAMILY_SUFFIXES.get(fam, _AGY_DEFAULT_SUFFIXES)
+            hardcoded_ids.update(f"{fam}-{lvl}" for lvl in levels)
+
+        missing = sorted(hardcoded_ids - reference)
+        self.assertEqual(
+            missing,
+            [],
+            msg=(
+                f"hardcoded agy ids missing from {source}: {missing}; "
+                "refresh _AGY_SUFFIX_FAMILIES/_AGY_FAMILY_SUFFIXES (and "
+                "_EXPECTED_AGY_MODEL_IDS) against `agy models`"
+            ),
+        )
+
+    @staticmethod
+    def _agy_model_ids_from_live_cli() -> list[str] | None:
+        """Return `agy models` ids, or None when agy is not runnable here
+        (binary absent, guarded, or call failed)."""
+        agy_bin = os.environ.get("AGY_BIN_PATH") or shutil.which("agy")
+        if not agy_bin:
+            return None
+        try:
+            proc = subprocess.run(
+                [agy_bin, "models"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        from wechatbridge.agy import _parse_agy_model_ids
+
+        ids = _parse_agy_model_ids(proc.stdout)
+        return ids or None
 
 
 class TestAgyModelFlag(unittest.IsolatedAsyncioTestCase):
