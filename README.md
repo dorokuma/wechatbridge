@@ -14,6 +14,48 @@ WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex /
 
 The bridge process stays up and long-polls iLink. For prompts that go to a CLI, it spawns one `agy` / `grok` / `codex` / `dsh` child (single-turn) and exits that child when done — the child does not stay resident. Many slash commands (`/help`, `/backend`, `/persona`, …) are handled inside the bridge and never start a CLI. Only artifacts the bridge can detect under the user's allowed session paths are pushed back via CDN.
 
+## Quick start
+
+Six steps, about 10 minutes from zero to your first reply in WeChat.
+
+1. **Install one CLI backend and sign in.** You need at least one: [agy](https://antigravity.google/docs/cli) (Google Antigravity), [grok](https://docs.x.ai/build/overview) (xAI Grok Build), [codex](https://developers.openai.com/codex/cli) (OpenAI Codex), or [dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md) (DeepSeek Harness). Any one of them is enough — pick the one you already use. After installing, complete its login once (e.g. `grok login`, `codex login`, `dsh login`).
+
+2. **Install WeChatBridge:**
+
+   ```bash
+   pipx install wechatbridge-cli
+   wechatbridge --version
+   ```
+
+3. **Get the WeChat bot channel.** The ClawBot / iLink channel is Tencent's official, free personal-account bot channel — no application, review, qualification, or payment required. Run:
+
+   ```bash
+   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+   ```
+
+   It guides you through scanning a QR code to bind your WeChat account. This step only gives the WeChat side a bindable bot identity; no credentials are stored in this repository.
+
+4. **Write a minimal config:**
+
+   ```bash
+   mkdir -p ~/.config/wechatbridge
+   curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
+   ```
+
+   Then edit `~/.config/wechatbridge/.env` and, for the first run, use the open mode:
+
+   ```bash
+   WECHATBRIDGE_ALLOWED_SENDERS=*
+   ```
+
+   Why `*`: the bridge fails closed — with both `WECHATBRIDGE_ALLOWED_SENDERS` and `WECHATBRIDGE_ADMINS` empty it denies everyone, and you don't know your own `wxid` yet.
+
+5. **Start it and bind:** run `wechatbridge`, then scan the QR code printed in the terminal with WeChat on your phone. The QR code expires after 180 seconds — if it times out, just rerun `wechatbridge`.
+
+6. **Get your own wxid and tighten the whitelist.** In WeChat, send the bot any message, then find that message's sender ID in the bridge log — it appears as `from=<id>`. Put that ID into `WECHATBRIDGE_ALLOWED_SENDERS` in place of `*` and restart. `*` is for first-run debugging only; tighten it for long-term use.
+
+See **Configure** below for every variable, and **Deploy** for running it as a service.
+
 ## Features
 
 - Text, image, file, and voice (WeChat server-side transcription only) go to the **active** backend (`agy`, `grok`, `codex`, or `dsh`)
@@ -139,7 +181,7 @@ mkdir -p ~/.config/wechatbridge
 curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
 
-Then edit `~/.config/wechatbridge/.env` with your settings. **First install:** if both `WECHATBRIDGE_ALLOWED_SENDERS` and `WECHATBRIDGE_ADMINS` are left empty the bridge denies every user (fail-closed) — set at least `WECHATBRIDGE_ADMINS=<your wxid>` or the allowlist.
+Then edit `~/.config/wechatbridge/.env` with your settings. **First install:** if both `WECHATBRIDGE_ALLOWED_SENDERS` and `WECHATBRIDGE_ADMINS` are left empty the bridge denies every user (fail-closed). Since you cannot know your own `wxid` before the first run, start with `WECHATBRIDGE_ALLOWED_SENDERS=*`, send the bot a message, read your sender ID (`from=<id>`) from the bridge log, then replace `*` with that wxid — and optionally set `WECHATBRIDGE_ADMINS=<your wxid>` — and restart.
 
 Key variables (all have defaults):
 

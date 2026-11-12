@@ -14,6 +14,48 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 桥接进程本身一直在跑、长轮询 iLink。需要交给 CLI 的提示才会按需拉起一个 agy / grok / codex / dsh 子进程（单轮），**子进程**跑完即退、不常驻。许多 slash（如 `/help`、`/backend`、`/persona`）在桥内直接处理，不会起 CLI。只有桥能识别、且落在用户允许目录内的产物，才会经 CDN 回传。
 
+## 快速开始
+
+六步，从零到在微信里收到第一条回复，大约 10 分钟。
+
+1. **装一个 CLI 后端并登录。** 至少需要一个：[agy](https://antigravity.google/docs/cli)（谷歌 Antigravity）、[grok](https://docs.x.ai/build/overview)（xAI Grok Build）、[codex](https://developers.openai.com/codex/cli)（OpenAI Codex）或 [dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md)（DeepSeek Harness）。四者任选其一，用你已经有的那个就行。装好后在该 CLI 里完成一次登录（如 `grok login`、`codex login`、`dsh login`）。
+
+2. **装 WeChatBridge：**
+
+   ```bash
+   pipx install wechatbridge-cli
+   wechatbridge --version
+   ```
+
+3. **拿到微信 bot 通道。** ClawBot / iLink 是腾讯官方免费开放的个人号 bot 通道——无需申请、审核、资质或付费。执行：
+
+   ```bash
+   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+   ```
+
+   它会引导你扫码绑定微信号。这一步只是让微信侧具备可绑定的 bot 身份；凭据不会进本仓库。
+
+4. **写一份最小配置：**
+
+   ```bash
+   mkdir -p ~/.config/wechatbridge
+   curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
+   ```
+
+   然后编辑 `~/.config/wechatbridge/.env`。首次启动用放开模式：
+
+   ```bash
+   WECHATBRIDGE_ALLOWED_SENDERS=*
+   ```
+
+   为什么用 `*`：桥默认 fail-closed——`WECHATBRIDGE_ALLOWED_SENDERS` 与 `WECHATBRIDGE_ADMINS` 都为空时会拒绝所有人，而此时你还不知道自己的 wxid。
+
+5. **启动并绑定：** 运行 `wechatbridge`，用手机微信扫终端里打印的二维码。二维码 180 秒超时，超时后重新运行 `wechatbridge` 即可。
+
+6. **拿到自己的 wxid 并收紧白名单。** 在微信里给 bot 发一条消息，然后在 bridge 日志里找到该消息的发送者 ID——日志中以 `from=<id>` 形式出现。把这个 ID 填回 `WECHATBRIDGE_ALLOWED_SENDERS`（替换 `*`）并重启。`*` 仅供首次调试，长期使用应收紧。
+
+更多配置见下文**配置**一节，部署见**部署**一节。
+
 ## 功能
 
 - 文本、图片、文件、语音（仅微信服务端语音转文字）交给**当前激活**的后端（`agy`、`grok`、`codex` 或 `dsh`）
@@ -139,7 +181,7 @@ mkdir -p ~/.config/wechatbridge
 curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
 
-然后编辑 `~/.config/wechatbridge/.env` 修改你的配置。**首次安装注意**：`WECHATBRIDGE_ALLOWED_SENDERS` 与 `WECHATBRIDGE_ADMINS` 都为空时桥会拒绝所有用户（fail-closed）——请至少填写 `WECHATBRIDGE_ADMINS=<你的 wxid>` 或白名单之一。
+然后编辑 `~/.config/wechatbridge/.env` 修改你的配置。**首次安装注意**：`WECHATBRIDGE_ALLOWED_SENDERS` 与 `WECHATBRIDGE_ADMINS` 都为空时桥会拒绝所有用户（fail-closed）。由于首次运行前你无法得知自己的 wxid，先用 `WECHATBRIDGE_ALLOWED_SENDERS=*` 启动，给 bot 发一条消息，从日志中读到自己的发送者 ID（`from=<id>`），再把 `*` 换成该 wxid——可选同时设 `WECHATBRIDGE_ADMINS=<你的 wxid>`——并重启。
 
 关键变量（都有默认值）：
 
