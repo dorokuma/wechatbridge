@@ -12,13 +12,13 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI：谷歌 agy / Antigrav
                                  (桥接本体)         (跑工具)
 ```
 
-WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容需要 AI 处理时，它才把 CLI 拉起一次，拿到答案再关掉，中间不留任何进程。
+WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容需要 AI 处理时，它才把 CLI 拉起一次，拿到答案再关掉；CLI 子进程不常驻，桥本身继续在后台收消息。
 
 `/help`、`/backend`、`/persona` 这类指令由桥自己应答，不会起 CLI。生成的文件只有在用户允许目录内、且被桥识别到，才会回传微信。
 
 ## 快速开始
 
-六步，从零到在微信里收到第一条回复，大约 10 分钟。
+五步，从零到在微信里收到第一条回复，大约 10 分钟。
 
 1. **装一个 CLI 后端并登录。** 推荐 [agy](https://antigravity.google/docs/cli)（谷歌 Antigravity），这是作者日常在用的后端。[grok](https://docs.x.ai/build/overview)、[codex](https://developers.openai.com/codex/cli)、[dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md) 也能用，但选之前先看下面 **CLI 后端**一节的状态说明。装好后在该 CLI 里登录一次（如 `grok login`、`codex login`、`dsh login`）。
 
@@ -29,15 +29,7 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
    wechatbridge --version
    ```
 
-3. **拿到微信 bot 通道。** ClawBot / iLink 是腾讯官方免费开放的个人号 bot 通道，不用申请、审核、资质或付费。执行：
-
-   ```bash
-   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-   ```
-
-   它会引导你扫码绑定微信号。这一步只是让微信侧具备可绑定的 bot 身份，凭据不会进本仓库。
-
-4. **写一份最小配置：**
+3. **写一份最小配置：**
 
    ```bash
    mkdir -p ~/.config/wechatbridge
@@ -52,9 +44,15 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
 
    为什么用 `*`：桥默认 fail-closed。`WECHATBRIDGE_ALLOWED_SENDERS` 和 `WECHATBRIDGE_ADMINS` 都为空时会拒绝所有人，而你此时还不知道自己的 wxid。
 
-5. **启动并绑定：** 运行 `wechatbridge`，用手机微信扫终端里打印的二维码。二维码 180 秒超时，超时后重新运行 `wechatbridge` 即可。
+   如果你第 1 步装的不是 `agy`，还要在 `.env` 里设全局默认后端；选 `agy` 可省略（默认就是 agy）：
 
-6. **拿到自己的 wxid 并收紧白名单。** 在微信里给 bot 发一条消息，然后在桥日志里找到该消息的发送者 ID，长这样：`from=<id>`。把这个 ID 填回 `WECHATBRIDGE_ALLOWED_SENDERS`（替换 `*`）并重启。`*` 仅供首次调试，长期使用应收紧。
+   ```bash
+   WECHATBRIDGE_BACKEND=grok   # 或 codex / dsh
+   ```
+
+4. **启动并扫码绑定。** ClawBot / iLink 是腾讯官方免费开放的个人号 bot 通道，不用申请、审核、资质或付费，你也不需要额外装任何东西：绑定由桥自己完成。运行 `wechatbridge`，它会在终端打印二维码，用手机微信扫码绑定。桥等待扫码的默认轮询超时是 180 秒，超时后它会自动重新获取二维码继续等，进程不退出也不用重启；只有你手动停掉进程才需要重新运行 `wechatbridge`。
+
+5. **拿到自己的 wxid 并收紧白名单。** 在微信里给 bot 发一条消息，然后在桥日志里找到该消息的发送者 ID，长这样：`from=<id>`。把这个 ID 填回 `WECHATBRIDGE_ALLOWED_SENDERS`（替换 `*`）并重启。`*` 仅供首次调试，长期使用应收紧。
 
 更多配置见下文**配置**一节，部署见**部署**一节。
 
@@ -97,12 +95,13 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
 - **dsh 是什么：** DeepSeek Harness CLI（`dsh`），通过 `headless` profile 单轮执行任务。
 - **启用与切换：** 在 `.env` 里设 `WECHATBRIDGE_BACKEND=dsh`，或在微信里发 `/backend dsh`。
 - **依赖 PyYAML：** dsh 后端需要 `PyYAML` 解析 profile 插件配置。缺了它，`/backend dsh` 会提示并保持原后端不变。安装：`pip install PyYAML` 或 `pipx inject wechatbridge-cli PyYAML`。
-- **窗口记忆（默认）：** `headless` 每次调用都新建会话（`session-<uuid>`），所以对话记忆由桥来维护。最近几轮对话（默认 10 轮对，上限 `WECHATBRIDGE_DSH_MEMORY_CHARS` 字符）存进 `dsh_memory.jsonl`，每次提问自动注入。`/clear` 或 `/new` 清空这份记忆重新开始。
+- **窗口记忆（默认）：** `headless` 每次调用都新建会话（`session-<uuid>`），所以对话记忆由桥来维护。成功的轮次会追加写入 `dsh_memory.jsonl`；每次调用时桥读取最近几轮对话（默认 10 轮对，上限 `WECHATBRIDGE_DSH_MEMORY_CHARS` 字符）注入提示词——这个上限限的是注入时的读取窗口，不是磁盘文件大小。`/clear` 或 `/new` 清空这份记忆重新开始。
 - **常驻会话模式（resume）：** 设 `WECHATBRIDGE_DSH_RESUME=true` 开启真正的常驻会话，类似 codex resume。前提是你的 headless profile 挂载了 `dsh-bridge-runner` 插件（`dsh_bridge_runner.py`，从环境变量读 `DSH_BRIDGE_SESSION_ID` 和 `DSH_BRIDGE_TASK`）。开了之后上下文在同一会话里自然累积，不做窗口截断。`/clear` 或 `/new` 删掉存下的会话 ID 开新会话。resume 模式下窗口记忆注入会跳过。
-- **工作区与状态隔离：** 实际跑的是 `dsh --profile headless -- <提示>`，`cwd` 是你的每用户会话目录（`WECHATBRIDGE_SESSION_DIR/<user_id>`）。桥私有状态（`dsh_memory.jsonl` 和持久会话 ID）放在 `WECHATBRIDGE_DSH_STATE_DIR`（`~/.local/share/wechatbridge/<实例名>/dsh_state/`），在子进程会话目录树之外。这样一级 `../` 穿越摸不到私有状态。
+- **工作区与状态隔离：** 默认窗口模式下实际跑的是 `dsh --profile headless -- <提示>`，`cwd` 是你的每用户会话目录（`WECHATBRIDGE_SESSION_DIR/<user_id>`）。resume 模式下没有 `-- <提示>` 参数：任务通过环境变量 `DSH_BRIDGE_TASK` 传入（profile 仍可用 `DSH_PROFILE` 配置）。桥私有状态（`dsh_memory.jsonl` 和持久会话 ID）放在 `WECHATBRIDGE_DSH_STATE_DIR`（`~/.local/share/wechatbridge/<实例名>/dsh_state/`），在子进程会话目录树之外。这样一级 `../` 穿越摸不到私有状态。
 - **谁能伤到谁：** 每个 dsh 子进程和桥用同一个 Unix 用户跑，中间没有容器。一级 `../` 到不了私有状态，但两级穿越（`../../dsh_state/<user_id>`）在文件系统层面仍然可达，这是有意接受的。所以只给你信任的人用。
 - **附件：** 图片和文件以 `@/绝对路径` 的形式并进 prompt 文本。我查过 dsh v0.1.1-rc.2：`headless` 自己不会打开或内联 `@` 提到的文件，而是把你的 prompt 原样交给模型。模型靠系统提示知道 @ 路径，需要时自己调 `read` 工具去读。桥会把越界 mention（`@/abs`、`@~/x`、`@file://`）改写成 `[blocked-path]`。这只是改 prompt 文本，不是安全边界。
 - **认证和 profile 是机器级共享。** 解析顺序：`WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`，和 grok、codex 的宿主回退模型一样。子进程的 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。设了 `WECHATBRIDGE_DSH_HOME` 就用专用主目录并自动做会话保留清理；不设就回退到 `$WECHATBRIDGE_HOST_HOME/.dsh`（若已设）或 `~/.dsh`，不自动清理，由你自己管理。如果桥跑在专用系统用户（如 `wechatbridge`）下，把 `WECHATBRIDGE_HOST_HOME` 指到操作员主目录，CLI 凭证和 profile 才能被找到。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 都能配。
+- **测试现状：** 和 codex 一样，本后端的测试基于 fake CLI；作者没有用真实 dsh CLI 在生产环境长期验证。最终要靠真实用户在真 CLI 上验收。
 - **插件文件：** resume 模式需要你在自己的 dsh profile 里挂载 `dsh-bridge-runner` 插件。本仓库不附带插件文件。
 
 ### grok 后端说明
@@ -115,7 +114,7 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
 
 - **状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
 - 每轮跑 `codex exec --json`。续聊用 `codex exec resume <thread_id> <prompt>`，thread id 按用户持久化。
-- **隔离：** 每个微信用户运行时 `HOME` 和 `CODEX_HOME` 指到自己的会话目录（`session_dir/.codex`），会话、日志、缓存互不串。
+- **隔离：** 每个微信用户运行时 `HOME` 指到自己的每用户会话目录（`session_dir`），`CODEX_HOME` 指到 `session_dir/.codex`，会话、日志、缓存互不串。
 - **认证：** 会话目录链接到宿主 `~/.codex/auth.json`（链接失败就拷贝一份），复用你宿主的 `codex login`。codex CLI 重写 `auth.json` 用「临时文件加 rename」，会把会话里的 symlink 拆成普通文件。桥会把这类文件原子写回宿主再重建链接，刷新后的新凭证不会被宿主已吊销的旧凭证覆盖。也可以在桥进程环境里设 `CODEX_API_KEY` 认证。本仓库不存放任何 key 或 token 值。
 - **测试现状：** 我手上没有真实 Codex 订阅或 CLI 可以实测。这个后端是按源码研究、JSONL fixture 和测试里的 fake CLI 写出来的（测试通过）。最终要靠真实用户在真 CLI 上验收。
 

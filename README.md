@@ -12,13 +12,13 @@ WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex /
                                        (the bridge)   (runs tools)
 ```
 
-WeChatBridge runs in the background and keeps asking WeChat for new messages. When you send something that needs the AI, it starts the CLI once, waits for the answer, then closes it again. Nothing stays running in between.
+WeChatBridge runs in the background and keeps asking WeChat for new messages. When you send something that needs the AI, it starts the CLI once, waits for the answer, then closes it again. Nothing stays running in between except the bridge itself: CLI children do not linger; the bridge keeps polling WeChat in the background.
 
 Commands like `/help`, `/backend`, or `/persona` are answered by the bridge itself and never start a CLI. A generated file only comes back to WeChat if the bridge can see it under your allowed session paths.
 
 ## Quick start
 
-Six steps, about 10 minutes from zero to your first reply in WeChat.
+Five steps, about 10 minutes from zero to your first reply in WeChat.
 
 1. **Install one CLI backend and sign in.** I recommend [agy](https://antigravity.google/docs/cli) (Google Antigravity), since that is the backend I run daily. [grok](https://docs.x.ai/build/overview), [codex](https://developers.openai.com/codex/cli), and [dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md) also work, but check the status notes under **CLI Backends** before you pick one. After installing, log in once in that CLI (for example `grok login`, `codex login`, or `dsh login`).
 
@@ -29,15 +29,7 @@ Six steps, about 10 minutes from zero to your first reply in WeChat.
    wechatbridge --version
    ```
 
-3. **Get the WeChat bot channel.** The ClawBot / iLink channel is Tencent's official, free personal-account bot channel: no application, review, qualification, or payment required. Run:
-
-   ```bash
-   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-   ```
-
-   It guides you through scanning a QR code to bind your WeChat account. This step only gives the WeChat side a bindable bot identity; no credentials are stored in this repository.
-
-4. **Write a minimal config:**
+3. **Write a minimal config:**
 
    ```bash
    mkdir -p ~/.config/wechatbridge
@@ -52,9 +44,15 @@ Six steps, about 10 minutes from zero to your first reply in WeChat.
 
    Why `*`: the bridge fails closed. With both `WECHATBRIDGE_ALLOWED_SENDERS` and `WECHATBRIDGE_ADMINS` empty it denies everyone, and you don't know your own `wxid` yet.
 
-5. **Start it and bind:** run `wechatbridge`, then scan the QR code printed in the terminal with WeChat on your phone. The QR code expires after 180 seconds. If it times out, just rerun `wechatbridge`.
+   If the backend you installed in step 1 is not `agy`, also set the global default backend in `.env`; `agy` is the default and can be omitted:
 
-6. **Get your own wxid and tighten the whitelist.** In WeChat, send the bot any message, then find that message's sender ID in the bridge log. It appears as `from=<id>`. Put that ID into `WECHATBRIDGE_ALLOWED_SENDERS` in place of `*` and restart. `*` is for first-run debugging only; tighten it for long-term use.
+   ```bash
+   WECHATBRIDGE_BACKEND=grok   # or codex / dsh
+   ```
+
+4. **Start it and scan the QR code to bind.** The ClawBot / iLink channel is Tencent's official, free personal-account bot channel: no application, review, qualification, or payment required — and you don't need to install anything extra: the bridge handles binding itself. Run `wechatbridge`; it prints a QR code in the terminal, and you scan it with WeChat on your phone. The bridge waits for a scan with a default poll timeout of 180 seconds; on timeout it automatically fetches a fresh QR code and keeps waiting — the process does not exit and does not need a restart. Only if you stop it yourself do you rerun `wechatbridge`.
+
+5. **Get your own wxid and tighten the whitelist.** In WeChat, send the bot any message, then find that message's sender ID in the bridge log. It appears as `from=<id>`. Put that ID into `WECHATBRIDGE_ALLOWED_SENDERS` in place of `*` and restart. `*` is for first-run debugging only; tighten it for long-term use.
 
 See **Configure** below for every variable, and **Deploy** for running it as a service.
 
@@ -97,12 +95,13 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
 - **What dsh is:** the DeepSeek Harness CLI (`dsh`), running one-shot tasks through its `headless` profile.
 - **Enable or switch:** set `WECHATBRIDGE_BACKEND=dsh` in `.env`, or send `/backend dsh` in WeChat.
 - **PyYAML dependency:** dsh needs `PyYAML` to parse profile plugin configurations. Without it, `/backend dsh` shows a notice and keeps your current backend. Install it with `pip install PyYAML` or `pipx inject wechatbridge-cli PyYAML`.
-- **Window memory (default):** `headless` starts a fresh session (`session-<uuid>`) on every call, so the bridge keeps the conversation memory instead. Recent turns (10 pairs by default, capped at `WECHATBRIDGE_DSH_MEMORY_CHARS` chars) are saved to `dsh_memory.jsonl` and injected into every prompt. `/clear` or `/new` wipes this memory to start fresh.
+- **Window memory (default):** `headless` starts a fresh session (`session-<uuid>`) on every call, so the bridge keeps the conversation memory instead. Successful turns are appended to `dsh_memory.jsonl`; on each call the bridge reads the most recent turns (10 pairs by default, capped at `WECHATBRIDGE_DSH_MEMORY_CHARS` chars) and injects them into the prompt as context — that cap limits the injected read window, not the file size on disk. `/clear` or `/new` wipes this memory to start fresh.
 - **Persistent resume mode:** set `WECHATBRIDGE_DSH_RESUME=true` for real persistent sessions, codex-style. This needs the `dsh-bridge-runner` plugin (`dsh_bridge_runner.py`, which reads `DSH_BRIDGE_SESSION_ID` and `DSH_BRIDGE_TASK` from the environment) mounted in your headless profile bundle. Context then accumulates natively across turns, with no windowing. `/clear` or `/new` deletes the stored session ID to start a fresh session. Window memory injection is skipped while resume mode is on.
-- **Workspace and state isolation:** dsh runs as `dsh --profile headless -- <prompt>` with `cwd` set to your per-user session directory (`WECHATBRIDGE_SESSION_DIR/<user_id>`). Bridge-private state (`dsh_memory.jsonl` and the persistent session ID) lives under `WECHATBRIDGE_DSH_STATE_DIR` (`~/.local/share/wechatbridge/<instance>/dsh_state/`), outside the child's session tree. That blocks one-level `../` traversal into private state.
+- **Workspace and state isolation:** in the default windowed mode, dsh runs as `dsh --profile headless -- <prompt>` with `cwd` set to your per-user session directory (`WECHATBRIDGE_SESSION_DIR/<user_id>`). In resume mode there is no `-- <prompt>` argv: the task is passed via the `DSH_BRIDGE_TASK` environment variable (and the profile stays configurable via `DSH_PROFILE`). Bridge-private state (`dsh_memory.jsonl` and the persistent session ID) lives under `WECHATBRIDGE_DSH_STATE_DIR` (`~/.local/share/wechatbridge/<instance>/dsh_state/`), outside the child's session tree. That blocks one-level `../` traversal into private state.
 - **Who can hurt whom:** every dsh child runs as the same Unix user as the bridge, with no container in between. One-level `../` cannot reach private state, but two-level traversal (`../../dsh_state/<user_id>`) still can on the filesystem, and that is accepted on purpose. Only let people you trust use this.
 - **Attachments:** images and files are merged into the prompt text as `@/absolute/path` mentions. I checked dsh v0.1.1-rc.2: `headless` does not open or inline `@`-mentioned files itself. It passes your prompt text straight to the model. The model gets system guidance about @-paths and calls its `read` tool when it needs a file. The bridge rewrites out-of-bounds mentions (`@/abs`, `@~/x`, `@file://`) to `[blocked-path]`. That filter only edits prompt text. It is not a security boundary.
 - **Auth and profiles are machine-wide.** Resolution order: `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`, the same host-fallback model as grok and codex. The child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` for a dedicated service home with automatic session retention cleanup. Leave it unset and it falls back to `$WECHATBRIDGE_HOST_HOME/.dsh` (if set) or `~/.dsh`, with no automatic cleanup; the operator manages sessions. If the bridge runs as a dedicated system user (for example `wechatbridge`), set `WECHATBRIDGE_HOST_HOME` to the operator's home directory. That way CLI credentials and profiles are found. `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are all configurable.
+- **Testing caveat:** like codex, this backend was verified with tests against a fake CLI; the author has not run the real `dsh` CLI in long-term production use. Final acceptance needs a real user running it against the actual dsh CLI.
 - **Plugin files:** resume mode needs the `dsh-bridge-runner` plugin mounted in your own dsh profile bundle. This repository does not ship plugin files.
 
 ### Grok backend notes
@@ -115,7 +114,7 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
 
 - **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
 - Each turn runs `codex exec --json`. Continuation uses `codex exec resume <thread_id> <prompt>`, with the thread id persisted per user.
-- **Isolation:** each WeChat user runs with `HOME` and `CODEX_HOME` pointed at their own per-user session directory (`session_dir/.codex`). Sessions, logs, and caches never cross users.
+- **Isolation:** each WeChat user runs with `HOME` pointed at their own per-user session directory (`session_dir`), and `CODEX_HOME` pointed at `session_dir/.codex`. Sessions, logs, and caches never cross users.
 - **Auth:** the per-user session links to the host `~/.codex/auth.json` (copied as a fallback), so it reuses your host `codex login`. The codex CLI rewrites `auth.json` with a temp file plus rename, which turns the session symlink into a regular file. The bridge copies such session files back to the host atomically and re-links them, so refreshed tokens never get overwritten by the revoked host copy. You can also set `CODEX_API_KEY` in the bridge process environment to authenticate. No key or token values are stored in this repository.
 - **Testing caveat:** I do not have a real Codex subscription or CLI to test against. This backend was built from source research, a JSONL fixture, and tests against a fake CLI, which pass. Final acceptance needs a real user running it against the actual Codex CLI.
 
