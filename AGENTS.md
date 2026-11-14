@@ -10,3 +10,5 @@
 版本号检查由 CI 的 `version-check.yml` 单独跑 `python scripts/check_version_bump.py`，不在 `make check` 内。
 
 提交/分支/门禁按 SYSTEM §4。
+
+工作笔记全量入库到 `.agents/notes/`；笔记须不含凭据或未脱敏环境细节。
