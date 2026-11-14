@@ -5,7 +5,7 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to agentic coding CLIs: Google's agy / Antigravity, xAI's Grok Build, OpenAI's Codex, or DeepSeek Harness' dsh. From WeChat you can send text, images, files, and voice (transcribed to text) to the active CLI. You get replies back, and generated files can come back to you over the WeChat CDN. Each user can switch backends with `/backend`, no restart needed.
+WeChatBridge puts your terminal coding agent in your pocket. Bring your own CLI — agy, grok, codex, or dsh — and talk to it from WeChat: text, images, files, and voice (transcribed to text). You get replies back, and generated files can come back to you over the WeChat CDN. Each user can switch backends with `/backend`, no restart needed.
 
 ```
 WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh CLI
@@ -85,13 +85,13 @@ agy is the backend I use every day. The other three are implemented and tested, 
 - **agy** (default): Google Antigravity CLI. **Status: this is the backend the author uses daily.**
 - **grok**: xAI Grok Build CLI. **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
 - **codex**: OpenAI Codex CLI. **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
-- **dsh**: DeepSeek Harness CLI (one-shot `headless` profile). **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
+- **dsh**: DeepSeek Harness CLI (one-shot `headless` profile). **Status: contributed by [@KOP-XIAO](https://github.com/KOP-XIAO) in #3 and #4, and verified on real hardware by the contributor (macOS, including cross-turn memory). The repo author has not run dsh in long-term production use — verify it in your own setup before relying on it.**
 
 You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh`. Each backend keeps its own model, effort, mode, and persona files. `WECHATBRIDGE_BACKEND` sets the global default.
 
 ### dsh backend notes
 
-- **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
+- **Status: contributed by [@KOP-XIAO](https://github.com/KOP-XIAO) in #3 and #4, and verified on real hardware by the contributor (macOS, including cross-turn memory). The repo author has not run dsh in long-term production use — verify it in your own setup before relying on it.**
 - **What dsh is:** the DeepSeek Harness CLI (`dsh`), running one-shot tasks through its `headless` profile.
 - **Enable or switch:** set `WECHATBRIDGE_BACKEND=dsh` in `.env`, or send `/backend dsh` in WeChat.
 - **PyYAML dependency:** dsh needs `PyYAML` to parse profile plugin configurations. Without it, `/backend dsh` shows a notice and keeps your current backend. Install it with `pip install PyYAML` or `pipx inject wechatbridge-cli PyYAML`.
@@ -101,7 +101,7 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
 - **Who can hurt whom:** every dsh child runs as the same Unix user as the bridge, with no container in between. One-level `../` cannot reach private state, but two-level traversal (`../../dsh_state/<user_id>`) still can on the filesystem, and that is accepted on purpose. Only let people you trust use this.
 - **Attachments:** images and files are merged into the prompt text as `@/absolute/path` mentions. I checked dsh v0.1.1-rc.2: `headless` does not open or inline `@`-mentioned files itself. It passes your prompt text straight to the model. The model gets system guidance about @-paths and calls its `read` tool when it needs a file. The bridge rewrites out-of-bounds mentions (`@/abs`, `@~/x`, `@file://`) to `[blocked-path]`. That filter only edits prompt text. It is not a security boundary.
 - **Auth and profiles are machine-wide.** Resolution order: `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`, the same host-fallback model as grok and codex. The child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` for a dedicated service home with automatic session retention cleanup. Leave it unset and it falls back to `$WECHATBRIDGE_HOST_HOME/.dsh` (if set) or `~/.dsh`, with no automatic cleanup; the operator manages sessions. If the bridge runs as a dedicated system user (for example `wechatbridge`), set `WECHATBRIDGE_HOST_HOME` to the operator's home directory. That way CLI credentials and profiles are found. `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are all configurable.
-- **Testing caveat:** like codex, this backend was verified with tests against a fake CLI; the author has not run the real `dsh` CLI in long-term production use. Final acceptance needs a real user running it against the actual dsh CLI.
+- **Testing caveat:** like codex, the tests ran against a fake CLI; on top of that, the contributor verified the real `dsh` CLI on his own hardware (macOS, including cross-turn memory resume). The author still has not run `dsh` in long-term production use — verify it in your own setup before relying on it.
 - **Plugin files:** resume mode needs the `dsh-bridge-runner` plugin mounted in your own dsh profile bundle. This repository does not ship plugin files.
 
 ### Grok backend notes
@@ -375,6 +375,10 @@ Other `/…` commands are either rejected (for example `/exit`), reported as uns
 - Artifact send-back is best-effort: files detected under allowed paths get sent, not every file the CLI created anywhere.
 - `/mcp` and `/agent` do not run MCP protocol or process supervisors inside the bridge. They only guide or rephrase for the CLI.
 - Keep it behind a whitelist for trusted users.
+
+## Contributors
+
+- [@KOP-XIAO](https://github.com/KOP-XIAO) — the dsh backend ([#3](https://github.com/dorokuma/wechatbridge/pull/3)) and its long-term memory plus resume support ([#4](https://github.com/dorokuma/wechatbridge/pull/4)), verified on real hardware.
 
 ## Contributing
 

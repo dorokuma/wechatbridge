@@ -5,7 +5,7 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge 把微信机器人接到 agentic 编程 CLI：谷歌 agy / Antigravity、xAI Grok Build、OpenAI Codex，或 DeepSeek Harness 的 dsh。你可以在微信里发文字、图片、文件、语音（微信侧转写成文字）给当前后端，拿回回复，生成的文件符合条件时还能经 CDN 发回微信。每个用户可用 `/backend` 切换后端，不用重启。
+WeChatBridge 把你的终端编程 agent 装进口袋。你自己的 CLI 不用换——agy、grok、codex、dsh 都行——直接通过微信跟它对话，文字、图片、文件、语音都可以（语音由微信侧转写成文字）。你发出去的内容能拿回回复，生成的文件符合条件时还能经 CDN 发回微信。每个用户可用 `/backend` 切换后端，不用重启。
 
 ```
 微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh CLI
@@ -85,13 +85,13 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
 - **agy**（默认）：谷歌 Antigravity CLI。**状态：作者日常使用的后端。**
 - **grok**：xAI Grok Build CLI。**状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
 - **codex**：OpenAI Codex CLI。**状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
-- **dsh**：DeepSeek Harness CLI（单轮 `headless` profile）。**状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
+- **dsh**：DeepSeek Harness CLI（单轮 `headless` profile）。**状态：由 [@KOP-XIAO](https://github.com/KOP-XIAO) 在 #3 与 #4 中贡献，并由贡献者在真机上验证（macOS，含跨轮记忆）。仓库作者未在生产环境长期使用 dsh——依赖前请先自行实测。**
 
 微信里用 `/backend agy`、`/backend grok`、`/backend codex` 或 `/backend dsh` 按用户切换。各后端各自记模型、强度、模式，人格文件也分开。全局默认用 `WECHATBRIDGE_BACKEND` 设。
 
 ### dsh 后端说明
 
-- **状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
+- **状态：由 [@KOP-XIAO](https://github.com/KOP-XIAO) 在 #3 与 #4 中贡献，并由贡献者在真机上验证（macOS，含跨轮记忆）。仓库作者未在生产环境长期使用 dsh——依赖前请先自行实测。**
 - **dsh 是什么：** DeepSeek Harness CLI（`dsh`），通过 `headless` profile 单轮执行任务。
 - **启用与切换：** 在 `.env` 里设 `WECHATBRIDGE_BACKEND=dsh`，或在微信里发 `/backend dsh`。
 - **依赖 PyYAML：** dsh 后端需要 `PyYAML` 解析 profile 插件配置。缺了它，`/backend dsh` 会提示并保持原后端不变。安装：`pip install PyYAML` 或 `pipx inject wechatbridge-cli PyYAML`。
@@ -101,7 +101,7 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
 - **谁能伤到谁：** 每个 dsh 子进程和桥用同一个 Unix 用户跑，中间没有容器。一级 `../` 到不了私有状态，但两级穿越（`../../dsh_state/<user_id>`）在文件系统层面仍然可达，这是有意接受的。所以只给你信任的人用。
 - **附件：** 图片和文件以 `@/绝对路径` 的形式并进 prompt 文本。我查过 dsh v0.1.1-rc.2：`headless` 自己不会打开或内联 `@` 提到的文件，而是把你的 prompt 原样交给模型。模型靠系统提示知道 @ 路径，需要时自己调 `read` 工具去读。桥会把越界 mention（`@/abs`、`@~/x`、`@file://`）改写成 `[blocked-path]`。这只是改 prompt 文本，不是安全边界。
 - **认证和 profile 是机器级共享。** 解析顺序：`WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`，和 grok、codex 的宿主回退模型一样。子进程的 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。设了 `WECHATBRIDGE_DSH_HOME` 就用专用主目录并自动做会话保留清理；不设就回退到 `$WECHATBRIDGE_HOST_HOME/.dsh`（若已设）或 `~/.dsh`，不自动清理，由你自己管理。如果桥跑在专用系统用户（如 `wechatbridge`）下，把 `WECHATBRIDGE_HOST_HOME` 指到操作员主目录，CLI 凭证和 profile 才能被找到。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 都能配。
-- **测试现状：** 和 codex 一样，本后端的测试基于 fake CLI；作者没有用真实 dsh CLI 在生产环境长期验证。最终要靠真实用户在真 CLI 上验收。
+- **测试现状：** 和 codex 一样，本后端的测试基于 fake CLI；在此基础上，贡献者在自己机器上用真实 `dsh` CLI 验证过（macOS，含跨轮记忆 resume）。作者仍未在生产环境长期使用 dsh——依赖前请先自行实测。
 - **插件文件：** resume 模式需要你在自己的 dsh profile 里挂载 `dsh-bridge-runner` 插件。本仓库不附带插件文件。
 
 ### grok 后端说明
@@ -375,6 +375,10 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 - 产物回传是「允许路径内、能识别到的尽量发」，不是「CLI 在哪写的都回传」。
 - `/mcp`、`/agent` 不在桥内跑 MCP 协议或托管子进程，只做引导或改写提示给 CLI。
 - 尽量加白名单，只给可信用户用。
+
+## 贡献者
+
+- [@KOP-XIAO](https://github.com/KOP-XIAO) — dsh 后端（[#3](https://github.com/dorokuma/wechatbridge/pull/3)）及其长期记忆与 resume 支持（[#4](https://github.com/dorokuma/wechatbridge/pull/4)），并在真机上验证过。
 
 ## 贡献
 
