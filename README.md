@@ -12,7 +12,7 @@ WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex /
                                        (the bridge)   (runs tools)
 ```
 
-WeChatBridge runs in the background and keeps asking WeChat for new messages. When you send something that needs the AI, it starts the CLI once, waits for the answer, then closes it again. Nothing stays running in between except the bridge itself: CLI children do not linger; the bridge keeps polling WeChat in the background.
+WeChatBridge runs in the background and keeps asking WeChat for new messages. When you send something that needs the AI, it starts the CLI once, waits for the answer, then closes it again.
 
 Commands like `/help`, `/backend`, or `/persona` are answered by the bridge itself and never start a CLI. A generated file only comes back to WeChat if the bridge can see it under your allowed session paths.
 
@@ -101,7 +101,7 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
 - **Who can hurt whom:** every dsh child runs as the same Unix user as the bridge, with no container in between. One-level `../` cannot reach private state, but two-level traversal (`../../dsh_state/<user_id>`) still can on the filesystem, and that is accepted on purpose. Only let people you trust use this.
 - **Attachments:** images and files are merged into the prompt text as `@/absolute/path` mentions. I checked dsh v0.1.1-rc.2: `headless` does not open or inline `@`-mentioned files itself. It passes your prompt text straight to the model. The model gets system guidance about @-paths and calls its `read` tool when it needs a file. The bridge rewrites out-of-bounds mentions (`@/abs`, `@~/x`, `@file://`) to `[blocked-path]`. That filter only edits prompt text. It is not a security boundary.
 - **Auth and profiles are machine-wide.** Resolution order: `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`, the same host-fallback model as grok and codex. The child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` for a dedicated service home with automatic session retention cleanup. Leave it unset and it falls back to `$WECHATBRIDGE_HOST_HOME/.dsh` (if set) or `~/.dsh`, with no automatic cleanup; the operator manages sessions. If the bridge runs as a dedicated system user (for example `wechatbridge`), set `WECHATBRIDGE_HOST_HOME` to the operator's home directory. That way CLI credentials and profiles are found. `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are all configurable.
-- **Testing caveat:** like codex, the tests ran against a fake CLI; on top of that, the contributor verified the real `dsh` CLI on his own hardware (macOS, including cross-turn memory resume). The author still has not run `dsh` in long-term production use — verify it in your own setup before relying on it.
+- **Testing caveat:** like codex, the tests ran against a fake CLI; on top of that, the contributor verified the real `dsh` CLI on their own hardware (macOS, including cross-turn memory resume). The author still has not run `dsh` in long-term production use — verify it in your own setup before relying on it.
 - **Plugin files:** resume mode needs the `dsh-bridge-runner` plugin mounted in your own dsh profile bundle. This repository does not ship plugin files.
 
 ### Grok backend notes
