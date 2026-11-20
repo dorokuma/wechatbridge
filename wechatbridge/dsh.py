@@ -953,7 +953,7 @@ def _cmd_help() -> str:
         "",
         "**引擎说明**",
         *engine_note,
-        "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
+        "- `/backend <agy|grok|codex|dsh|pig>` — 切换助手引擎",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — **重置对话**（清空记忆并开始全新会话）",

@@ -5,6 +5,7 @@ Settings with environment variable overrides.
 
 import os
 import logging
+from urllib.parse import urlsplit
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
@@ -139,13 +140,70 @@ _instance_data_dir = os.path.join(
 )
 
 
+_DEFAULT_MAGPIE_BASE_URL = "https://magpie.hotkids.eu/v1"
+
+
+def _validate_magpie_url(url: str) -> str:
+    """Validate the Magpie base URL: only https:// or loopback http:// allowed.
+
+    A public plain-http endpoint would send the Bearer key in cleartext, so it
+    is rejected and falls back to the https default. Parsed with urlsplit so
+    userinfo (``http://localhost:80@evil.example``) cannot smuggle a public
+    host past the loopback check, and IPv6 loopback (``http://[::1]:8080``)
+    is recognized correctly. The returned URL is normalized (no trailing
+    slash; keeps its path suffix such as ``/v1``).
+    """
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return _DEFAULT_MAGPIE_BASE_URL
+    try:
+        parsed = urlsplit(raw)
+    except (ValueError, TypeError):
+        parsed = None
+    if parsed is None or not parsed.hostname:
+        logger.warning(
+            "Invalid WECHATBRIDGE_MAGPIE_BASE_URL %r (must start with https:// or "
+            "loopback http://); falling back to %s",
+            url, _DEFAULT_MAGPIE_BASE_URL,
+        )
+        return _DEFAULT_MAGPIE_BASE_URL
+    scheme = (parsed.scheme or "").lower()
+    # Any userinfo (user:pass@) makes the URL ambiguous for the Bearer-key
+    # destination host — refuse it for both http and https.
+    if parsed.username or parsed.password:
+        logger.warning(
+            "Invalid WECHATBRIDGE_MAGPIE_BASE_URL %r (userinfo not allowed); "
+            "falling back to %s",
+            url, _DEFAULT_MAGPIE_BASE_URL,
+        )
+        return _DEFAULT_MAGPIE_BASE_URL
+    if scheme == "https":
+        return raw
+    if scheme == "http":
+        host = (parsed.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return raw
+        logger.warning(
+            "WECHATBRIDGE_MAGPIE_BASE_URL %r uses non-loopback http:// (would "
+            "leak the API key in cleartext); falling back to %s",
+            url, _DEFAULT_MAGPIE_BASE_URL,
+        )
+        return _DEFAULT_MAGPIE_BASE_URL
+    logger.warning(
+        "Invalid WECHATBRIDGE_MAGPIE_BASE_URL %r (must start with https:// or "
+        "loopback http://); falling back to %s",
+        url, _DEFAULT_MAGPIE_BASE_URL,
+    )
+    return _DEFAULT_MAGPIE_BASE_URL
+
+
 class AppConfig:
     # iLink base URL (no trailing slash)
     ilink_base_url: str = os.getenv("ILINK_BASE_URL", "https://ilinkai.weixin.qq.com")
 
-    # Active CLI backend: "agy", "grok", "codex", or "dsh" (global default, can be overridden per-user via /backend)
+    # Active CLI backend: "agy", "grok", "codex", "dsh", or "pig" (global default, can be overridden per-user via /backend)
     backend: str = os.getenv("WECHATBRIDGE_BACKEND", "agy").lower()
-    if backend not in ("agy", "grok", "codex", "dsh"):
+    if backend not in ("agy", "grok", "codex", "dsh", "pig"):
         logger.warning("Unknown backend %r, falling back to 'agy'", backend)
         backend = "agy"
 
@@ -160,6 +218,23 @@ class AppConfig:
 
     # dsh (DeepSeek Harness) CLI binary path
     dsh_binary_path: str = os.getenv("DSH_BIN_PATH", "dsh")  # default assumes in PATH
+
+    # pig CLI binary path
+    pig_binary_path: str = os.getenv("PIG_BIN_PATH", "pig")  # default assumes in PATH
+
+    # pig execution timeout (seconds). Aligned with Magpie upstream stream
+    # idle timeout (570000 ms); raise to ~585 to prefer the remote 504.
+    pig_timeout: int = _env_int("PIG_TIMEOUT", 570)
+
+    # Magpie (OpenAI-compatible) base URL for the pig backend.
+    # Only https:// or loopback http:// is allowed — a plain public http://
+    # endpoint would leak the Bearer key in cleartext.
+    magpie_base_url: str = _validate_magpie_url(
+        os.getenv("WECHATBRIDGE_MAGPIE_BASE_URL", "https://magpie.hotkids.eu/v1")
+    )
+
+    # Magpie API key for the pig backend (never logged / persisted).
+    magpie_api_key: str = os.getenv("WECHATBRIDGE_MAGPIE_API_KEY") or os.getenv("MAGPIE_API_KEY", "")
 
     # dsh profile booted for one-shot tasks. The headless profile answers a
     # single task, prints the final assistant message, and exits.

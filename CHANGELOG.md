@@ -5,6 +5,28 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-19
+
+### Added
+
+- **新增 `pig` CLI 后端**（`wechatbridge/pig.py`）：经 Magpie（OpenAI-compatible，`api=openai-responses`）仅暴露单模型 `gemini-web/gemini-4-neon`，每用户隔离 `session_dir/.pig/agent`（同时锁死 `PIG_HOME`/`PIG_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` 并剥除 `PIG_USE_PI_DIRS` 等宿主变量），脱敏 `models.json`（`apiKey` 仅存 `$MAGPIE_API_KEY` 占位符，磁盘零明文）与 `settings.json`（`retry.enabled=false`，重试权收归桥接 `UpstreamGuard`）。`--mode json` 下 `returncode` 与 JSONL 末条 `stopReason` 联合判定：`error`/`aborted` 即使 `rc=0` 也按失败分类，`length` 保留已生成正文并附截断提示。独立 `@file` argv 按魔数分流（静态 JPEG/PNG[排除 APNG]/GIF/WebP/BMP 与 ≤64KiB UTF-8 文本拆入独立 `@file` 参数；APNG 与 PDF/大二进制文件内联去 `@` 保留纯路径防 `U+FFFD` 膨胀），prompt 首字符 `/`、`@`、`-` 前置空格中性化防误触发内置命令。默认超时 570s，`start_new_session` + 进程组回收。斜杠：`/models`、`/model`（严格单模型白名单，拒绝 `gemini-web/gemini-4-neon-task`，支持 `:low/:medium/:high` 切档）、`/fast`、`/planning`（硬切 `--tools read,grep,find,ls`）、`/persona`（`pig_persona.txt` 0o600，经 `runtime_prompt.txt` → `--append-system-prompt` 注入）、`/add-dir`、`/clear`/`/new`、`/help`、`/agents`、`/mcp`。
+- **`config.py` 新增 pig 配置**：`pig_binary_path`（`PIG_BIN_PATH`）、`pig_timeout`（`PIG_TIMEOUT`，默认 570）、`magpie_base_url`（`WECHATBRIDGE_MAGPIE_BASE_URL`，仅允许 `https://` 或回环 `http://`）、`magpie_api_key`（`WECHATBRIDGE_MAGPIE_API_KEY`/`MAGPIE_API_KEY`）；`backend` 白名单与 `KNOWN_BACKENDS` 增 `pig`。
+
+### Security
+
+- **凭据扫描补齐 `.pig`/`.pi` 与内存态密钥**：`_matches_session_secret_content` 在会话根补 `.pig/agent/{auth.json,models.json,settings.json,runtime_prompt.txt}` 与 `pig_persona.txt`，在 `WECHATBRIDGE_HOST_HOME` 与 `~` 双根补 `.pig/agent/auth.json`、`.pi/agent/auth.json`（双根覆盖不变量保持），并新增内存态 `MAGPIE_API_KEY` 字节比对拦截 `echo $MAGPIE_API_KEY > out.txt` 外带；`is_sensitive_artifact_path` 对会话外路径的祖先目录拦截保留 `.gemini` 与显式敏感目录名，授权的点目录祖先（`.wt`/`.local` 等）放行；`models.json`/`pig_persona.txt`/`runtime_prompt.txt` 入敏感文件名与前缀清单，`.pig`/`.pi` 入敏感目录名与快照跳过清单；出站正文与产物均防 `MAGPIE_API_KEY` 明文泄漏（正文强制替换 `[REDACTED]`）。
+- **pig 7d/30d 清理信任锚点对齐 `user_dir` + 在途 run 互斥**：`_pig_temp_root_untrusted` 对 `user_dir`→清理根（`.pig/agent/logs`、`.pig/logs`、`.pig/cache`）相对链路逐组件 lstat 拒绝软链、并校验 realpath 落在 `user_dir` 内；`_pig_sessions_tree_untrusted`（30d sessions）改为同一实现/同一锚点——`session_base_dir` 及其上层（bridge 信任根，可能经软链挂载，如 `/data`→`/mnt/vol1/data`）不再纳入校验，不再因宿主路径含软链而永久拒删 pig 历史。7d pig 三根清理进一步与 30d 一致持 `_pig_session_clean_lock` 并检查 `_ACTIVE_PIG_SESSIONS`：登记/active/清理锁统一 `realpath(user_dir)` 稳定键（`user_dir` 以下软链操作无法漂移键、致盲注册表或分叉锁）+ 持锁查 active 互斥，消除换链致盲（登记/active/清理键不再被 `user_dir` 以下软链漂移）与『在途 run 与清理』『清理器内部 validate→delete』两类交错窗口；`_clean_pig_temp_root_7d` 取锁前先 `lexists` 门控，从未跑过 pig 的用户不在 `_PIG_SESSION_CLEAN_LOCKS` 留条目。命中即跳过不误删宿主/外部目录，限 pig 根、旧后端零扩面。残余窗口：无在途登记的空闲窗口内，同 UID 外部行为体仍可在校验后与 `os.walk` 前换链（`os.walk` 顶层 root 软链跟随），与 11 个旧后端临时根属同一既有信任模型，本分支未扩面亦未消除。
+
+### Fixed
+
+- **`_classify_cli_error` 补齐 pig 分类**：pig 鉴权错误（`no api key found`/`invalid api key`/`401`）、502/503/522 网关瞬断归 `network`、Magpie `sent nothing for 570000 ms` 归 `cascade_timeout`、`504`/`524` 归 `timeout`；`session_not_found` 覆盖续聊损坏特征，且仅在非零退出且 stderr 命中本地损坏特征时才驱动 `--continue` 单次自愈重试（上游瞬时 `no session` 不再误清会话历史）。
+- **TTL 清理补齐 `.pig`**：7 天临时目录增 `.pig/agent/logs`、`.pig/logs`、`.pig/cache`（`_SESSION_TEMP_REL_DIRS` 旧 11 项 + pig 3 项 = 14 项）；30 天历史清理新增 `_clean_pig_sessions`（仅删 `.pig/agent/sessions/<cwd>/*.jsonl`，不触碰 `models.json`/`settings.json`），并与 `.initialized.pig` 联动。
+
+### Tests
+
+- 新增 `tests/fake_pig.py` 与 `tests/test_pig.py`；`tests/test_hardening.py` 追加 `.pig`/`.pi` 双根凭据扫描、内存态密钥拦截、`.pig` 快照跳过与 30d TTL 回归用例。
+- 新增 `TestPigTempRootSymlinkRefused`：叶子 `.pig/agent/logs`→外部树、祖先 `.pig`→外部树、中间层 `.pig/agent`→外部树三场景，外部过期文件均放在真实匹配的清理子路径（`outside*/logs`）内，断言不被删、祖先软链原样保留、未劫持 pig 根仍按 7d TTL 正常清理；`tests/test_pig.py` 另补 7d pig 根在途 run 持锁跳过与 `session_base_dir` 软链不误拒 30d/`/clear` 回归。
+
 ## [1.9.5] - 2026-11-11
 
 ### Security

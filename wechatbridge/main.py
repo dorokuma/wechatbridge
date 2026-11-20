@@ -23,6 +23,8 @@ from .ilink import ILinkClient
 from .runner_common import (
     KNOWN_BACKENDS,
     MAX_ADD_DIRS,
+    _live_key_in_path_names,
+    _redact_live_key,
     _sanitize_prompt_at_paths,
     clean_session_media,
     clear_initialized,
@@ -182,6 +184,9 @@ async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
         elif backend == "dsh":
             from .dsh import run_dsh
             return await run_dsh(prompt, user_id)
+        elif backend == "pig":
+            from .pig import run_pig
+            return await run_pig(prompt, user_id)
         else:
             from .agy import run_agy
             return await run_agy(prompt, user_id)
@@ -591,6 +596,9 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
         elif backend == "dsh":
             from .dsh import handle_dsh_slash_command
             return await handle_dsh_slash_command(text, user_id)
+        elif backend == "pig":
+            from .pig import handle_pig_slash_command
+            return await handle_pig_slash_command(text, user_id)
         else:
             from .agy import handle_slash_command
             return await handle_slash_command(text, user_id)
@@ -610,6 +618,12 @@ def _cmd_backend(args: str, user_id: str) -> str:
         prefs = load_prefs(user_id)
         current = prefs.get("backend", config.backend)
         model_label = format_model_label(prefs.get("model", ""))
+        if current == "pig" and not prefs.get("model"):
+            try:
+                from .pig import PIG_MODEL_ID as _PIG_MODEL_ID_2
+                model_label = _PIG_MODEL_ID_2
+            except (ImportError, ModuleNotFoundError):
+                pass
         backend_list = " / ".join(f"`{b}`" for b in KNOWN_BACKENDS)
         return (
             f"📋 **当前助手引擎** 📋\n\n`{current}`\n"
@@ -633,11 +647,20 @@ def _cmd_backend(args: str, user_id: str) -> str:
             from .codex import _delete_codex_thread_id
         except (ImportError, ModuleNotFoundError) as e:
             return format_error("缺少依赖", str(e))
+    elif name == "pig":
+        try:
+            from .pig import _clear_pig_sessions as _pig_clear_sessions
+            from .pig import PIG_MODEL_ID as _PIG_MODEL_ID
+        except (ImportError, ModuleNotFoundError) as e:
+            return format_error("缺少依赖", str(e))
 
     prefs = load_prefs(user_id)
     old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
     model_label = format_model_label(prefs.get("model", ""))
+    if new == "pig" and not prefs.get("model"):
+        # pig 是单模型后端：空 model 槽展示真实固定模型而非「默认（未指定）」
+        model_label = _PIG_MODEL_ID
     # Reset session so new backend starts fresh (only when actually changed)
     if old != new:
         session_dir = get_session_dir(user_id)
@@ -648,6 +671,8 @@ def _cmd_backend(args: str, user_id: str) -> str:
         elif new == "dsh":
             clear_memory(user_id)
             clear_session_id(user_id)
+        elif new == "pig":
+            _pig_clear_sessions(session_dir)
         return (
             f"✅ **助手引擎已切换** ✅\n\n"
             f"`{old}` → `{new}`\n"
@@ -853,6 +878,10 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
         # $DSH_HOME/sessions/ (outside per-user tree) and are cleaned by cutoff,
         # so they never match anyway.
         allowed_root = session_dir
+    elif backend == "pig":
+        # pig runs with cwd=session_dir; tool-written files may also land in
+        # user-approved /add-dir roots, so allow those too.
+        allowed_root = session_dir
     else:
         # agy runs with cwd=session_dir, artifacts are under session_dir
         allowed_root = session_dir
@@ -863,7 +892,7 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
     # add_dir_roots), capped at MAX_ADD_DIRS. Deleted dirs, plain files,
     # out-of-bounds paths and symlink escapes must not become artifact allow
     # roots. grok and dsh do not use add-dir.
-    if backend in ("codex", "agy"):
+    if backend in ("codex", "agy", "pig"):
         prefs = load_prefs(from_user)
         for d in (prefs.get("add_dirs", []) or [])[:MAX_ADD_DIRS]:
             ok, resolved = validate_add_dir(d, from_user)
@@ -871,16 +900,30 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                 add_dirs.append(resolved)
 
     async def _notify_failure(name: str, reason: str) -> None:
-        # Never echo server absolute paths to WeChat users
+        # Never echo server absolute paths to WeChat users; the display
+        # name is additionally redacted so a live key embedded in the
+        # artifact filename cannot ride the notice back (defense in depth
+        # on top of format_artifact_send_failure_notice's own redaction).
         await client.send_message(
             to_user_id=from_user,
-            text=format_artifact_send_failure_notice(name, reason),
+            text=format_artifact_send_failure_notice(_redact_live_key(name), reason),
             context_token=context_token,
             baseurl=client.state.baseurl,
             bot_token=client.state.bot_token,
         )
 
     for idx, (art_name, art_path) in enumerate(artifacts):
+        # A live Magpie key embedded in the artifact file name would leak
+        # inside the file_item payload (ilink sends basename verbatim) and
+        # inside every user-facing notice — treat as sensitive.
+        if _live_key_in_path_names(art_name):
+            # The name (and resolved path) may embed a live key — never
+            # log it raw, and never send it to the user unredacted.
+            logger.warning(
+                "Blocked artifact with live key in name: %s", _redact_live_key(art_name)
+            )
+            await _notify_failure(art_name, "skipped")
+            continue
         if idx >= MAX_OUTBOUND_ARTIFACTS_PER_TURN:
             try:
                 await client.send_message(
@@ -911,7 +954,11 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                     continue
             real_path = os.path.realpath(art_path)
             if is_sensitive_artifact_path(real_path, session_dir):
-                logger.warning("Blocked sensitive/internal artifact: %s", real_path)
+                # The path itself may carry a live key in a segment — log
+                # the redacted form only.
+                logger.warning(
+                    "Blocked sensitive/internal artifact: %s", _redact_live_key(real_path)
+                )
                 await _notify_failure(art_name, "skipped")
                 continue
             try:
@@ -930,6 +977,14 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                 await _notify_failure(art_name, "skipped")
                 continue
             art_path = real_path
+            # Basename of the resolved path is what ilink actually sends.
+            if _live_key_in_path_names(os.path.basename(art_path)):
+                logger.warning(
+                    "Blocked artifact with live key in basename: %s",
+                    _redact_live_key(art_path),
+                )
+                await _notify_failure(art_name, "skipped")
+                continue
             file_size = st.st_size
             if file_size == 0:
                 logger.warning("Artifact is empty (0 bytes), skipping: %s", art_path)
@@ -1707,7 +1762,7 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy, Grok Build, Codex, or dsh CLIs — text/image/file/voice in, CLI replies and generated files back.")
+    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy, Grok Build, Codex, dsh, or pig CLIs — text/image/file/voice in, CLI replies and generated files back.")
     parser.add_argument("--version", action="version", version=f"wechatbridge {__version__}")
     parser.parse_args()
     logger.info("wechatbridge v%s 启动 (backend=%s, instance=%s)", __version__, config.backend, config.instance)

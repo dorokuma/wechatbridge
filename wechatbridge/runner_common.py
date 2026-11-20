@@ -15,6 +15,7 @@ import shutil
 import signal
 import stat
 import sys
+import threading
 import time
 from urllib.parse import unquote
 
@@ -114,6 +115,9 @@ _SENSITIVE_ARTIFACT_FILE_NAMES = frozenset({
     ".dsh_memory.json",
     ".dsh_memory.jsonl",
     "grok_persona.txt",
+    "pig_persona.txt",
+    "models.json",
+    "runtime_prompt.txt",
     "gemini.md",
     "agents.md",
     "agents.override.md",
@@ -136,6 +140,9 @@ _SENSITIVE_ARTIFACT_PREFIXES = (
     "dsh_session_id",
     "dsh_memory",
     "grok_persona",
+    "pig_persona",
+    "models.json",
+    "runtime_prompt",
     "gemini.md",
     "agents.md",
     "agents.override.md",
@@ -149,6 +156,8 @@ _SENSITIVE_ARTIFACT_DIR_NAMES = frozenset({
     ".grok",
     ".codex",
     ".dsh",
+    ".pig",
+    ".pi",
     ".git",
     ".ssh",
     ".gnupg",
@@ -163,6 +172,89 @@ def _host_home() -> str:
     kept here (no import) to avoid a module cycle.
     """
     return os.environ.get("WECHATBRIDGE_HOST_HOME") or os.path.expanduser("~")
+
+
+def _iter_live_magpie_keys() -> list:
+    """Distinct live Magpie API key strings (config + env), empty filtered out.
+
+    Same resolution order the pig runner uses to inject the key into the
+    child process environment — the sources scanned for leak detection must
+    cover every value that could be injected.
+    """
+    keys = []
+    for k in (
+        getattr(config, "magpie_api_key", "") or "",
+        os.environ.get("WECHATBRIDGE_MAGPIE_API_KEY", "") or "",
+        os.environ.get("MAGPIE_API_KEY", "") or "",
+    ):
+        k = k.strip()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def _live_secret_in_bytes(data: bytes) -> bool:
+    """True if *data* contains any live Magpie API key verbatim."""
+    if not data:
+        return False
+    for k in _iter_live_magpie_keys():
+        if len(k) >= 8 and k.encode("utf-8") in data:
+            return True
+    return False
+
+
+def _live_key_in_path_names(path: str) -> bool:
+    """True if the basename or any path segment of *path* contains a live key."""
+    if not path:
+        return False
+    for part in str(path).replace("\\", "/").split("/"):
+        if part and _live_secret_in_bytes(part.encode("utf-8", "replace")):
+            return True
+    return False
+
+
+def _redact_live_key(text: str) -> str:
+    """Replace every live Magpie API key in *text* with ``[REDACTED]``.
+
+    Shared by user-facing notices and log lines: unlike pig.py's local
+    ``_redact_key`` (config > env resolution order), this scans every live
+    key source at once so no resolution-order gap can leak a key.
+    """
+    if not text:
+        return text
+    for k in _iter_live_magpie_keys():
+        if len(k) >= 8:
+            text = text.replace(k, "[REDACTED]")
+    return text
+
+
+def _file_contains_live_key(path: str, max_bytes: int) -> bool:
+    """True if file *path* contains a live Magpie API key in its first
+    *max_bytes*, streamed in chunks so very large artifacts (up to the
+    outbound send cap) are still scanned. A straddling key at a chunk
+    boundary is caught via an overlap window sized to the longest key."""
+    keys = [k.encode("utf-8") for k in _iter_live_magpie_keys() if len(k) >= 8]
+    if not keys:
+        return False
+    overlap = max(len(k) for k in keys) - 1
+    _CHUNK = 256 * 1024
+    tail = b""
+    read_total = 0
+    try:
+        with open(path, "rb") as f:
+            while read_total < max_bytes:
+                chunk = f.read(min(_CHUNK, max_bytes - read_total))
+                if not chunk:
+                    break
+                read_total += len(chunk)
+                data = tail + chunk
+                for k in keys:
+                    if k in data:
+                        return True
+                tail = data[-overlap:] if overlap else b""
+    except OSError:
+        return False
+    return False
 
 
 def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool:
@@ -180,17 +272,40 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
     ``prefs.json``, …) that ``os.path.exists`` resolves against the bridge
     process CWD, which could match unrelated files.
 
-    Inherent boundary: this check only blocks whole-file verbatim copies,
-    renames, or splices. It does not stop exfiltration of a single extracted
-    field, an encoded/transformed variant, or a credential that is truncated
-    before matching — secrets are read up to 64KiB and candidates up to
-    256KiB, so anything beyond those caps is never compared.
+    Inherent boundary: the whole-file copy check only blocks verbatim
+    copies, renames, or splices within the 256KiB candidate budget. The
+    live Magpie key check is separate and unbounded up to the outbound
+    send cap (streamed with chunk overlap), and also applies to the
+    candidate's file name/path segments. Encoded/transformed variants of
+    any secret are out of scope by design.
     """
+    # A live Magpie key embedded in the artifact *file name* (or any path
+    # segment) is an outbound leak on its own — the basename travels inside
+    # the file_item payload and inside user-facing failure notices.
+    if _live_key_in_path_names(candidate_real):
+        return True
+
     try:
         st = os.lstat(candidate_real)
-        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 256 * 1024:
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
             return False
     except OSError:
+        return False
+
+    # In-memory env-key byte scan: under User=root the model can run
+    # ``echo $MAGPIE_API_KEY > out.txt`` — a candidate file containing the
+    # live key verbatim must be blocked even though the key never sits in
+    # a credential file on disk. Unlike the whole-file copy check below,
+    # this is NOT bounded by the 256KiB budget: artifacts up to the
+    # outbound send cap (~100MiB) are scanned in chunks with an overlap
+    # window so a key at a chunk boundary cannot slip through.
+    key_scan_cap = max(int(getattr(config, "max_outbound_file_bytes", 0) or 0), 1)
+    if st.st_size <= key_scan_cap:
+        if _file_contains_live_key(candidate_real, key_scan_cap):
+            return True
+
+    if st.st_size > 256 * 1024:
+        # Whole-file verbatim copy check keeps its historical 256KiB budget.
         return False
 
     secret_files = []
@@ -203,6 +318,11 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
             os.path.join(sess_real, "prefs.json"),
             os.path.join(sess_real, ".codex_thread_id"),
             os.path.join(sess_real, "grok_persona.txt"),
+            os.path.join(sess_real, "pig_persona.txt"),
+            os.path.join(sess_real, ".pig", "agent", "auth.json"),
+            os.path.join(sess_real, ".pig", "agent", "models.json"),
+            os.path.join(sess_real, ".pig", "agent", "settings.json"),
+            os.path.join(sess_real, ".pig", "agent", "runtime_prompt.txt"),
             os.path.join(sess_real, ".gemini", "GEMINI.md"),
             os.path.join(sess_real, "GEMINI.md"),
             os.path.join(sess_real, "AGENTS.md"),
@@ -239,6 +359,11 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
                 token_root, ".gemini", "antigravity-cli", "antigravity-oauth-token"
             )
         )
+        # Host pig/pi credentials live at ~/.pig/agent/auth.json (native pig)
+        # and ~/.pi/agent/auth.json (PIG_USE_PI_DIRS=1 wrapped builds); both
+        # are covered under the same dual-root scan as the agy token above.
+        secret_files.append(os.path.join(token_root, ".pig", "agent", "auth.json"))
+        secret_files.append(os.path.join(token_root, ".pi", "agent", "auth.json"))
     cand_bytes: bytes | None = None
     for sf in secret_files:
         try:
@@ -255,6 +380,7 @@ def _matches_session_secret_content(candidate_real: str, sess_real: str) -> bool
                 return True
         except OSError:
             continue
+
     return False
 
 
@@ -306,7 +432,14 @@ def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
             if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in rel_parts[:-1]):
                 return True
     else:
-        if any(p.startswith(".") or p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in norm_parts[:-1] if p == ".gemini"):
+        # Outside session_dir (e.g. an /add-dir root under .wt or ~/.local):
+        # only the explicit sensitive dir names above apply — the authorized
+        # root itself may legitimately live under a dot-dir ancestor
+        # (worktrees, XDG data dirs), which must not block its contents.
+        # ``.gemini`` is the single exception: the bridge's agy OAuth tree
+        # (~/.gemini/antigravity-cli/…) is sensitive wherever it appears,
+        # so a .gemini ancestor outside the session is still blocked.
+        if any(p == ".gemini" for p in norm_parts[:-1]):
             return True
 
     if _matches_session_secret_content(real, sess_real):
@@ -338,8 +471,8 @@ def is_sensitive_artifact_path(path: str, session_dir: str) -> bool:
 # legitimate artifact source) but ``is_sensitive_artifact_path`` downstream
 # rejects anything they contain outside that one exception.
 _SNAPSHOT_SKIP_DIR_NAMES = frozenset({
-    ".codex", ".git", "__pycache__", "node_modules", "venv", ".venv",
-    "cache", ".cache",
+    ".codex", ".pig", ".pi", ".git", "__pycache__", "node_modules",
+    "venv", ".venv", "cache", ".cache",
 })
 
 # Bridge-private top-level files inside a per-user session dir that must never
@@ -347,6 +480,7 @@ _SNAPSHOT_SKIP_DIR_NAMES = frozenset({
 _SNAPSHOT_EXCLUDE_TOP_LEVEL_NAMES = frozenset({
     "prefs.json",
     "dsh_memory.jsonl",
+    "pig_persona.txt",
 })
 
 # Extension whitelist for session_dir snapshot-fallback artifacts: user
@@ -415,15 +549,24 @@ def _snapshot_regular_files(roots: list) -> dict:
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            # Exclude internal metadata directories in-place BEFORE counting
+            # this dir — sensitive dir trees (.pig/.pi/.codex/…) must never
+            # consume the dir/file budget or contribute entries.
+            dirnames[:] = [
+                d for d in dirnames if d not in _SNAPSHOT_SKIP_DIR_NAMES
+            ]
+            parts = os.path.normpath(dirpath).split(os.sep)
+            if any(p in _SENSITIVE_ARTIFACT_DIR_NAMES for p in parts):
+                # Really prune: .grok/.dsh/… are not in _SNAPSHOT_SKIP_DIR_NAMES,
+                # so without clearing dirnames os.walk would still recurse the
+                # whole tree unbounded (bypassing the 2s budget).
+                dirnames[:] = []
+                continue
             dir_count += 1
             if dir_count > _MAX_DIRS:
                 return _abort("directory-count", root, dirpath)
             if time.monotonic() - t_start > _MAX_SCAN_TIME:
                 return _abort("scan-time", root, dirpath)
-            # Exclude internal metadata directories in-place
-            dirnames[:] = [
-                d for d in dirnames if d not in _SNAPSHOT_SKIP_DIR_NAMES
-            ]
             for fn in filenames:
                 file_count += 1
                 if file_count > _MAX_FILES:
@@ -811,9 +954,12 @@ def format_artifact_send_failure_notice(art_name: str, reason: str) -> str:
     """User-facing text when an artifact cannot be sent back to WeChat.
 
     ``reason`` is an internal code: skipped / not_found / send_failed / error.
-    Must never include server absolute paths — only the display name and reason.
+    Must never include server absolute paths — only the display name and
+    reason. The display name is redacted through :func:`_redact_live_key`
+    so a live key embedded in the artifact filename can never ride the
+    notice back to the user.
     """
-    name = (art_name or "file").replace("`", "'").strip() or "file"
+    name = _redact_live_key((art_name or "file").replace("`", "'").strip()) or "file"
     detail = _ARTIFACT_FAIL_REASONS.get(reason) or _ARTIFACT_FAIL_REASONS["error"]
     return (
         f"⚠️ **文件未能发送** ⚠️\n\n"
@@ -907,6 +1053,19 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
         ):
             return "auth"
 
+    if backend == "pig":
+        if (
+            "no api key found" in lower
+            or "invalid api key" in lower
+            or "incorrect api key" in lower
+            or (
+                "failed to resolve" in lower
+                and ("api key" in lower or "api_key" in lower or "apikey" in lower)
+            )
+            or re.search(r"\b401\b", lower)
+        ):
+            return "auth"
+
     if (
         "not signed in" in lower
         or "authenticate" in lower
@@ -988,9 +1147,30 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
     ):
         return "network"
 
+    # Cloudflare / reverse-proxy gateway blips (pig → Magpie over CF tunnel).
+    if (
+        re.search(r"(?:status|code|http)\s*[:=]?\s*(?:502|503|522)\b", lower)
+        or "bad gateway" in lower
+        or "service unavailable" in lower
+    ):
+        return "network"
+
     # --- 8. Timeout / cascade -----------------------------------------------------
     if "timeout waiting for cascade" in lower or "timeout waiting for response" in lower:
         return "cascade_timeout"
+
+    # Magpie upstream stream idle timeout: "The backend sent nothing for
+    # 570000 ms" (HTTP 504 surfaced by magpie-gemini-web waitTimer).
+    if "sent nothing for" in lower:
+        return "cascade_timeout"
+
+    # Gateway timeouts (504 upstream, 524 Cloudflare origin timeout).
+    if (
+        re.search(r"(?:status|code|http)\s*[:=]?\s*(?:504|524)\b", lower)
+        or "gateway time-out" in lower
+        or "gateway timeout" in lower
+    ):
+        return "timeout"
 
     if "timeout" in lower or "timed out" in lower or "deadline exceeded" in lower:
         return "timeout"
@@ -999,7 +1179,15 @@ def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
     if "permission" in lower and ("denied" in lower or "refuse" in lower or "rejected" in lower):
         return "permission"
 
-    if "no session found" in lower:
+    if (
+        "no session found" in lower
+        or "session not found" in lower
+        or "failed to load session" in lower
+        or "corrupt session" in lower
+        or "not a valid pi session" in lower
+        or "session: empty file" in lower
+        or "session file" in lower
+    ):
         return "session_not_found"
 
     if "model" in lower and (
@@ -1266,7 +1454,7 @@ upstream_guard = UpstreamGuard()
 # Per-user preference persistence (per-backend model/effort/mode memory)
 # ---------------------------------------------------------------------------
 
-KNOWN_BACKENDS = ("agy", "grok", "codex", "dsh")
+KNOWN_BACKENDS = ("agy", "grok", "codex", "dsh", "pig")
 BACKEND_SCOPED_KEYS = ("model", "effort", "mode")
 
 
@@ -1732,7 +1920,21 @@ _SESSION_TEMP_REL_DIRS = (
     os.path.join(".codex", "logs"),
     os.path.join(".dsh", "logs"),
     os.path.join(".dsh", "cache"),
+    os.path.join(".pig", "agent", "logs"),
+    os.path.join(".pig", "logs"),
+    os.path.join(".pig", "cache"),
 )
+
+# pig 7d temp roots — a pig turn (bash tool) can replace any ancestor
+# (.pig, .pig/agent) or the leaf itself with a symlink onto a foreign tree;
+# the periodic cleaner then walks/removes the target's files. These get an
+# lstat-level ancestor+leaf check before _remove_old_files_under. Legacy
+# backends are untouched (existing behaviour, out of this branch's scope).
+_SESSION_TEMP_PIG_REL_DIRS = frozenset({
+    os.path.join(".pig", "agent", "logs"),
+    os.path.join(".pig", "logs"),
+    os.path.join(".pig", "cache"),
+})
 
 # Dialogue history — cleaned as *units* (never split SQLite sidecars / session trees).
 _HISTORY_CONVERSATIONS_REL = os.path.join(
@@ -1742,6 +1944,7 @@ _HISTORY_BRAIN_REL = os.path.join(".gemini", "antigravity-cli", "brain")
 _HISTORY_KNOWLEDGE_REL = os.path.join(".gemini", "antigravity-cli", "knowledge")
 _HISTORY_GROK_SESSIONS_REL = os.path.join(".grok", "sessions")
 _HISTORY_CODEX_SESSIONS_REL = os.path.join(".codex", "sessions")
+_HISTORY_PIG_SESSIONS_REL = os.path.join(".pig", "agent", "sessions")
 
 # SQLite sidecar suffixes that must share fate with the main ``*.db`` file.
 _SQLITE_SIDECAR_TAILS = ("-wal", "-shm", "-journal")
@@ -1838,6 +2041,42 @@ def _remove_old_files_under(root: str, cutoff: float) -> int:
     except OSError as e:
         logger.warning("Session cleanup walk failed %s: %s", root, e)
     return removed
+
+
+def _pig_temp_root_untrusted(user_dir: str, rel: str) -> bool:
+    """True when the ``user_dir/rel`` chain contains a symlink component or
+    the cleaning root's realpath escapes ``user_dir``.
+
+    ``os.walk(..., followlinks=False)`` only stops descent into symlinked
+    *sub*directories — a symlinked ``.pig`` / ``.pig/agent`` ancestor (or
+    the leaf root itself, which ``isdir`` happily follows) still retargets
+    the delete pass onto a foreign tree. Every existing component between
+    ``user_dir`` (exclusive) and the root (inclusive) is lstat'd; a missing
+    component just stops the walk (nothing to traverse). Components above
+    ``user_dir`` stay trusted — ``session_base_dir``/<name> is
+    bridge-owned. Mirrors the symlink part of
+    This IS the shared implementation: :func:`_pig_sessions_tree_untrusted`
+    delegates here with the ``.pig/agent/sessions`` relative chain.
+    """
+    base = os.path.abspath(user_dir)
+    root = os.path.join(base, rel)
+    cur = base
+    for comp in [c for c in rel.split(os.sep) if c and c != os.curdir]:
+        cur = os.path.join(cur, comp)
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            break  # component missing — nothing to traverse or delete
+        if stat.S_ISLNK(st.st_mode):
+            return True
+    try:
+        real_root = os.path.realpath(root)
+        real_base = os.path.realpath(base)
+    except OSError:
+        return True
+    if real_root != real_base and not real_root.startswith(real_base + os.sep):
+        return True
+    return False
 
 
 def _file_mtime(path: str) -> float | None:
@@ -2092,6 +2331,265 @@ def _clean_codex_sessions(sessions_root: str, cutoff: float) -> int:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Active pig session registry (TTL cleaner vs. running subprocess coordination)
+#
+# The periodic history cleaner runs on a worker thread while run_pig holds the
+# per-user session on the event loop. A .jsonl older than the TTL could be
+# lstat'ed as "expired", then pig re-opens it for --continue, then the stale
+# unlink lands anyway — losing the just-resumed conversation. Registration
+# makes the cleaner skip any session tree that is actively in use.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_PIG_LOCK = threading.Lock()
+# {sessions_stable_key: refcount} — see _pig_session_stable_key.
+_ACTIVE_PIG_SESSIONS: dict = {}
+
+# Serializes a run_pig registration against the TTL cleaner's check→delete
+# window for ONE sessions tree. A ``threading.Lock`` is created lazily per
+# stable key — and only once the sessions tree is known to exist (or a run
+# is about to create it), so the dict does not accumulate entries for users
+# that never ran pig. It is held only for the registration on the runner
+# side and for the per-root check+delete on the cleaner side — never for
+# disk traversal of the whole user tree, never for the subprocess run.
+_PIG_SESSION_CLEAN_LOCKS: dict = {}
+
+
+def _pig_session_stable_key(user_dir: str) -> str:
+    """Stable identity for a user's ``.pig/agent/sessions`` tree.
+
+    Anchored ONLY on the bridge-owned ``user_dir``: the realpath walk
+    stops there, then the fixed ``.pig/agent/sessions`` suffix is
+    appended WITHOUT resolving. A pig turn (bash tool) may retarget any
+    component below ``user_dir`` — e.g. swap ``sessions`` for a symlink
+    onto a decoy — but realpath'ing the attacker-controlled chain would
+    derive a DIFFERENT key mid-run: the cleaner would compute K2 while
+    run_pig registered K1, blinding ``_pig_session_root_active`` (active
+    skip lost → 7d roots cleaned during a live turn) and forking the
+    clean lock (check→walk no longer mutual-excluded → the old
+    validate→``os.walk`` TOCTOU reopens). Resolving only up to
+    ``user_dir`` keeps registration key == lookup key for the whole
+    turn; the lstat chain checks in ``_pig_temp_root_untrusted`` /
+    ``_pig_sessions_tree_untrusted`` still refuse a swapped chain before
+    any delete.
+    """
+    try:
+        real_user = os.path.realpath(user_dir)
+    except OSError:
+        real_user = os.path.abspath(user_dir)
+    return os.path.join(real_user, _HISTORY_PIG_SESSIONS_REL)
+
+
+def _pig_session_clean_lock(sessions_root: str) -> threading.Lock:
+    """Return the per-sessions-tree cleaner/runner coordination lock."""
+    key = _pig_session_stable_key(_pig_sessions_user_dir(sessions_root))
+    with _ACTIVE_PIG_LOCK:
+        lock = _PIG_SESSION_CLEAN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PIG_SESSION_CLEAN_LOCKS[key] = lock
+        return lock
+
+
+def _register_active_pig_session(sessions_root: str) -> str:
+    """Register a pig sessions tree as in-use; returns its stable key.
+
+    The registration runs under the per-session clean lock, so a TTL
+    cleaner can never complete its delete pass between "no active
+    sessions" and this registration taking effect: the cleaner either
+    sees the active entry (and skips) or finishes its pass first. No
+    mtime is touched — the 30d TTL keeps expiring strictly by real file
+    mtime; idle history is not renewed by merely starting a run.
+
+    Callers must run this off the event loop (``asyncio.to_thread``): it
+    may wait on the cleaner's lock and must never stall the loop.
+    """
+    with _pig_session_clean_lock(sessions_root):
+        key = _pig_session_stable_key(_pig_sessions_user_dir(sessions_root))
+        with _ACTIVE_PIG_LOCK:
+            _ACTIVE_PIG_SESSIONS[key] = _ACTIVE_PIG_SESSIONS.get(key, 0) + 1
+    return key
+
+
+def _unregister_active_pig_session(key: str) -> None:
+    if not key:
+        return
+    with _ACTIVE_PIG_LOCK:
+        n = _ACTIVE_PIG_SESSIONS.get(key, 0)
+        if n <= 1:
+            _ACTIVE_PIG_SESSIONS.pop(key, None)
+        else:
+            _ACTIVE_PIG_SESSIONS[key] = n - 1
+
+
+def _pig_session_root_active(sessions_root: str) -> bool:
+    """True if the sessions_root (or an ancestor of it) is currently active."""
+    key = _pig_session_stable_key(_pig_sessions_user_dir(sessions_root))
+    with _ACTIVE_PIG_LOCK:
+        return any(key == k or key.startswith(k + os.sep) for k in _ACTIVE_PIG_SESSIONS)
+
+
+def _pig_sessions_tree_untrusted(
+    sessions_root: str, user_dir: str | None = None
+) -> bool:
+    """True when the ``user_dir`` → ``sessions_root`` chain contains a
+    symlink component or the sessions realpath escapes ``user_dir``.
+
+    Same trust boundary as :func:`_pig_temp_root_untrusted` (which is the
+    shared implementation this delegates to): components at or above
+    ``user_dir`` — ``session_base_dir``/<name> and the configured base
+    itself — are bridge-owned and NOT re-validated. Walking lstat from
+    ``/`` would permanently refuse every pig cleanup on hosts whose
+    session store sits behind a symlinked path (e.g. ``/data`` →
+    ``/mnt/vol1/data``): the attacker-writable surface is only the
+    ``.pig`` / ``.pig/agent`` / ``sessions`` chain *below* user_dir.
+
+    ``user_dir`` defaults to sessions_root's third ancestor
+    (``.pig/agent/sessions`` → user_dir); callers pass it explicitly
+    when known.
+    """
+    root = os.path.abspath(sessions_root)
+    if user_dir is None:
+        user_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(root))
+        )
+    rel = os.path.relpath(root, os.path.abspath(user_dir))
+    return _pig_temp_root_untrusted(user_dir, rel)
+
+
+def _pig_sessions_user_dir(sessions_root: str) -> str:
+    """Derive the owning user_dir from a ``.pig/agent/sessions`` root."""
+    return os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(sessions_root)))
+    )
+
+
+def _clean_pig_temp_root_7d(user_dir: str, rel: str, cutoff: float) -> int:
+    """7d TTL for a pig temp root (``.pig/agent/logs``/``.pig/logs``/
+    ``.pig/cache``), mutual-excluded with in-flight pig runs.
+
+    Holds the SAME ``_pig_session_clean_lock`` that run_pig's
+    registration uses (keyed on this user_dir's stable
+    ``realpath(user_dir)`` + ``.pig/agent/sessions`` suffix — never the
+    attacker-swappable chain's realpath): a turn in flight makes
+    ``_pig_session_root_active`` true → skip; otherwise the untrusted
+    check and the delete pass run inside the lock, so a run can never
+    register (or a bash turn retarget an ancestor) between validate and
+    delete — the check→``os.walk`` TOCTOU is closed.
+    """
+    target = os.path.join(user_dir, rel)
+    if not os.path.lexists(target):
+        # Nothing to clean this round: skip BEFORE taking/creating the
+        # per-sessions lock so users that never ran pig leave no entry
+        # behind in _PIG_SESSION_CLEAN_LOCKS. No TOCTOU — a tree planted
+        # later is picked up by the next pass.
+        return 0
+    sessions_root = os.path.join(
+        user_dir, _HISTORY_PIG_SESSIONS_REL
+    )
+    lock = _pig_session_clean_lock(sessions_root)
+    with lock:
+        if _pig_session_root_active(sessions_root):
+            return 0
+        if _pig_temp_root_untrusted(user_dir, rel):
+            logger.warning(
+                "Session cleanup: refusing pig temp root with "
+                "symlink/escape chain: %s", os.path.join(user_dir, rel),
+            )
+            return 0
+        return _remove_old_files_under(
+            os.path.join(user_dir, rel), cutoff
+        )
+
+
+def _clean_pig_sessions(sessions_root: str, cutoff: float) -> int:
+    """Expire idle pig sessions: .pig/agent/sessions/<cwd-bucket>/*.jsonl.
+
+    Only ``*.jsonl`` files older than *cutoff* are deleted (empty bucket
+    dirs pruned afterwards); models.json/settings.json one level up are
+    never touched. A symlinked sessions_root — or ANY symlinked ancestor
+    component (.pig, .pig/agent, or the tree resolving outside its
+    expected parent) — is never followed: it would retarget delete onto a
+    foreign tree. A sessions_root currently registered as active (a
+    run_pig in flight) is skipped entirely so a stale-mtime .jsonl that
+    was just resumed is not unlinked.
+
+    The whole check+delete runs under the per-session clean lock
+    (keyed on the ``realpath(user_dir)`` + fixed-suffix stable key, so
+    a mid-clean swap of the ``sessions`` chain can never fork the lock
+    or blind the active check); a run_pig that registers under the same
+    lock can therefore never interleave between this check and the
+    delete — it either ran first (registration visible → skip) or waits
+    until the cleaner is done (then registers on an already-pruned,
+    empty tree). The lock is only created once the
+    ``.pig/agent/sessions`` tree is known to exist, so users that never
+    ran pig leave no entry behind.
+    """
+    if not os.path.isdir(sessions_root) or os.path.islink(sessions_root):
+        return 0
+    lock = _pig_session_clean_lock(sessions_root)
+    with lock:
+        # Re-check inside the lock: registration (or another cleaner)
+        # may have landed between the isdir gate and lock acquisition.
+        if not os.path.isdir(sessions_root):
+            return 0
+        if _pig_session_root_active(sessions_root):
+            return 0
+        if _pig_sessions_tree_untrusted(
+            sessions_root, user_dir=_pig_sessions_user_dir(sessions_root)
+        ):
+            logger.warning(
+                "Session cleanup: refusing pig sessions tree with "
+                "symlink/escape ancestor: %s", sessions_root,
+            )
+            return 0
+        return _clean_pig_sessions_locked(sessions_root, cutoff)
+
+
+def _clean_pig_sessions_locked(sessions_root: str, cutoff: float) -> int:
+    """Inner delete pass for :func:`_clean_pig_sessions` (clean lock held)."""
+    removed = 0
+    try:
+        names = os.listdir(sessions_root)
+    except OSError as e:
+        logger.warning("Session cleanup list failed %s: %s", sessions_root, e)
+        return 0
+    for name in names:
+        path = os.path.join(sessions_root, name)
+        if os.path.islink(path):
+            continue
+        if os.path.isfile(path):
+            if name.endswith(".jsonl"):
+                try:
+                    if os.lstat(path).st_mtime < cutoff:
+                        os.remove(path)
+                        removed += 1
+                        logger.info("Session cleanup: removed pig session %s", path)
+                except OSError as e:
+                    logger.warning("Session cleanup failed %s: %s", path, e)
+            continue
+        if not os.path.isdir(path):
+            continue
+        try:
+            children = os.listdir(path)
+        except OSError as e:
+            logger.warning("Session cleanup list failed %s: %s", path, e)
+            continue
+        for fn in children:
+            fp = os.path.join(path, fn)
+            if not fn.endswith(".jsonl"):
+                continue
+            try:
+                if os.path.isfile(fp) and not os.path.islink(fp) and os.lstat(fp).st_mtime < cutoff:
+                    os.remove(fp)
+                    removed += 1
+                    logger.info("Session cleanup: removed pig session %s", fp)
+            except OSError as e:
+                logger.warning("Session cleanup failed %s: %s", fp, e)
+        _try_rmdir_empty(path)
+    return removed
+
+
 def _try_rmdir_empty(path: str) -> None:
     """Remove dir if it is now empty (used by codex date-bucket pruning)."""
     try:
@@ -2119,6 +2617,9 @@ def _clean_user_history(user_dir: str, cutoff: float) -> int:
     )
     removed += _clean_codex_sessions(
         os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL), cutoff
+    )
+    removed += _clean_pig_sessions(
+        os.path.join(user_dir, _HISTORY_PIG_SESSIONS_REL), cutoff
     )
     # Legacy dsh files directly under user_dir (migrated/obsolete)
     for fn in ("dsh_session_id", "dsh_memory.jsonl"):
@@ -2207,6 +2708,21 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
             except OSError as e:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
+    # pig: check only pig session dirs
+    pig_has = _dir_has_any_file(os.path.join(user_dir, _HISTORY_PIG_SESSIONS_REL))
+    if not pig_has:
+        flag = os.path.join(user_dir, ".initialized.pig")
+        if os.path.exists(flag):
+            try:
+                os.remove(flag)
+                cleared["pig"] = True
+                logger.info(
+                    "Session cleanup: cleared .initialized.pig for %s (no pig history left)",
+                    user_dir,
+                )
+            except OSError as e:
+                logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
+
     # dsh: transcripts live in host DSH_HOME/sessions or bridge-private state dir;
     # clear .initialized.dsh flag only when no active memory/session remains
     user_name = os.path.basename(user_dir)
@@ -2230,7 +2746,7 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
     # Legacy: clean shared .initialized if no history at all
-    if not grok_has and not agy_has and not codex_has and not dsh_has:
+    if not grok_has and not agy_has and not codex_has and not dsh_has and not pig_has:
         flag = os.path.join(user_dir, ".initialized")
         if os.path.exists(flag):
             try:
@@ -2288,6 +2804,14 @@ def clean_session_data(
                 if not os.path.isdir(user_dir):
                     continue
                 for rel in _SESSION_TEMP_REL_DIRS:
+                    if rel in _SESSION_TEMP_PIG_REL_DIRS:
+                        # pig roots: validate+delete under the run_pig
+                        # clean lock — an in-flight turn (its bash tool
+                        # may retarget .pig ancestors) always wins.
+                        removed += _clean_pig_temp_root_7d(
+                            user_dir, rel, temp_cutoff
+                        )
+                        continue
                     removed += _remove_old_files_under(
                         os.path.join(user_dir, rel), temp_cutoff
                     )
@@ -2377,29 +2901,94 @@ def split_message_chunks(text: str, limit: int | None = None) -> list[str]:
     return [c for c in chunks if c != ""] or [""]
 
 
-async def terminate_process(process, graceful: bool = True) -> None:
+def _process_group_alive(pgid: int) -> bool:
+    """True if at least one member of process group *pgid* still exists."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+async def terminate_process(
+    process, graceful: bool = True, pgid: int | None = None
+) -> None:
     """Terminate a subprocess with Unix process-group or Windows direct kill.
 
     graceful: SIGTERM → 2s wait → SIGKILL (Unix); kill() (Windows).
     Non-graceful: SIGKILL immediately (Unix); kill() (Windows).
+
+    *pgid* (optional): the pre-recorded process-group id captured at spawn
+    time (``start_new_session=True`` → pgid == child pid). When given, the
+    group is signalled even after the root process has already exited — a
+    background child that survived its parent (ignored SIGTERM, detached
+    stdio) would otherwise keep running with no waitable handle. Group
+    liveness is checked via ``killpg(pgid, 0)`` so the escalation to
+    SIGKILL depends on remaining members, not only on the root's
+    returncode.
+
+    The enhanced whole-group wait/escalation applies ONLY on this explicit
+    *pgid* path (pig). With ``pgid=None`` the behaviour is exactly the
+    pre-pig baseline: derive the group via ``os.getpgid``, wait only on
+    the root's returncode, escalate to SIGKILL only when the root is
+    still running — agy/codex/dsh/grok callers are untouched.
     """
     if not process or not process.pid:
         return
     try:
         if hasattr(os, "getpgid") and hasattr(os, "killpg"):
-            pgid = os.getpgid(process.pid)
-            if graceful:
-                os.killpg(pgid, signal.SIGTERM)
-                logger.info("Sent SIGTERM to process group %s for graceful lock release", pgid)
+            if pgid is None:
+                # Baseline semantics for the four legacy backends.
+                pgid = os.getpgid(process.pid)
+                if graceful:
+                    os.killpg(pgid, signal.SIGTERM)
+                    logger.info(
+                        "Sent SIGTERM to process group %s for graceful lock release",
+                        pgid,
+                    )
+                    for _ in range(20):
+                        if process.returncode is not None:
+                            break
+                        await asyncio.sleep(0.1)
+                    if process.returncode is None:
+                        os.killpg(pgid, signal.SIGKILL)
+                        logger.info(
+                            "Sent SIGKILL to process group %s after grace period",
+                            pgid,
+                        )
+                else:
+                    os.killpg(pgid, signal.SIGKILL)
+            elif graceful:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                    logger.info(
+                        "Sent SIGTERM to process group %s for graceful lock release",
+                        pgid,
+                    )
+                except ProcessLookupError:
+                    pass
                 for _ in range(20):
-                    if process.returncode is not None:
+                    if process.returncode is not None and not _process_group_alive(pgid):
                         break
                     await asyncio.sleep(0.1)
-                if process.returncode is None:
-                    os.killpg(pgid, signal.SIGKILL)
-                    logger.info("Sent SIGKILL to process group %s after grace period", pgid)
+                if process.returncode is None or _process_group_alive(pgid):
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                        logger.info(
+                            "Sent SIGKILL to process group %s after grace period",
+                            pgid,
+                        )
+                    except ProcessLookupError:
+                        pass
             else:
-                os.killpg(pgid, signal.SIGKILL)
+                # Non-graceful: unconditional group SIGKILL — the root may
+                # already be reaped while background children linger.
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         else:
             # Windows: no process groups, kill directly
             process.kill()

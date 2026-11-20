@@ -5037,5 +5037,482 @@ class TestProcessMessageMediaNotices(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[附件（原文件名：data.xlsx）: @", captured[0])
 
 
+class TestPigCredentialScanRegression(unittest.TestCase):
+    """pig backend hardening regressions: dual-root secret scan, env-key byte
+    match, .pig snapshot skip, and .pig session TTL."""
+
+    def test_dual_root_pig_pi_auth_and_session_files_blocked(self):
+        """Dual-root invariant: every planted source uses a DISTINCT payload
+        so each assertTrue can only be satisfied by that exact source being
+        scanned — deleting the host pig/pi root or the session-source list
+        must make a corresponding assert fail (no same-payload sweep)."""
+        from wechatbridge.runner_common import is_sensitive_artifact_path
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            host_home = os.path.join(td, "host_home")
+            env_home = os.path.join(td, "env_home")
+            sess = os.path.join(td, "sess")
+            dsh_state = os.path.join(td, "dsh_state")
+            dsh_home = os.path.join(td, "dsh_home")
+            for d in (host_home, env_home, sess, dsh_state, dsh_home):
+                os.makedirs(d)
+
+            # Four host-side sources, each with its own payload
+            sources = {}
+            for tag, root, sub in (
+                ("hp", host_home, (".pig", "agent", "auth.json")),
+                ("hpi", host_home, (".pi", "agent", "auth.json")),
+                ("ep", env_home, (".pig", "agent", "auth.json")),
+                ("epi", env_home, (".pi", "agent", "auth.json")),
+            ):
+                payload = f'{{"token":"{tag}-unique-payload-00001"}}'.encode()
+                d = os.path.join(root, *sub[:-1])
+                os.makedirs(d, exist_ok=True)
+                p = os.path.join(d, "auth.json")
+                with open(p, "wb") as f:
+                    f.write(payload)
+                sources[tag] = payload
+            # One session-side source
+            sess_payload = b'{"sess":"sess-unique-payload-00002"}'
+            p = os.path.join(sess, "pig_persona.txt")
+            with open(p, "wb") as f:
+                f.write(sess_payload)
+            sources["sess"] = sess_payload
+
+            scratch = os.path.join(sess, "scratch")
+            os.makedirs(scratch)
+            clean_env = {
+                "WECHATBRIDGE_HOST_HOME": host_home,
+                "HOME": env_home,
+                "WECHATBRIDGE_MAGPIE_API_KEY": "",
+                "MAGPIE_API_KEY": "",
+            }
+            for tag, payload in sources.items():
+                cand = os.path.join(scratch, f"cand_{tag}.txt")
+                with open(cand, "wb") as f:
+                    f.write(b"prefix " + payload + b" suffix")
+                # env-only inputs: the live Magpie key comes from
+                # WECHATBRIDGE_MAGPIE_API_KEY (also readable by
+                # _iter_live_magpie_keys on the baseline path), never from
+                # a patched config attribute — config.magpie_api_key does
+                # not exist on the baseline and must not be touched.
+                key_env = dict(clean_env)
+                key_env["WECHATBRIDGE_MAGPIE_API_KEY"] = (
+                    f"sk-unique-{tag}-payload-00003"
+                )
+                with mock.patch.dict(os.environ, key_env, clear=False), \
+                     mock.patch.object(config, "dsh_home", dsh_home), \
+                     mock.patch.object(config, "dsh_state_dir", dsh_state):
+                    self.assertTrue(
+                        is_sensitive_artifact_path(cand, sess),
+                        f"source {tag} not scanned",
+                    )
+
+    def test_env_magpie_key_bytes_blocked(self):
+        """A candidate artifact containing the live MAGPIE_API_KEY bytes
+        must be intercepted regardless of file size (256KiB cap lifted for
+        the key scan) or whether the key sits in the file name."""
+        from wechatbridge.runner_common import is_sensitive_artifact_path
+        from wechatbridge.config import config
+
+        key = "sk-test-magpie-env-key-abcdef1234"
+        with tempfile.TemporaryDirectory() as td:
+            sess = os.path.join(td, "sess")
+            os.makedirs(sess)
+            dsh_home = os.path.join(td, "dsh_home")
+            dsh_state = os.path.join(td, "dsh_state")
+            os.makedirs(dsh_home)
+            os.makedirs(dsh_state)
+            # The key arrives purely via env (a real input source on both
+            # baseline and worktree): nothing on the config object that the
+            # baseline lacks may be patched. dsh_home / dsh_state_dir are
+            # baseline attributes but still pinned to temp dirs for
+            # isolation.
+            clean_env = {
+                "WECHATBRIDGE_HOST_HOME": os.path.join(td, "hh"),
+                "HOME": os.path.join(td, "eh"),
+                "WECHATBRIDGE_MAGPIE_API_KEY": key,
+                "MAGPIE_API_KEY": "",
+            }
+            os.makedirs(clean_env["WECHATBRIDGE_HOST_HOME"])
+            os.makedirs(clean_env["HOME"])
+            # small file with the key in content
+            small = os.path.join(sess, "out.txt")
+            with open(small, "w", encoding="utf-8") as f:
+                f.write(f"value: {key}\n")
+            # >256KiB file with the key past the legacy copy-scan cap
+            big = os.path.join(sess, "big.txt")
+            with open(big, "wb") as f:
+                f.write(b"A" * (300 * 1024) + key.encode() + b"\n")
+            # key in the basename
+            named = os.path.join(sess, f"report_{key}.txt")
+            with open(named, "w") as f:
+                f.write("benign")
+            with mock.patch.dict(os.environ, clean_env, clear=False), \
+                 mock.patch.object(config, "dsh_home", dsh_home), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state):
+                self.assertTrue(is_sensitive_artifact_path(small, sess))
+                self.assertTrue(is_sensitive_artifact_path(big, sess))
+                self.assertTrue(is_sensitive_artifact_path(named, sess))
+
+    def test_pig_dir_skipped_in_snapshot(self):
+        """.pig/agent/sessions with many files must not consume the snapshot
+        file/dir budget — normal deliverables are still collected. A .grok
+        deep tree (NOT in _SNAPSHOT_SKIP_DIR_NAMES) must also be pruned
+        entirely, not walked unbounded."""
+        from wechatbridge.runner_common import _snapshot_regular_files
+
+        with tempfile.TemporaryDirectory() as sess:
+            deep = os.path.join(sess, ".pig", "agent", "sessions")
+            for i in range(60):
+                d = os.path.join(deep, f"--cwd{i}--")
+                os.makedirs(d)
+                for j in range(4):
+                    with open(os.path.join(d, f"s{j}.jsonl"), "w") as f:
+                        f.write("{}")
+            # .grok leftover tree — not in _SNAPSHOT_SKIP_DIR_NAMES, must be
+            # pruned by the _SENSITIVE_ARTIFACT_DIR_NAMES branch (Rev#9).
+            grok_deep = os.path.join(sess, ".grok", "sessions")
+            for i in range(30):
+                d = os.path.join(grok_deep, f"d{i}")
+                os.makedirs(d)
+                with open(os.path.join(d, "x.jsonl"), "w") as f:
+                    f.write("{}")
+            report = os.path.join(sess, "report.pdf")
+            with open(report, "wb") as f:
+                f.write(b"%PDF")
+            snap = _snapshot_regular_files([sess])
+            self.assertIn(report, snap)
+            self.assertTrue(all(".pig" not in p.split(os.sep) for p in snap))
+            self.assertTrue(all(".grok" not in p.split(os.sep) for p in snap))
+
+    def test_add_dir_under_dot_ancestors_not_blocked(self):
+        """MF-3: a file inside an authorized root that itself lives under
+        dot-dir ancestors (.wt worktree, ~/.local XDG data) must NOT be
+        treated as sensitive — only the explicit sensitive dir names apply
+        outside session_dir."""
+        from wechatbridge.runner_common import (
+            is_sensitive_artifact_path,
+            _sanitize_prompt_at_paths,
+            validate_add_dir,
+        )
+        from wechatbridge.config import config
+        from wechatbridge import dsh
+
+        with tempfile.TemporaryDirectory() as td:
+            wt_root = os.path.join(td, ".wt", "repo", "feat")
+            os.makedirs(wt_root)
+            pdf = os.path.join(wt_root, "out.pdf")
+            with open(pdf, "wb") as f:
+                f.write(b"%PDF-1.4")
+            sess = os.path.join(td, "sess")
+            os.makedirs(sess)
+            xdg_pdf = os.path.join(
+                td, ".local", "share", "wechatbridge", "default", "sessions", "u1", "a.pdf"
+            )
+            os.makedirs(os.path.dirname(xdg_pdf))
+            with open(xdg_pdf, "wb") as f:
+                f.write(b"%PDF-1.4")
+            # Baseline-attribute isolation only: dsh_home/dsh_state_dir
+            # exist on the baseline AppConfig; magpie_api_key does NOT —
+            # the live key arrives via WECHATBRIDGE_MAGPIE_API_KEY env.
+            dsh_home = os.path.join(td, "dsh_home")
+            dsh_state = os.path.join(td, "dsh_state")
+            os.makedirs(dsh_home)
+            os.makedirs(dsh_state)
+
+            clean_env = {
+                "WECHATBRIDGE_HOST_HOME": os.path.join(td, "hh"),
+                "HOME": os.path.join(td, "eh"),
+                "WECHATBRIDGE_MAGPIE_API_KEY": "",
+                "MAGPIE_API_KEY": "",
+            }
+            os.makedirs(clean_env["WECHATBRIDGE_HOST_HOME"])
+            os.makedirs(clean_env["HOME"])
+            with mock.patch.dict(os.environ, clean_env, clear=False), \
+                 mock.patch.object(config, "dsh_home", dsh_home), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "add_dir_roots", [os.path.join(td, ".wt")]), \
+                 mock.patch.object(config, "session_base_dir", sess):
+                # /add-dir authorization succeeds under .wt
+                ok, _ = validate_add_dir(wt_root, "u1")
+                self.assertTrue(ok)
+                # file inside it is not sensitive
+                self.assertFalse(is_sensitive_artifact_path(pdf, sess))
+                # @path inside the authorized root is not rewritten to blocked
+                out = _sanitize_prompt_at_paths(
+                    f"请审阅 @{pdf}", sess, extra_roots=[os.path.realpath(wt_root)]
+                )
+                self.assertNotIn("[blocked-path]", out)
+                # dsh extract_artifacts on an .local path still yields the file
+                arts = dsh.extract_artifacts(f"[a.pdf](file://{xdg_pdf})")
+                self.assertTrue(any(p == xdg_pdf for _, p in arts))
+
+    def test_gemini_outside_session_blocked_else_branch(self):
+        """MF-R2-2: the baseline else-branch blocking of an out-of-session
+        ``.gemini`` ancestor was dropped during the R1 MF-3 re-allow — a
+        ~/.gemini/antigravity-cli tree (and session_dir="" dsh calls) must
+        still be treated as sensitive. In-session scratch stays allowed.
+        """
+        from wechatbridge.runner_common import is_sensitive_artifact_path
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            # An authorized /add-dir root that legitimately lives under a
+            # dot-dir ancestor (.wt) — must still NOT be sensitive (R1 MF-3).
+            wt_root = os.path.join(td, ".wt", "repo")
+            os.makedirs(wt_root)
+            legit = os.path.join(wt_root, "out.pdf")
+            with open(legit, "wb") as f:
+                f.write(b"%PDF")
+            # A .gemini tree outside the session — host agy OAuth layout.
+            host_gemini = os.path.join(
+                td, ".gemini", "antigravity-cli", "brain", "plan.md"
+            )
+            os.makedirs(os.path.dirname(host_gemini))
+            with open(host_gemini, "w") as f:
+                f.write("plan")
+            sess = os.path.join(td, "sess")
+            os.makedirs(sess)
+            # Baseline-attribute isolation only: dsh_home/dsh_state_dir
+            # exist on the baseline AppConfig; magpie_api_key does NOT —
+            # the live key arrives via WECHATBRIDGE_MAGPIE_API_KEY env.
+            dsh_home = os.path.join(td, "dsh_home")
+            dsh_state = os.path.join(td, "dsh_state")
+            os.makedirs(dsh_home)
+            os.makedirs(dsh_state)
+            clean_env = {
+                "WECHATBRIDGE_HOST_HOME": os.path.join(td, "hh"),
+                "HOME": os.path.join(td, "eh"),
+                "WECHATBRIDGE_MAGPIE_API_KEY": "",
+                "MAGPIE_API_KEY": "",
+            }
+            os.makedirs(clean_env["WECHATBRIDGE_HOST_HOME"])
+            os.makedirs(clean_env["HOME"])
+            with mock.patch.dict(os.environ, clean_env, clear=False), \
+                 mock.patch.object(config, "dsh_home", dsh_home), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "session_base_dir", sess):
+                # .gemini ancestor outside session → sensitive
+                self.assertTrue(is_sensitive_artifact_path(host_gemini, sess))
+                # session_dir="" (dsh extract_artifacts cwd="" path) →
+                # still sensitive
+                self.assertTrue(is_sensitive_artifact_path(host_gemini, ""))
+                # authorized root under .wt ancestor → still NOT sensitive
+                self.assertFalse(is_sensitive_artifact_path(legit, sess))
+                # in-session .gemini scratch → allowed
+                scratch = os.path.join(
+                    sess, ".gemini", "antigravity-cli", "scratch", "a.txt"
+                )
+                os.makedirs(os.path.dirname(scratch))
+                with open(scratch, "w") as f:
+                    f.write("x")
+                self.assertFalse(is_sensitive_artifact_path(scratch, sess))
+                # in-session .gemini non-scratch → still sensitive
+                brain = os.path.join(
+                    sess, ".gemini", "antigravity-cli", "brain", "plan.md"
+                )
+                os.makedirs(os.path.dirname(brain))
+                with open(brain, "w") as f:
+                    f.write("x")
+                self.assertTrue(is_sensitive_artifact_path(brain, sess))
+
+    def test_pig_session_ttl_and_flag_linkage(self):
+        """clean_session_data: expired .pig/agent/sessions/*.jsonl removed and
+        .initialized.pig cleared; models.json/settings.json survive."""
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "sessions")
+            user_dir = os.path.join(base, "user_abc")
+            sess_root = os.path.join(user_dir, ".pig", "agent", "sessions", "--cwd--")
+            os.makedirs(sess_root)
+            old_f = os.path.join(sess_root, "old.jsonl")
+            fresh_f = os.path.join(sess_root, "fresh.jsonl")
+            for p in (old_f, fresh_f):
+                with open(p, "w") as f:
+                    f.write("{}")
+            old_mtime = time.time() - 40 * 86400
+            os.utime(old_f, (old_mtime, old_mtime))
+            agent_dir = os.path.join(user_dir, ".pig", "agent")
+            for cfg in ("models.json", "settings.json"):
+                with open(os.path.join(agent_dir, cfg), "w") as f:
+                    f.write("{}")
+                os.utime(os.path.join(agent_dir, cfg), (old_mtime, old_mtime))
+            flag = os.path.join(user_dir, ".initialized.pig")
+            with open(flag, "w") as f:
+                f.write("1")
+            # SF-B': clean_session_data unconditionally sweeps the private
+            # dsh state dir (get_dsh_state_dir()) AND the explicit-DSH_HOME
+            # sessions tree — both must be pinned inside this temp dir so
+            # a host with a real dsh root configured can never lose data
+            # to this regression test.
+            dsh_state = os.path.join(td, "dsh_state")
+            dsh_home_dir = os.path.join(td, "dsh_home")
+            os.makedirs(dsh_state)
+            os.makedirs(dsh_home_dir)
+
+            with mock.patch.object(config, "session_base_dir", base), \
+                 mock.patch.object(config, "history_retention_days", 30), \
+                 mock.patch.object(config, "session_retention_days", 7), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "dsh_home", dsh_home_dir):
+                clean_session_data()
+
+            self.assertFalse(os.path.exists(old_f))
+            self.assertTrue(os.path.exists(fresh_f))
+            self.assertTrue(os.path.exists(os.path.join(agent_dir, "models.json")))
+            self.assertTrue(os.path.exists(os.path.join(agent_dir, "settings.json")))
+            # fresh.jsonl remains → flag NOT cleared (history still exists)
+            self.assertTrue(os.path.exists(flag))
+
+            # Age out the fresh file too → now flag must be cleared
+            os.utime(fresh_f, (old_mtime, old_mtime))
+            with mock.patch.object(config, "session_base_dir", base), \
+                 mock.patch.object(config, "history_retention_days", 30), \
+                 mock.patch.object(config, "session_retention_days", 7), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "dsh_home", dsh_home_dir):
+                clean_session_data()
+            self.assertFalse(os.path.exists(fresh_f))
+            self.assertFalse(os.path.exists(flag))
+            self.assertTrue(os.path.exists(os.path.join(agent_dir, "models.json")))
+
+
+class TestPigTempRootSymlinkRefused(unittest.TestCase):
+    """MF-7d: a pig turn (bash tool) may replace any ancestor of a 7d pig
+    temp root (.pig / .pig/agent / the leaf) with a symlink onto a foreign
+    tree; the periodic ``clean_session_data`` pass must refuse to traverse
+    it, never deleting files outside the user's session dir."""
+
+    def test_pig_temp_root_symlink_to_external_tree_skipped(self):
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "sessions")
+            user_dir = os.path.join(base, "u_pig_temps")
+            os.makedirs(user_dir)
+
+            # Foreign tree the symlink points at, with an EXPIRED file the
+            # buggy walk would have deleted.
+            outside = os.path.join(td, "outside")
+            os.makedirs(outside)
+            victim = os.path.join(outside, "keep-me.log")
+            with open(victim, "w", encoding="utf-8") as f:
+                f.write("keep")
+            old_mtime = time.time() - 40 * 86400
+            os.utime(victim, (old_mtime, old_mtime))
+
+            # .pig/agent/logs 叶子本身是指向外部树的软链（等价地，
+            # .pig / .pig/agent 祖先软链也走同一条拒绝路径）。
+            agent_dir = os.path.join(user_dir, ".pig", "agent")
+            os.makedirs(agent_dir)
+            os.symlink(outside, os.path.join(agent_dir, "logs"))
+
+            # 同用户的另一个 pig 7d 根（.pig/logs）是真实目录且含过期
+            # 文件——它必须照常清理，证明只对被劫持的根拒删。
+            pig_logs = os.path.join(user_dir, ".pig", "logs")
+            os.makedirs(pig_logs)
+            stale = os.path.join(pig_logs, "stale.log")
+            with open(stale, "w", encoding="utf-8") as f:
+                f.write("old")
+            os.utime(stale, (old_mtime, old_mtime))
+
+            dsh_state = os.path.join(td, "dsh_state")
+            dsh_home = os.path.join(td, "dsh_home")
+            os.makedirs(dsh_state)
+            os.makedirs(dsh_home)
+
+            with mock.patch.object(config, "session_base_dir", base), \
+                 mock.patch.object(config, "session_retention_days", 7), \
+                 mock.patch.object(config, "history_retention_days", 30), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "dsh_home", dsh_home):
+                removed = clean_session_data()
+
+            # 外部树里的过期文件绝不被碰；软链本身保留。
+            self.assertTrue(
+                os.path.exists(victim),
+                "expired file in a foreign tree must NOT be deleted",
+            )
+            self.assertTrue(
+                os.path.islink(os.path.join(agent_dir, "logs")),
+                "the hijacked leaf symlink must be left in place",
+            )
+            # 未被劫持的 pig 根仍按 7d TTL 正常清理。
+            self.assertFalse(
+                os.path.exists(stale),
+                "legit expired file under .pig/logs must still be removed",
+            )
+            self.assertGreaterEqual(removed, 1)
+
+            # 祖先软链场景：.pig 整个换成软链时同样拒绝。
+            # victim 必须落在真实匹配的清理子路径（outside2/logs）里——
+            # 若只在 outside2 根部放文件，即使删掉祖先防护 walk 也到不
+            # 了它，断言照样过（假绿）。
+            outside2 = os.path.join(td, "outside2")
+            outside2_logs = os.path.join(outside2, "logs")
+            os.makedirs(outside2_logs)
+            victim2 = os.path.join(outside2_logs, "keep-me-2.log")
+            with open(victim2, "w", encoding="utf-8") as f:
+                f.write("keep")
+            os.utime(victim2, (old_mtime, old_mtime))
+
+            user_dir2 = os.path.join(base, "u_pig_ancestor")
+            os.makedirs(user_dir2)
+            os.symlink(outside2, os.path.join(user_dir2, ".pig"))
+
+            with mock.patch.object(config, "session_base_dir", base), \
+                 mock.patch.object(config, "session_retention_days", 7), \
+                 mock.patch.object(config, "history_retention_days", 30), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "dsh_home", dsh_home):
+                clean_session_data()
+
+            self.assertTrue(
+                os.path.exists(victim2),
+                "ancestor .pig symlink must not retarget deletes outside",
+            )
+            self.assertTrue(
+                os.path.islink(os.path.join(user_dir2, ".pig")),
+                "the ancestor symlink itself must be left in place",
+            )
+
+            # 中间层祖先软链场景：.pig/agent → 外部树。仅检叶子的实现
+            # （.pig/agent/logs 是真实目录）会放过它并删到外部 victim。
+            outside3 = os.path.join(td, "outside3")
+            outside3_logs = os.path.join(outside3, "logs")
+            os.makedirs(outside3_logs)
+            victim3 = os.path.join(outside3_logs, "keep-me-3.log")
+            with open(victim3, "w", encoding="utf-8") as f:
+                f.write("keep")
+            os.utime(victim3, (old_mtime, old_mtime))
+
+            user_dir3 = os.path.join(base, "u_pig_mid")
+            pig3 = os.path.join(user_dir3, ".pig")
+            os.makedirs(pig3)
+            os.symlink(outside3, os.path.join(pig3, "agent"))
+
+            with mock.patch.object(config, "session_base_dir", base), \
+                 mock.patch.object(config, "session_retention_days", 7), \
+                 mock.patch.object(config, "history_retention_days", 30), \
+                 mock.patch.object(config, "dsh_state_dir", dsh_state), \
+                 mock.patch.object(config, "dsh_home", dsh_home):
+                clean_session_data()
+
+            self.assertTrue(
+                os.path.exists(victim3),
+                "intermediate .pig/agent symlink must not retarget "
+                "deletes outside",
+            )
+            self.assertTrue(
+                os.path.islink(os.path.join(pig3, "agent")),
+                "the intermediate symlink itself must be left in place",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
