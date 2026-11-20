@@ -17,6 +17,8 @@
 
 - **槽位持有不变量**：`wechatbridge/main.py` 中 `_GlobalSlot.held`（`:255-311`）必须真实反映当前任务是否持有全局并发槽位 semaphore，并在退避临时释放/重获及取消清理（`:1693-1699`）时保持一致防止重复 `release`；同时 relogin 切换路径必须经 `msg_tasks` 排空等待（`:1561-1575`）完成后才关闭 `client`，重构槽位或登录切换逻辑时不得破坏这两处不变量。
 - **凭据扫描双根覆盖**：当显式配置 `WECHATBRIDGE_HOST_HOME` 与服务进程 `HOME` 分离时，`wechatbridge/runner_common.py`（`:159-165`、`:232-240`）针对 `agy` OAuth token 敏感内容扫描必须同时覆盖 `_host_home()` 与 `os.path.expanduser("~")`（二者去重，与 `wechatbridge/agy.py:178` token 读取来源对齐），修改凭据扫描根集合时不可将该双根覆盖退化为单根。
+- **清理信任模型残余窗口**：pig 7d/30d 临时根与 sessions 清理的「校验→删除」互斥只在**有在途 pig 登记**时经 `_pig_session_clean_lock` + `_pig_session_root_active` 成立；**无登记的空闲窗口内，同 UID 外部行为体（该用户其它后端在途 bash，或逃逸 pig 孤儿子进程）仍可在 `_pig_temp_root_untrusted`/`_pig_sessions_tree_untrusted` 返回后、`os.walk`/unlink 前换链**——`os.walk` 对顶层 root 软链始终跟随（`followlinks=False` 只管子目录下降）。此窗口与 11 个旧后端临时根完全相同（既有信任模型，非本分支引入）；后续若要消除需 fd 锚定（`os.open(root, O_NOFOLLOW|O_DIRECTORY)`）或锁内 lstat 复查，改动前须评估是否对旧后端同步扩面。
+- **`_register`/`_unregister` 配平不变量**：`_ACTIVE_PIG_SESSIONS` refcount 必须严格配平：`_register_active_pig_session` 每次 +1 必须经 `_unregister_active_pig_session`（含 `run_pig` 取消路径 `_reg_lock`/`_reg_state` 三交错自偿 late +1）对称 -1。残留 +1 的后果不再只是历史免清——`pig.py` 的 `/clear`/`/new`（`handle_pig_slash_command`→`_clear_pig_sessions` `:678` active 门控）与单次自愈重试（`:1188`）会**永久静默跳过**，症状是远端用户清会话命令失灵且无报错、极难定位；重构登记/取消/自愈/`finally` 路径时不得破坏配平（现有 `test_cancelled_registration_reaps_active_key` 覆盖取消三交错，新增取消分支须同步补覆盖）。
 ## Release Policy / 发布规范
 
 本节是本仓库发版的强制规则。仓库已有的更具体版本、构建或发布渠道规则优先，但不得降低以下底线。

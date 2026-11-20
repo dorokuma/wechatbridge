@@ -1264,7 +1264,7 @@ def _cmd_help() -> str:
         "**模型控制**",
         "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
         "- `/models` — 查看可用模型列表",
-        "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
+        "- `/backend <agy|grok|codex|dsh|pig>` — 切换助手引擎",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — 重置对话（开始新会话）",

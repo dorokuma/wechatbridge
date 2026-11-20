@@ -1,7 +1,7 @@
 [project]
 name = "wechatbridge-cli"
 dynamic = ["version"]
-description = "Bridge WeChat messages to agy, Grok Build, or Codex CLIs — text/image/file/voice in, CLI replies and generated files back."
+description = "Bridge WeChat messages to agy, Grok Build, Codex, dsh, or pig CLIs — text/image/file/voice in, CLI replies and generated files back."
 requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "MIT" }
@@ -9,7 +9,7 @@ urls = { Homepage = "https://github.com/dorokuma/wechatbridge", Repository = "ht
 authors = [
     { name = "WeChatBridge contributors" },
 ]
-keywords = ["wechat", "bot", "bridge", "agy", "grok", "codex"]
+keywords = ["wechat", "bot", "bridge", "agy", "grok", "codex", "pig"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
