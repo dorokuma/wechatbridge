@@ -5,10 +5,10 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge puts your terminal coding agent in your pocket. Bring your own CLI — agy, grok, codex, or dsh — and talk to it from WeChat: text, images, files, and voice (transcribed to text). You get replies back, and generated files can come back to you over the WeChat CDN. Each user can switch backends with `/backend`, no restart needed.
+WeChatBridge puts your terminal coding agent in your pocket. Bring your own CLI — agy, grok, codex, dsh, or pig — and talk to it from WeChat: text, images, files, and voice (transcribed to text). You get replies back, and generated files can come back to you over the WeChat CDN. Each user can switch backends with `/backend`, no restart needed.
 
 ```
-WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh CLI
+WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh / pig CLI
                                        (the bridge)   (runs tools)
 ```
 
@@ -20,7 +20,7 @@ Commands like `/help`, `/backend`, or `/persona` are answered by the bridge itse
 
 Five steps, about 10 minutes from zero to your first reply in WeChat.
 
-1. **Install one CLI backend and sign in.** I recommend [agy](https://antigravity.google/docs/cli) (Google Antigravity), since that is the backend I run daily. [grok](https://docs.x.ai/build/overview), [codex](https://developers.openai.com/codex/cli), and [dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md) also work, but check the status notes under **CLI Backends** before you pick one. After installing, log in once in that CLI (for example `grok login`, `codex login`, or `dsh login`).
+1. **Install one CLI backend and sign in.** I recommend [agy](https://antigravity.google/docs/cli) (Google Antigravity), since that is the backend I run daily. [grok](https://docs.x.ai/build/overview), [codex](https://developers.openai.com/codex/cli), [dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md), and pig (Magpie-backed, `gemini-web/gemini-4-neon`) also work, but check the status notes under **CLI Backends** before you pick one. After installing, log in once in that CLI (for example `grok login`, `codex login`, or `dsh login`; pig takes its key from `MAGPIE_API_KEY` rather than an interactive login).
 
 2. **Install WeChatBridge:**
 
@@ -47,7 +47,7 @@ Five steps, about 10 minutes from zero to your first reply in WeChat.
    If the backend you installed in step 1 is not `agy`, also set the global default backend in `.env`; `agy` is the default and can be omitted:
 
    ```bash
-   WECHATBRIDGE_BACKEND=grok   # or codex / dsh
+   WECHATBRIDGE_BACKEND=grok   # or codex / dsh / pig
    ```
 
 4. **Start it and scan the QR code to bind.** The ClawBot / iLink channel is Tencent's official, free personal-account bot channel: no application, review, qualification, or payment required — and you don't need to install anything extra: the bridge handles binding itself. Run `wechatbridge`; it prints a QR code in the terminal, and you scan it with WeChat on your phone. The bridge waits for a scan with a default poll timeout of 180 seconds; on timeout it automatically fetches a fresh QR code and keeps waiting — the process does not exit and does not need a restart. Only if you stop it yourself do you rerun `wechatbridge`.
@@ -58,10 +58,10 @@ See **Configure** below for every variable, and **Deploy** for running it as a s
 
 ## Features
 
-- You can send text, images, files, and voice (transcribed by WeChat's servers) to the active backend: `agy`, `grok`, `codex`, or `dsh`. See **CLI Backends** for how mature each one is.
+- You can send text, images, files, and voice (transcribed by WeChat's servers) to the active backend: `agy`, `grok`, `codex`, `dsh`, or `pig`. See **CLI Backends** for how mature each one is.
 - Files the CLI produces inside your allowed directory can come back to WeChat, up to a size cap. Not every file it touches gets sent.
 - Each WeChat user gets their own workspace. Model, effort, and mode settings are remembered per backend.
-- You can switch backends at runtime with `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh`. Switching clears that backend's continuation state (the agy/grok continuation flag and the codex `thread_id`/resume state), so the next CLI turn starts a fresh session. History files on disk are not wiped right away.
+- You can switch backends at runtime with `/backend agy`, `/backend grok`, `/backend codex`, `/backend dsh`, or `/backend pig`. Switching clears that backend's continuation state (the agy/grok continuation flag and the codex `thread_id`/resume state), so the next CLI turn starts a fresh session. History files on disk are not wiped right away.
 - Slash commands for model, session reset, persona, and more (see below).
 - A dangerous-prompt gate checks messages against a keyword list of destructive patterns and asks for confirmation first.
 - Sender whitelist via `WECHATBRIDGE_ALLOWED_SENDERS`: non-empty means listed users only, `*` means everyone, empty means admins only (nobody if there are no admins either).
@@ -80,14 +80,15 @@ Default data paths expand from `~` (for example `~/.local/share/wechatbridge/<in
 
 ## CLI Backends
 
-agy is the backend I use every day. The other three are implemented and tested, but I have not run them in production for long. Verify a non-agy backend in your own setup before you rely on it.
+agy and pig are the backends I run in production every day. The other three are implemented and tested, but I have not run them in production for long. Verify a non-agy backend in your own setup before you rely on it.
 
 - **agy** (default): Google Antigravity CLI. **Status: this is the backend the author uses daily.**
+- **pig**: Magpie-backed single-model CLI (`gemini-web/gemini-4-neon` via an OpenAI-compatible upstream). **Status: this is a backend the author runs in production daily.**
 - **grok**: xAI Grok Build CLI. **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
 - **codex**: OpenAI Codex CLI. **Status: implemented and tested, but not battle-tested by the author — please verify it in your own setup before relying on it.**
 - **dsh**: DeepSeek Harness CLI (one-shot `headless` profile). **Status: contributed by [@KOP-XIAO](https://github.com/KOP-XIAO) in #3 and #4, and verified on real hardware by the contributor (macOS, including cross-turn memory). The repo author has not run dsh in long-term production use — verify it in your own setup before relying on it.**
 
-You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh`. Each backend keeps its own model, effort, mode, and persona files. `WECHATBRIDGE_BACKEND` sets the global default.
+You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, `/backend dsh`, or `/backend pig`. Each backend keeps its own model, effort, mode, and persona files. `WECHATBRIDGE_BACKEND` sets the global default.
 
 ### dsh backend notes
 
@@ -118,6 +119,18 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
 - **Auth:** the per-user session links to the host `~/.codex/auth.json` (copied as a fallback), so it reuses your host `codex login`. The codex CLI rewrites `auth.json` with a temp file plus rename, which turns the session symlink into a regular file. The bridge copies such session files back to the host atomically and re-links them, so refreshed tokens never get overwritten by the revoked host copy. You can also set `CODEX_API_KEY` in the bridge process environment to authenticate. No key or token values are stored in this repository.
 - **Testing caveat:** I do not have a real Codex subscription or CLI to test against. This backend was built from source research, a JSONL fixture, and tests against a fake CLI, which pass. Final acceptance needs a real user running it against the actual Codex CLI.
 
+### pig backend notes
+
+- **Status: this is a backend the author runs in production daily.**
+- **What pig is:** a single-model backend driven through [Magpie](https://github.com) (an OpenAI-compatible upstream), which exposes exactly one model — `gemini-web/gemini-4-neon` — behind the `pig` CLI. The bridge is hard-locked to that one model; there is no model picker, and `/model` only accepts `gemini-web/gemini-4-neon` with an optional thinking-level suffix (`:low`/`:medium`/`:high`).
+- **Enable or switch:** set `WECHATBRIDGE_BACKEND=pig` in `.env`, or send `/backend pig` in WeChat.
+- **Upstream + auth:** the bridge talks to Magpie at `WECHATBRIDGE_MAGPIE_BASE_URL` (default `https://magpie.hotkids.eu/v1`; only `https://` or loopback `http://` is allowed — a plain remote `http://` is rejected). It needs a Magpie API key from `WECHATBRIDGE_MAGPIE_API_KEY` or `MAGPIE_API_KEY` in the bridge process environment; the key is injected into the pig child after env sanitizing and is never persisted on disk — the per-user `models.json` keeps only the `$MAGPIE_API_KEY` placeholder.
+- **Per-user isolation:** each WeChat user gets `session_dir/.pig/agent` with a minimized `models.json` + `settings.json` (0o600, atomic, symlink/hardlink refused). The child is locked to that tree via `PIG_HOME` + `PIG_CODING_AGENT_DIR` + `PI_CODING_AGENT_DIR`, and the host `PIG_USE_PI_DIRS`/`PIG_PIGLET_*` env is stripped so it cannot escape to your real `~/.pig`. `settings.json` disables pig's internal retry so the bridge's `UpstreamGuard` owns all backoff.
+- **Slash commands:** `/models` (list), `/model` (strict single-model, `:low`/`:medium`/`:high` thinking), `/fast`, `/planning` (switches to read-only tools), `/persona` (`pig_persona.txt`, injected via `--append-system-prompt`), `/add-dir`, `/clear`, `/new`, `/help`, `/agents`, `/mcp`.
+- **Attachments:** `@/absolute/path` file/image mentions are split into independent `@file` argv by magic bytes (JPEG/PNG/GIF/WebP/BMP and small UTF-8 text get real `@file` args; APNG, PDFs and large binaries are inlined as a path so they do not blow up with U+FFFD).
+- **Continuation:** `/clear` or `/new` clears that user's continuation flag so the next turn starts a fresh pig session; on-disk history under `session_dir/.pig/agent/sessions` is TTL-cleaned on the same 30-day schedule as the other backends.
+- **Config:** `PIG_BIN_PATH` (binary path), `PIG_TIMEOUT` (run timeout, default 570s to match the upstream stream deadline), `WECHATBRIDGE_MAGPIE_BASE_URL`, `WECHATBRIDGE_MAGPIE_API_KEY` / `MAGPIE_API_KEY`.
+
 ## Prerequisites
 
 - At least one CLI installed and signed in:
@@ -125,7 +138,8 @@ You switch per user with `/backend agy`, `/backend grok`, `/backend codex`, or `
   - and/or `grok` on `PATH`, or set `GROK_BIN_PATH`
   - and/or `codex` on `PATH`, or set `CODEX_BIN_PATH`
   - and/or `dsh` on `PATH`, or set `DSH_BIN_PATH` (DeepSeek Harness; run `dsh login` first)
-  - Antigravity is Google's terminal coding agent (the successor to Gemini CLI). Grok Build is xAI's equivalent, Codex is OpenAI's, and dsh is DeepSeek Harness' CLI.
+  - and/or `pig` on `PATH`, or set `PIG_BIN_PATH` (Magpie-backed single-model CLI; needs `WECHATBRIDGE_MAGPIE_API_KEY` or `MAGPIE_API_KEY`)
+  - Antigravity is Google's terminal coding agent (the successor to Gemini CLI). Grok Build is xAI's equivalent, Codex is OpenAI's, dsh is DeepSeek Harness' CLI, and pig is a Magpie-fronted single-model CLI.
 - A WeChat account with a [ClawBot / iLink](https://ilinkai.weixin.qq.com) bot (QR bind on first run)
 - Python 3.10+
 
@@ -197,6 +211,10 @@ Key variables (all have defaults):
 | `GROK_BIN_PATH` | `grok` | path to the grok binary |
 | `CODEX_BIN_PATH` | `codex` | path to the codex binary |
 | `DSH_BIN_PATH` | `dsh` | path to the dsh binary |
+| `PIG_BIN_PATH` | `pig` | path to the pig binary |
+| `PIG_TIMEOUT` | `570` | pig CLI run timeout in seconds (aligned with the Magpie upstream stream deadline) |
+| `WECHATBRIDGE_MAGPIE_BASE_URL` | `https://magpie.hotkids.eu/v1` | Magpie OpenAI-compatible base URL for the pig backend (only `https://` or loopback `http://` allowed) |
+| `WECHATBRIDGE_MAGPIE_API_KEY` | _empty_ | Magpie API key for the pig backend (also read from `MAGPIE_API_KEY`; injected into the pig child, never persisted) |
 | `DSH_PROFILE` | `headless` | dsh profile booted for one-shot tasks |
 | `DSH_TIMEOUT` | `600` | dsh CLI run timeout in seconds |
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh backend: recent user+assistant turns injected as context |
@@ -205,7 +223,7 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = fallback to `WECHATBRIDGE_HOST_HOME/.dsh` or `~/.dsh` without auto cleanup (precedence: `WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`) |
 | `WECHATBRIDGE_HOST_HOME` | _empty_ | host home directory override for service user deployments; used as fallback base for grok (`~/.grok`), codex (`~/.codex`), and dsh (`~/.dsh`) |
 | `WECHATBRIDGE_DSH_STATE_DIR` | _derived_ | bridge-private dsh state directory (memory JSONL and persistent session IDs; defaults to `~/.local/share/wechatbridge/<instance>/dsh_state`) |
-| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
+| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh` / `pig`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs; `*` = allow all; empty = only `WECHATBRIDGE_ADMINS` users (deny all if that is empty too) |
 | `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (agy / grok / codex backends) |
@@ -332,8 +350,8 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | Command | Action |
 |---|---|
 | `/help` | list supported commands for the active backend |
-| `/backend <agy\|grok\|codex\|dsh>` | switch CLI backend for this WeChat user (on a real change it clears that backend's continuation state: agy/grok flag, codex `thread_id`/resume, or dsh memory/session ID, so the next turn starts a fresh session; history files may remain until retention cleanup) |
-| `/clear` or `/new` | start a new conversation (agy/grok: drops continue flag; codex: clears thread ID; dsh: clears window memory or persistent session ID) |
+| `/backend <agy\|grok\|codex\|dsh\|pig>` | switch CLI backend for this WeChat user (on a real change it clears that backend's continuation state: agy/grok flag, codex `thread_id`/resume, dsh memory/session ID, or pig continue flag, so the next turn starts a fresh session; history files may remain until retention cleanup) |
+| `/clear` or `/new` | start a new conversation (agy/grok: drops continue flag; codex: clears thread ID; dsh: clears window memory or persistent session ID; pig: clears continue flag) |
 | `/model <name>` | set model (all backends validate against a live list: agy/grok via CLI `models`; codex via `codex debug models` then `--bundled`; unknown names or list-fetch failures are refused and nothing is written; see `/models`) |
 | `/models` | list models (agy/grok/codex all query the live CLI; codex uses `debug models` and falls back to a built-in reference note only if the live list cannot be fetched) |
 | `/fast` | fast-mode toggle: low reasoning effort (accepts `on`/`off`; a second bare `/fast` turns it off) |
@@ -365,7 +383,7 @@ Other `/…` commands are either rejected (for example `/exit`), reported as uns
 
 ## Limitations
 
-- Not a standalone agent. You need agy and/or grok and/or codex and/or dsh.
+- Not a standalone agent. You need agy and/or grok and/or codex and/or dsh and/or pig.
 - **codex** is implemented and tested, but not battle-tested by me. I have no real Codex subscription or CLI to check against. I built it from source research, a JSONL fixture, and tests against a fake CLI, which pass. Confirm it in your own setup before you rely on it.
 - **dsh** has both windowed memory (default, last `WECHATBRIDGE_DSH_MEMORY_TURNS` turns) and true persistent sessions (`WECHATBRIDGE_DSH_RESUME=true`). Tests cover the logic, but I have not run it long-term either. Resume mode also needs you to mount the `dsh-bridge-runner` plugin in your own dsh profile; this repo does not ship plugin files.
 - On dsh, the model/effort/mode/persona slash commands are not wired yet. `/model`, `/fast`, `/planning`, `/persona`, and `/add-dir` return a "not supported" notice.

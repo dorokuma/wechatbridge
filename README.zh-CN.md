@@ -5,10 +5,10 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge 把你的终端编程 agent 装进口袋。你自己的 CLI 不用换——agy、grok、codex、dsh 都行——直接通过微信跟它对话，文字、图片、文件、语音都可以（语音由微信侧转写成文字）。你发出去的内容能拿回回复，生成的文件符合条件时还能经 CDN 发回微信。每个用户可用 `/backend` 切换后端，不用重启。
+WeChatBridge 把你的终端编程 agent 装进口袋。你自己的 CLI 不用换——agy、grok、codex、dsh、pig 都行——直接通过微信跟它对话，文字、图片、文件、语音都可以（语音由微信侧转写成文字）。你发出去的内容能拿回回复，生成的文件符合条件时还能经 CDN 发回微信。每个用户可用 `/backend` 切换后端，不用重启。
 
 ```
-微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh CLI
+微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh / pig CLI
                                  (桥接本体)         (跑工具)
 ```
 
@@ -20,7 +20,7 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
 
 五步，从零到在微信里收到第一条回复，大约 10 分钟。
 
-1. **装一个 CLI 后端并登录。** 推荐 [agy](https://antigravity.google/docs/cli)（谷歌 Antigravity），这是作者日常在用的后端。[grok](https://docs.x.ai/build/overview)、[codex](https://developers.openai.com/codex/cli)、[dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md) 也能用，但选之前先看下面 **CLI 后端**一节的状态说明。装好后在该 CLI 里登录一次（如 `grok login`、`codex login`、`dsh login`）。
+1. **装一个 CLI 后端并登录。** 推荐 [agy](https://antigravity.google/docs/cli)（谷歌 Antigravity），这是作者日常在用的后端。[grok](https://docs.x.ai/build/overview)、[codex](https://developers.openai.com/codex/cli)、[dsh](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md)、pig（Magpie 上游单模型，`gemini-web/gemini-4-neon`）也能用，但选之前先看下面 **CLI 后端**一节的状态说明。装好后在该 CLI 里登录一次（如 `grok login`、`codex login`、`dsh login`；pig 不走交互登录，从 `MAGPIE_API_KEY` 取 key）。
 
 2. **装 WeChatBridge：**
 
@@ -47,7 +47,7 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
    如果你第 1 步装的不是 `agy`，还要在 `.env` 里设全局默认后端；选 `agy` 可省略（默认就是 agy）：
 
    ```bash
-   WECHATBRIDGE_BACKEND=grok   # 或 codex / dsh
+   WECHATBRIDGE_BACKEND=grok   # 或 codex / dsh / pig
    ```
 
 4. **启动并扫码绑定。** ClawBot / iLink 是腾讯官方免费开放的个人号 bot 通道，不用申请、审核、资质或付费，你也不需要额外装任何东西：绑定由桥自己完成。运行 `wechatbridge`，它会在终端打印二维码，用手机微信扫码绑定。桥等待扫码的默认轮询超时是 180 秒，超时后它会自动重新获取二维码继续等，进程不退出也不用重启；只有你手动停掉进程才需要重新运行 `wechatbridge`。
@@ -58,10 +58,10 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
 
 ## 功能
 
-- 你可以发文本、图片、文件、语音（微信服务端转文字）给当前后端：`agy`、`grok`、`codex` 或 `dsh`。各后端成熟度见 **CLI 后端**一节。
+- 你可以发文本、图片、文件、语音（微信服务端转文字）给当前后端：`agy`、`grok`、`codex`、`dsh` 或 `pig`。各后端成熟度见 **CLI 后端**一节。
 - CLI 在你允许目录内生成的文件可以回传微信，有大小上限。不是它碰过的每个文件都会发。
 - 每个微信用户有自己的工作区。模型、推理强度、模式按后端分别记忆。
-- 运行中用 `/backend agy`、`/backend grok`、`/backend codex` 或 `/backend dsh` 切换后端。真切换会清掉该后端的续聊状态（agy/grok 的续聊标记和 codex 的 `thread_id`/resume 状态），下一轮 CLI 起新会话。磁盘上的历史文件不会立刻删。
+- 运行中用 `/backend agy`、`/backend grok`、`/backend codex`、`/backend dsh` 或 `/backend pig` 切换后端。真切换会清掉该后端的续聊状态（agy/grok 的续聊标记和 codex 的 `thread_id`/resume 状态），下一轮 CLI 起新会话。磁盘上的历史文件不会立刻删。
 - slash 指令：模型、清会话、人格等（见下表）。
 - 危险提示闸门：按关键词列表匹配破坏性模式，命中先确认再跑。
 - 白名单 `WECHATBRIDGE_ALLOWED_SENDERS`：非空 = 仅列表内用户；`*` = 全开；空 = 仅管理员，管理员也为空则拒绝所有人。
@@ -80,14 +80,15 @@ WeChatBridge 在后台常驻，不停地向微信拉新消息。你发的内容�
 
 ## CLI 后端
 
-agy 是作者每天用的后端。另外三个已经实现并有测试，但作者没在生产环境长期跑过。选非 agy 后端前，请先在你自己的环境里实测再依赖。
+agy 和 pig 是作者每天在生产环境跑的后端。另外三个已经实现并有测试，但作者没在生产环境长期跑过。选非 agy 后端前，请先在你自己的环境里实测再依赖。
 
 - **agy**（默认）：谷歌 Antigravity CLI。**状态：作者日常使用的后端。**
+- **pig**：Magpie 上游单模型 CLI（`gemini-web/gemini-4-neon`）。**状态：作者日常在生产环境使用的后端。**
 - **grok**：xAI Grok Build CLI。**状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
 - **codex**：OpenAI Codex CLI。**状态：已实现并有测试，但作者未在生产环境长期使用——请先自行实测再依赖。**
 - **dsh**：DeepSeek Harness CLI（单轮 `headless` profile）。**状态：由 [@KOP-XIAO](https://github.com/KOP-XIAO) 在 #3 与 #4 中贡献，并由贡献者在真机上验证（macOS，含跨轮记忆）。仓库作者未在生产环境长期使用 dsh——依赖前请先自行实测。**
 
-微信里用 `/backend agy`、`/backend grok`、`/backend codex` 或 `/backend dsh` 按用户切换。各后端各自记模型、强度、模式，人格文件也分开。全局默认用 `WECHATBRIDGE_BACKEND` 设。
+微信里用 `/backend agy`、`/backend grok`、`/backend codex`、`/backend dsh` 或 `/backend pig` 按用户切换。各后端各自记模型、强度、模式，人格文件也分开。全局默认用 `WECHATBRIDGE_BACKEND` 设。
 
 ### dsh 后端说明
 
@@ -118,6 +119,18 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
 - **认证：** 会话目录链接到宿主 `~/.codex/auth.json`（链接失败就拷贝一份），复用你宿主的 `codex login`。codex CLI 重写 `auth.json` 用「临时文件加 rename」，会把会话里的 symlink 拆成普通文件。桥会把这类文件原子写回宿主再重建链接，刷新后的新凭证不会被宿主已吊销的旧凭证覆盖。也可以在桥进程环境里设 `CODEX_API_KEY` 认证。本仓库不存放任何 key 或 token 值。
 - **测试现状：** 我手上没有真实 Codex 订阅或 CLI 可以实测。这个后端是按源码研究、JSONL fixture 和测试里的 fake CLI 写出来的（测试通过）。最终要靠真实用户在真 CLI 上验收。
 
+### pig 后端说明
+
+- **状态：作者日常在生产环境使用的后端。**
+- **pig 是什么：** 经 Magpie（OpenAI-compatible 上游）驱动的单模型后端，`pig` CLI 只暴露一个模型 `gemini-web/gemini-4-neon`。桥把它锁死在这一个模型上——没有模型选择，`/model` 也只接受 `gemini-web/gemini-4-neon`，可选带思考强度后缀（`:low`/`:medium`/`:high`）。
+- **启用与切换：** 在 `.env` 里设 `WECHATBRIDGE_BACKEND=pig`，或在微信里发 `/backend pig`。
+- **上游与认证：** 桥连 `WECHATBRIDGE_MAGPIE_BASE_URL`（默认 `https://magpie.hotkids.eu/v1`；只允许 `https://` 或回环 `http://`，远程明文 `http://` 会被拒）。需要 Magpie API key：桥从进程环境的 `WECHATBRIDGE_MAGPIE_API_KEY` 或 `MAGPIE_API_KEY` 读，env 清洗后注入 pig 子进程，**不落盘**——每用户 `models.json` 里只存 `$MAGPIE_API_KEY` 占位符。
+- **每用户隔离：** 每个微信用户拿 `session_dir/.pig/agent` + 最小化 `models.json`/`settings.json`（0o600、原子写、拒软链/硬链）。子进程被 `PIG_HOME` + `PIG_CODING_AGENT_DIR` + `PI_CODING_AGENT_DIR` 锁在这棵树里，宿主的 `PIG_USE_PI_DIRS`/`PIG_PIGLET_*` 环境变量会被剥掉，防止逃逸到你真实的 `~/.pig`。`settings.json` 里关了 pig 自带的重试，重试权收归桥接 `UpstreamGuard`。
+- **斜杠指令：** `/models`（列表）、`/model`（严格单模型，`:low`/`:medium`/`:high` 切思考强度）、`/fast`、`/planning`（切只读工具）、`/persona`（`pig_persona.txt`，经 `--append-system-prompt` 注入）、`/add-dir`、`/clear`、`/new`、`/help`、`/agents`、`/mcp`。
+- **附件：** `@/绝对路径` 的文件/图片 mention 按魔数拆成独立 `@file` 参数（JPEG/PNG/GIF/WebP/BMP 和小 UTF-8 文本给真实 `@file`；APNG、PDF、大二进制内联成路径，避免 U+FFFD 膨胀）。
+- **续聊：** `/clear` 或 `/new` 清掉该用户的续聊标记，下一轮起新 pig 会话；`session_dir/.pig/agent/sessions` 下的历史按和其它后端一样的 30 天 TTL 清理。
+- **配置：** `PIG_BIN_PATH`（二进制路径）、`PIG_TIMEOUT`（执行超时，默认 570s 对齐上游流式截止）、`WECHATBRIDGE_MAGPIE_BASE_URL`、`WECHATBRIDGE_MAGPIE_API_KEY` / `MAGPIE_API_KEY`。
+
 ## 前置条件
 
 - 至少装好并登录其中一个 CLI：
@@ -125,7 +138,8 @@ agy 是作者每天用的后端。另外三个已经实现并有测试，但作�
   - 和/或 `grok` 在 `PATH` 中，或设 `GROK_BIN_PATH`
   - 和/或 `codex` 在 `PATH` 中，或设 `CODEX_BIN_PATH`
   - 和/或 `dsh` 在 `PATH` 中，或设 `DSH_BIN_PATH`（DeepSeek Harness，先跑 `dsh login`）
-  - Antigravity 是谷歌终端 agentic 编程工具（Gemini CLI 官方继任）。Grok Build 是 xAI 同类产品，Codex 是 OpenAI 的，dsh 是 DeepSeek Harness 的 CLI。
+  - 和/或 `pig` 在 `PATH` 中，或设 `PIG_BIN_PATH`（Magpie 上游单模型 CLI；需 `WECHATBRIDGE_MAGPIE_API_KEY` 或 `MAGPIE_API_KEY`）
+  - Antigravity 是谷歌终端 agentic 编程工具（Gemini CLI 官方继任）。Grok Build 是 xAI 同类产品，Codex 是 OpenAI 的，dsh 是 DeepSeek Harness 的 CLI，pig 是 Magpie 上游单模型 CLI。
 - 一个微信账号 + [ClawBot / iLink](https://ilinkai.weixin.qq.com) 机器人（首次扫码绑定）
 - Python 3.10+
 
@@ -197,6 +211,10 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `GROK_BIN_PATH` | `grok` | grok 可执行文件路径 |
 | `CODEX_BIN_PATH` | `codex` | codex 可执行文件路径 |
 | `DSH_BIN_PATH` | `dsh` | dsh 可执行文件路径 |
+| `PIG_BIN_PATH` | `pig` | pig 可执行文件路径 |
+| `PIG_TIMEOUT` | `570` | pig CLI 执行超时秒数（对齐 Magpie 上游流式截止） |
+| `WECHATBRIDGE_MAGPIE_BASE_URL` | `https://magpie.hotkids.eu/v1` | pig 后端的 Magpie OpenAI-compatible base URL（仅允许 `https://` 或回环 `http://`） |
+| `WECHATBRIDGE_MAGPIE_API_KEY` | _空_ | pig 后端的 Magpie API key（也读 `MAGPIE_API_KEY`；注入 pig 子进程，不落盘） |
 | `DSH_PROFILE` | `headless` | dsh 单轮任务启动的 profile |
 | `DSH_TIMEOUT` | `600` | dsh CLI 执行超时秒数 |
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh 后端：注入上下文的最近对话轮数（user+assistant 对） |
@@ -205,7 +223,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 回退至 `WECHATBRIDGE_HOST_HOME/.dsh` 或 `~/.dsh` 且不自动清理（优先级：`WECHATBRIDGE_DSH_HOME` > `WECHATBRIDGE_HOST_HOME/.dsh` > `~/.dsh`） |
 | `WECHATBRIDGE_HOST_HOME` | _空_ | 宿主用户主目录覆盖（服务用户部署时使用；用作 grok `~/.grok`、codex `~/.codex`、dsh `~/.dsh` 的回退基准路径） |
 | `WECHATBRIDGE_DSH_STATE_DIR` | _派生_ | 桥私有 dsh 状态目录（记忆 JSONL 与持久会话 ID；默认 `~/.local/share/wechatbridge/<实例名>/dsh_state`） |
-| `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
+| `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh` / `pig`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔；`*` = 全开；空 = 仅 `WECHATBRIDGE_ADMINS` 成员（管理员也为空则拒绝所有人） |
 | `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（agy / grok / codex 后端） |
@@ -332,8 +350,8 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | 指令 | 作用 |
 |---|---|
 | `/help` | 按当前后端列出支持指令 |
-| `/backend <agy\|grok\|codex\|dsh>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态：agy/grok 标记、codex `thread_id`/resume，或 dsh 记忆/会话 ID，下次起新会话；历史文件可能仍在，靠保留策略清理） |
-| `/clear` 或 `/new` | 开启新对话（agy/grok：丢弃续聊标记；codex：清空 thread_id；dsh：清空窗口记忆或常驻会话 ID） |
+| `/backend <agy\|grok\|codex\|dsh\|pig>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态：agy/grok 标记、codex `thread_id`/resume、dsh 记忆/会话 ID，或 pig 续聊标记，下次起新会话；历史文件可能仍在，靠保留策略清理） |
+| `/clear` 或 `/new` | 开启新对话（agy/grok：丢弃续聊标记；codex：清空 thread_id；dsh：清空窗口记忆或常驻会话 ID；pig：丢弃续聊标记） |
 | `/model <名称>` | 设模型（各后端均对照实时列表校验：agy/grok 走 CLI `models`；codex 走 `codex debug models`，失败或空再试 `--bundled`；未知名或列表拉取失败则拒绝且不写 prefs；见 `/models`） |
 | `/models` | 列出可用模型（agy/grok/codex 均向 CLI 实时查询；codex 用 `debug models`，仅在实时列表拉不到时才回退内置参考说明） |
 | `/fast` | 快速模式开关：低推理开销（可带 `on`/`off`，无参再按一次关闭） |
@@ -365,7 +383,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 
 ## 已知限制
 
-- 不是独立 agent，你需要 agy 和/或 grok 和/或 codex 和/或 dsh。
+- 不是独立 agent，你需要 agy 和/或 grok 和/或 codex 和/或 dsh 和/或 pig。
 - **codex** 已实现并有测试，但我没有真实 Codex 订阅或 CLI 实测过，只按源码研究、JSONL fixture 和测试里的 fake CLI 写的（测试通过）。用之前先在你自己的环境确认。
 - **dsh** 有窗口记忆（默认，最近 `WECHATBRIDGE_DSH_MEMORY_TURNS` 轮）和常驻会话（`WECHATBRIDGE_DSH_RESUME=true`）两种模式。逻辑有测试覆盖，但我也没长期跑过。resume 模式需要你自己在 dsh profile 里挂载 `dsh-bridge-runner` 插件，本仓库不附带插件文件。
 - dsh 的模型/强度/模式/人格 slash 指令还没接通，`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 在 dsh 后端会回「暂不支持」。
